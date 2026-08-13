@@ -1,175 +1,139 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/OpenListTeam/Logo/main/logo.svg" width="128" height="128" alt="logo" />
-
-  <p><em>OpenList is a resilient, long-term governance, community-driven fork of AList — built to defend open source against trust-based attacks.</em></p>
-
-  <img src="https://goreportcard.com/badge/github.com/OpenListTeam/OpenList/v3" alt="latest version" />
-  <a href="https://github.com/OpenListTeam/OpenList/blob/main/LICENSE"><img src="https://img.shields.io/github/license/OpenListTeam/OpenList" alt="License" /></a>
-  <a href="https://github.com/OpenListTeam/OpenList/actions?query=workflow%3ABuild"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList/build.yml?branch=main" alt="Build status" /></a>
-  <a href="https://github.com/OpenListTeam/OpenList/releases"><img src="https://img.shields.io/github/release/OpenListTeam/OpenList" alt="latest version" /></a>
-
-  <a href="https://github.com/OpenListTeam/OpenList/discussions"><img src="https://img.shields.io/github/discussions/OpenListTeam/OpenList?color=%23ED8936" alt="discussions" /></a>
-  <a href="https://github.com/OpenListTeam/OpenList/releases"><img src="https://img.shields.io/github/downloads/OpenListTeam/OpenList/total?color=%239F7AEA&logo=github" alt="Downloads" /></a>
+  <h1>OpenList_NEW</h1>
+  <p>基于 OpenList 二次开发的多网盘文件列表程序</p>
+  <p>
+    <img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License" />
+  </p>
 </div>
 
 ---
 
-- English | [中文](./README/README_cn.md) | [日本語](./README/README_ja.md) | [Dutch](./README/README_nl.md) | [한국어](./README/README_ko.md) | [Deutsch](./README/README_de.md) | [Русский](./README/README_ru.md) | [Français](./README/README_fr.md) | [Español](./README/README_es.md) | [العربية](./README/README_ar.md)
+## 简介
 
-- [Contributing](./CONTRIBUTING.md)
-- [CODE OF CONDUCT](./CODE_OF_CONDUCT.md)
-- [LICENSE](./LICENSE)
+本项目基于 [OpenList](https://github.com/OpenListTeam/OpenList) 二次开发，在保留原版全部功能的基础上，增加了以下增强功能。
 
-## Disclaimer
+## 新增功能
 
-OpenList is an open-source project independently maintained by the OpenList Team, following the AGPL-3.0 license and committed to maintaining complete code openness and modification transparency.
+### 1. 115 网盘扫码登录（免手动抓取 Cookie）
 
-We have noticed the emergence of some third-party projects in the community with names similar to this project, such as OpenListApp/OpenListApp, as well as some paid proprietary software using the same or similar naming. To avoid user confusion, we hereby declare:
+原先挂载 115 网盘需要用户手动运行 Python 脚本或从浏览器抓取 Cookie，过程繁琐。
 
-- OpenList has no official association with any third-party derivative projects.
+现在在添加存储页面选择 **115 Cloud** 驱动后，会直接显示扫码登录面板：
 
-- All software, code, and services of this project are maintained by the OpenList Team and are freely available on GitHub.
+- 可选择登录设备（网页端 / 安卓 / iOS / 电视端 / 支付宝小程序 / 微信小程序 / 安卓多开）
+- 一键获取二维码，使用 115 App 扫码
+- 扫码成功后 **自动填入 Cookie**，无需手动复制
+- 自动弹出 **挂载文件夹选择框**，勾选需要的文件夹后自动填入根文件夹 ID
 
-- Project documentation and API services primarily rely on charitable resources provided by Cloudflare. There are currently no paid plans or commercial deployments, and the use of existing features does not involve any costs.
+新增后端 API：
 
-We respect the community's rights to free use and derivative development, but we also strongly urge downstream projects:
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/115/qrcode` | GET | 获取登录二维码（base64 PNG）及 uid/time/sign |
+| `/api/115/qrcode/status` | GET | 轮询扫码状态（0 等待 / 1 已扫描 / 2 已登录 / -1 过期 / -2 取消） |
+| `/api/115/qrcode/login` | POST | 扫码确认后获取登录 Cookie |
+| `/api/115/root_folders` | POST | 使用 Cookie 列出网盘根目录文件夹 |
 
-- Should not use the "OpenList" name for impersonation promotion or commercial gain;
+> 注：原版默认的 `linux` / `mac` / `windows` 登录设备已被 115 官方下架，本版已将默认设备改为 `web`。
 
-- Must not distribute OpenList-based code in a closed-source manner or violate AGPL license terms.
+### 2. 视频缩略图
 
-To better maintain healthy ecosystem development, we recommend:
+115 网盘中的视频文件（如 mp4）在列表中默认不显示内容预览，无法快速判断视频内容。
 
-- Clearly indicate the project source and choose appropriate open-source licenses in accordance with the open-source spirit;
+现在 **视频文件会自动生成缩略图**，在网格视图中直接显示视频画面：
 
-- If involving commercial use, please avoid using "OpenList" or any confusing naming as the project name;
+- 首次访问时通过 ffmpeg 从视频流中抽取画面生成缩略图
+- 缩略图自动缓存到本地（`data/temp/thumb_cache/`），之后访问秒回
+- 支持所有通过本程序挂载的视频存储（115 / 阿里云盘 / 本地等）
 
-- If you need to use materials located under OpenListTeam/Logo, you may modify and use them under compliance with the agreement.
+新增后端 API：
 
-Thank you for your support and understanding of the OpenList project.
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/vt/*path` | GET | 获取视频文件缩略图（自动生成并缓存） |
 
-## Features
+### 3. 一键安装脚本
 
-- [x] Multiple storages
-  - [x] Local storage
-  - [x] [Aliyundrive](https://www.alipan.com)
-  - [x] OneDrive / Sharepoint ([Global](https://www.microsoft.com/en-us/microsoft-365/onedrive/online-cloud-storage), [CN](https://portal.partner.microsoftonline.cn), DE, US)
-  - [x] [189cloud](https://cloud.189.cn) (Personal, Family)
-  - [x] [GoogleDrive](https://drive.google.com)
-  - [x] [123pan](https://www.123pan.com)
-  - [x] [FTP / SFTP](https://en.wikipedia.org/wiki/File_Transfer_Protocol)
-  - [x] [PikPak](https://www.mypikpak.com)
-  - [x] [S3](https://aws.amazon.com/s3)
-  - [x] [Seafile](https://seafile.com)
-  - [x] [UPYUN Storage Service](https://www.upyun.com/products/file-storage)
-  - [x] [WebDAV](https://en.wikipedia.org/wiki/WebDAV)
-  - [x] Teambition([China](https://www.teambition.com), [International](https://us.teambition.com))
-  - [x] [MediaFire](https://www.mediafire.com)
-  - [x] [Mediatrack](https://www.mediatrack.cn)
-  - [x] [ProtonDrive](https://proton.me/drive)
-  - [x] [139yun](https://yun.139.com) (Personal, Family, Group, Share)
-  - [x] [YandexDisk](https://disk.yandex.com)
-  - [x] [BaiduNetdisk](http://pan.baidu.com)
-  - [x] [Terabox](https://www.terabox.com/main)
-  - [x] [UC](https://drive.uc.cn)
-  - [x] [Quark](https://pan.quark.cn)
-  - [x] [Thunder](https://pan.xunlei.com)
-  - [x] [Lanzou](https://www.lanzou.com)
-  - [x] [ILanzou](https://www.ilanzou.com)
-  - [x] [Google photo](https://photos.google.com)
-  - [x] [Mega.nz](https://mega.nz)
-  - [x] [Baidu photo](https://photo.baidu.com)
-  - [x] [SMB](https://en.wikipedia.org/wiki/Server_Message_Block)
-  - [x] [115](https://115.com)
-  - [X] [Cloudreve](https://cloudreve.org)
-  - [x] [Dropbox](https://www.dropbox.com)
-  - [x] [FeijiPan](https://www.feijipan.com)
-  - [x] [dogecloud](https://www.dogecloud.com/product/oss)
-  - [x] [Azure Blob Storage](https://azure.microsoft.com/products/storage/blobs)
-  - [x] [Chaoxing](https://www.chaoxing.com)
-  - [x] [CNB](https://cnb.cool/)
-  - [x] [Degoo](https://degoo.com)
-  - [x] [Doubao](https://www.doubao.com)
-  - [x] [Febbox](https://www.febbox.com)
-  - [x] [GitHub](https://github.com)
-  - [x] [OpenList](https://github.com/OpenListTeam/OpenList)
-  - [x] [Teldrive](https://github.com/tgdrive/teldrive)
-  - [x] [Weiyun](https://www.weiyun.com)
-  - [x] [DingTalk Docs](https://alidocs.dingtalk.com/)
-- [x] Easy to deploy and out-of-the-box
-- [x] File preview (PDF, markdown, code, plain text, ...)
-- [x] Image preview in gallery mode
-- [x] Video and audio preview, support lyrics and subtitles
-- [x] Office documents preview (docx, pptx, xlsx, ...)
-- [x] `README.md` preview rendering
-- [x] File permalink copy and direct file download
-- [x] Dark mode
-- [x] I18n
-- [x] Protected routes (password protection and authentication)
-- [x] WebDAV
-- [x] Docker Deploy
-- [x] Cloudflare Workers proxy
-- [x] File/Folder package download
-- [x] Web upload(Can allow visitors to upload), delete, mkdir, rename, move and copy
-- [x] Offline download
-- [x] Copy files between two storage
-- [x] Multi-thread downloading acceleration for single-thread download/stream
+根目录 `install.sh` 提供全新服务器一键部署：
 
-## Document
+```bash
+# Debian / Ubuntu / CentOS 一键安装
+curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bash
+```
 
-- 📘 [Docs](https://doc.oplist.org)
-- 🌏 [CN Mirror](https://doc.oplist.org.cn)
-- ⚖️ [Terms of Use](https://doc.oplist.org/terms)
-- 🔒 [Privacy Policy](https://doc.oplist.org/privacy)
+脚本自动完成：
+1. 安装系统依赖（git、gcc、ffmpeg、Go）
+2. 克隆本仓库并编译
+3. 初始化数据目录
+4. 注册 systemd 服务并开机自启
+5. 启动并验证服务可用
 
-## Demo
+可选环境变量：`INSTALL_DIR`（安装目录）、`OPENLIST_PORT`（端口）、`INSTALL_BRANCH`（分支）。
 
-- 🌎 [Global Demo](https://demo.oplist.org)
-- 🇨🇳 [CN Demo](https://demo.oplist.org.cn)
+## 快速部署
 
-## Discussion
+### 方式一：一键脚本（推荐）
 
-Please refer to [*Discussions*](https://github.com/OpenListTeam/OpenList/discussions) for raising general questions, ***Issues* is for bug reports and feature requests only.**
+```bash
+curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bash
+```
 
-## Sponsor
+### 方式二：手动部署
 
-[![VPS.Town](https://vps.town/static/images/sponsor.png)](https://vps.town "VPS.Town - Trust, Effortlessly. Your Cloud, Reimagined.")
+```bash
+# 1. 安装依赖
+apt install -y git gcc ffmpeg curl     # Debian/Ubuntu
+# 2. 获取 Go（或使用系统包管理器）
+# 3. 克隆并编译
+git clone https://github.com/Xioaruan912/OpenList_NEW.git
+cd OpenList_NEW
+go build -o openlist ./main.go
+# 4. 启动
+./openlist server
+```
 
-## Donors
+启动后浏览器访问 `http://<服务器IP>:5244`，首次启动的日志中会打印管理员账号和初始密码。
 
-Thanks to the following donors for their generous support:
+## 默认配置
 
-- [HisAtri](https://github.com/HisAtri)
-- 爱发电用户_7jTh
-- suka
+| 项目 | 默认值 |
+|---|---|
+| Web 端口 | `5244` |
+| 数据目录 | `<安装目录>/data/` |
+| 视频缩略图缓存 | `data/temp/thumb_cache/` |
+| 默认登录设备（115） | `web` |
 
-## License
+## 支持功能
 
-The `OpenList` is open-source software licensed under the [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.txt) license.
+- 多网盘聚合挂载（115、阿里云盘、百度网盘、GoogleDrive、OneDrive、WebDAV、FTP/SFTP、S3 等 90+ 驱动）
+- 文件上传 / 下载 / 复制 / 移动 / 重命名 / 批量操作
+- 在线预览（视频、图片、音频、文档）
+- 分享链接、离线下载、任务管理
+- WebDAV / S3 / FTP / SFTP 协议支持
+- MCP（Model Context Protocol）支持
 
-## Disclaimer
+## 常见问题
 
-- This project is a free and open-source software designed to facilitate file sharing via net disks, primarily intended to support the downloading and learning of the Go programming language.
-- Please comply with all applicable laws and regulations when using this software. Any form of misuse is strictly prohibited.
-- The software is based on official SDKs or APIs without any modification, disruption, or interference with their behavior.
-- It only performs HTTP 302 redirects or traffic forwarding, and does not intercept, store, or tamper with any user data.
-- This project is not affiliated with any official platform or service provider.
-- The software is provided "as is", without any warranties of any kind, either express or implied, including but not limited to warranties of merchantability or fitness for a particular purpose.
-- The maintainers are not liable for any direct or indirect damages arising from the use of, or inability to use, this software.
-- You are solely responsible for any risks associated with using this software, including but not limited to account bans or download speed limitations.
-- This project is licensed under the [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.txt) License. Please see the [LICENSE](./LICENSE) file for details.
+<details>
+<summary><b>115 扫码登录提示设备已下架？</b></summary>
+请选择网页端、安卓、iOS、电视端、支付宝/微信小程序、安卓多开等设备，`linux` / `mac` / `windows` 已被 115 官方下架。
+</details>
 
-## Contact Us
+<details>
+<summary><b>视频缩略图加载很慢？</b></summary>
+首次访问每个视频需要下载视频片段并用 ffmpeg 抽帧，通常需要数秒到十几秒。生成后会缓存，之后秒开。如果视频很多，建议先浏览一次预热。
+</details>
 
-- [@GitHub](https://github.com/OpenListTeam)
-- [Telegram Group](https://t.me/OpenListTeam)
-- [Telegram Channel](https://t.me/OpenListOfficial)
+<details>
+<summary><b>如何修改端口？</b></summary>
+修改 `<数据目录>/config.json` 中的 `scheme.http_port` 后重启服务即可。
+</details>
 
-## Contributors
+## 致谢
 
-We sincerely thank the author [Xhofe](https://github.com/Xhofe) of the original project [AlistGo/alist](https://github.com/AlistGo/alist) and all other contributors.
+- [OpenList](https://github.com/OpenListTeam/OpenList) - 上游项目
+- 115 扫码登录方案参考 [ChenyangGao/qrcode_cookie_115](https://gist.github.com/ChenyangGao/d26a592a0aeb13465511c885d5c7ad61)
 
-Thanks goes to these wonderful people:
+## 许可证
 
-[![Contributors](https://contrib.rocks/image?repo=OpenListTeam/OpenList)](https://github.com/OpenListTeam/OpenList/graphs/contributors)
-
+本项目遵循 [AGPL-3.0](LICENSE) 许可证。
