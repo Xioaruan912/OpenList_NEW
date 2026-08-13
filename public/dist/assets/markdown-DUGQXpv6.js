@@ -1,0 +1,1 @@
+import{E as e,H as t,Qi as n,an as r}from"./store-BnRstdzp.js";import{Yt as i,Z as a}from"./components-Dn2iiZkQ.js";var o=()=>{let[o]=t();return n(i,{get loading(){return o.loading},get children(){return n(a,{get children(){return o()?.content},get ext(){return r(e.obj.name)},toc:!0})}})};export{o as default};
