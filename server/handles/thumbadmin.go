@@ -2,6 +2,7 @@ package handles
 
 import (
 	"os"
+	stdpath "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -73,6 +74,22 @@ func ThumbStatus(c *gin.Context) {
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
+	// 已有缩略图的目录清单（按目录分组，来自路径索引）
+	indexed := readThumbIndex()
+	cacheByDir := map[string]int{}
+	for _, p := range indexed {
+		dir := stdpath.Dir(p)
+		if dir != "" && dir != "." {
+			cacheByDir[dir]++
+		}
+	}
+	cachedDirs := make([]gin.H, 0, len(cacheByDir))
+	for dir, cnt := range cacheByDir {
+		cachedDirs = append(cachedDirs, gin.H{"dir": dir, "count": cnt})
+	}
+	sort.Slice(cachedDirs, func(i, j int) bool { return cachedDirs[i]["count"].(int) > cachedDirs[j]["count"].(int) })
+	status["cached_by_dir"] = cachedDirs
+
 	// 失败明细（按目录分组）
 	fails := listThumbFails()
 	byDir := map[string]int{}

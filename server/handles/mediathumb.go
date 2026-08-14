@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -373,6 +374,76 @@ func encodeThumb(mjpeg []byte) ([]byte, error) {
 	return resizeImageData(mjpeg)
 }
 
+// 缩略图路径索引：生成成功时记录路径，供管理页按目录统计已有缩略图
+var (
+	thumbIndexMu sync.Mutex
+)
+
+const thumbIndexFile = "index.jsonl"
+
+func thumbIndexPath() string {
+	return filepath.Join(thumbDir(), thumbIndexFile)
+}
+
+// thumbRecord 记录一条缩略图成功记录（append，含路径）
+func thumbRecord(rawPath string) {
+	if rawPath == "" {
+		return
+	}
+	line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
+		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
+	thumbIndexMu.Lock()
+	defer thumbIndexMu.Unlock()
+	f, err := os.OpenFile(thumbIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+	// 索引超过 50000 行时截断重写（仅保留缓存文件仍存在的条目）
+	if fi, err := os.Stat(thumbIndexPath()); err == nil && fi.Size() > 4*1024*1024 {
+		thumbRewriteIndex()
+	}
+}
+
+// thumbRewriteIndex 重写索引：只保留缓存文件仍存在的条目
+func thumbRewriteIndex() {
+	lines := readThumbIndex()
+	f, err := os.Create(thumbIndexPath())
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	for _, p := range lines {
+		h := thumbHash(p)
+		if _, err := os.Stat(filepath.Join(thumbDir(), "video-"+h+".png")); err == nil {
+			_, _ = f.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+		}
+	}
+}
+
+// readThumbIndex 读取索引中的路径列表
+func readThumbIndex() []string {
+	data, err := os.ReadFile(thumbIndexPath())
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var m struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
+			paths = append(paths, m.Path)
+		}
+	}
+	return paths
+}
+
 // serveThumb 通用缩略图入口：缓存命中直接返回，未命中则串行生成
 func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, error)) {
 	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
@@ -416,6 +487,7 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		return
 	}
 	_ = os.WriteFile(cachePath, png, 0o666)
+	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
 }
 
@@ -632,6 +704,7 @@ func prewarmWorker() {
 			} else {
 				_ = os.WriteFile(cachePath, png, 0o666)
 			}
+			thumbRecord(task.rawPath)
 			prewarmDone.Store(task.rawPath, struct{}{})
 		}()
 	}
@@ -1011,6 +1084,7 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 				remoteThumbMissClear(rawPath)
 				remoteThumbCacheSet(rawPath, data)
 				_ = os.WriteFile(diskPath, data, 0o666)
+				thumbRecord(rawPath)
 				serveThumbPNG(c, data)
 				return
 			}
@@ -1047,6 +1121,7 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	remoteThumbMissClear(rawPath)
 	remoteThumbCacheSet(rawPath, png)
 	_ = os.WriteFile(diskPath, png, 0o666)
+	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
 }
 
