@@ -159,7 +159,9 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 		return nil, errors.New("not a file object")
 	}
 	userAgent := args.Header.Get("User-Agent")
-	downloadInfo, err := d.client.DownloadWithUA(f.PickCode, userAgent)
+	// 优先用 Android 下载接口（proapi.115.com/android），
+	// chrome 接口（app/chrome/downurl）易被 115 风控拦截导致播放/缩略图失败
+	downloadInfo, err := d.client.DownloadWithUAByAndroidAPI(f.PickCode, userAgent)
 	if err != nil {
 		MarkStorageError(d.GetStorage().MountPath, err)
 		return nil, err

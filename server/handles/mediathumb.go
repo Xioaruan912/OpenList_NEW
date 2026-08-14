@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	stdpath "path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -689,16 +690,26 @@ const (
 	remoteThumbCacheTTL = time.Hour
 )
 
+// sanitize115Name 清除 115 禁止/不安全的文件名字符，仅保留字母数字中文与常见符号
+var sanitize115Re = regexp.MustCompile(`[^\p{L}\p{N}\-_\s\.\(\)\[\]]+`)
+
+func sanitize115Name(name string) string {
+	name = sanitize115Re.ReplaceAllString(name, "_")
+	name = strings.Trim(name, "._")
+	if len(name) > 40 {
+		name = name[:40]
+	}
+	if name == "" {
+		name = "thumb"
+	}
+	return name
+}
+
 func remoteThumbName(rawPath string) string {
 	h := md5.Sum([]byte(rawPath))
 	base := stdpath.Base(rawPath)
 	name := strings.TrimSuffix(base, stdpath.Ext(base))
-	// 清除 115 禁止的文件名字符（\ / : * ? " < > |）
-	replacer := strings.NewReplacer("\\", "_", "/", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
-	name = replacer.Replace(name)
-	if len(name) > 40 {
-		name = name[:40]
-	}
+	name = sanitize115Name(name)
 	return name + "_" + hex.EncodeToString(h[:4]) + ".png"
 }
 

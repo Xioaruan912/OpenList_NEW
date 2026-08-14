@@ -106,7 +106,9 @@ func (d *Pan115) getNewFileByPickCode(pickCode string) (*FileObj, error) {
 }
 
 func (d *Pan115) getUA() string {
-	return fmt.Sprintf("Mozilla/5.0 115Browser/%s", appVer)
+	// 使用普通浏览器 UA：115 的 WAF 对 115Browser UA 特征的 API 请求风控严格，
+	// 换成 Chrome UA 可绕过下载接口的拦截（实测 Chrome UA 的直链下载一直正常）
+	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 func (c *Pan115) GenerateToken(fileID, preID, timeStamp, fileSize, signKey, signVal string) string {
