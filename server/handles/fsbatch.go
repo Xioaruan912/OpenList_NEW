@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -184,6 +185,7 @@ func FsBatchRename(c *gin.Context) {
 		return
 	}
 	common.GinAppendValues(c, conf.MetaKey, meta)
+	// 限速执行：每文件 500ms，避免批量重命名高频调用触发网盘风控
 	for _, renameObject := range req.RenameObjects {
 		if renameObject.SrcName == "" || renameObject.NewName == "" {
 			continue
@@ -202,6 +204,12 @@ func FsBatchRename(c *gin.Context) {
 		if err := fs.Rename(c.Request.Context(), filePath, renameObject.NewName); err != nil {
 			common.ErrorResp(c, err, 500)
 			return
+		}
+		select {
+		case <-c.Request.Context().Done():
+			common.ErrorResp(c, c.Request.Context().Err(), 500)
+			return
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 	common.SuccessResp(c)

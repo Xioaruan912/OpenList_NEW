@@ -202,6 +202,11 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ThumbWidth, Value: "288", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail width in pixels, default 288`},
 		{Key: conf.ThumbFailTTL, Value: "604800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `negative cache duration in seconds for failed cover/folder detection, default 7 days`},
 
+		// ai rename settings
+		{Key: conf.AiRenameApiUrl, Value: "https://api.deepseek.com/v1", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `AI rename OpenAI-compatible API base URL`},
+		{Key: conf.AiRenameApiKey, Value: "", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `AI rename API key`},
+		{Key: conf.AiRenameModel, Value: "deepseek-v4-flash", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `AI rename model (cheapest one)`},
+
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},
 		{Key: conf.SearchIndex, Value: "none", Type: conf.TypeSelect, Options: "database,database_non_full_text,bleve,meilisearch,none", Group: model.INDEX},
