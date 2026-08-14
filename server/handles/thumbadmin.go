@@ -35,9 +35,12 @@ func ThumbGenerate(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	// 115 风控中不拦截生成：缩略图本地生成并缓存（前端可正常展示），
-	// remote 模式上传失败自动进入待传队列，在配置的上传窗口批量补传到网盘
-	blocked, _ := isStorageBlocked(req.Path)
+	// 115 风控中禁止触发缩略图生成：生成需从网盘下载视频片段（ffmpeg 抽帧），
+	// 风控中下载会加剧风控。风控解除后再生成，远程上传失败会自动进入上传窗口补传。
+	if blocked, _ := isStorageBlocked(req.Path); blocked {
+		common.ErrorStrResp(c, "115 网盘风控中，缩略图需下载视频生成，请稍后再试（风控通常 10-30 分钟）", 429)
+		return
+	}
 	apiURL := common.GetApiUrl(c)
 	queued := 0
 	removed := 0
@@ -87,7 +90,7 @@ func ThumbGenerate(c *gin.Context) {
 	common.SuccessResp(c, gin.H{
 		"queued": queued, "path": req.Path, "recursive": req.Recursive,
 		"force": req.Force, "removed": removed,
-		"blocked": blocked, "failed_dirs": failedDirs,
+		"failed_dirs": failedDirs,
 	})
 }
 

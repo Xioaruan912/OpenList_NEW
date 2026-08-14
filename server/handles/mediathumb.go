@@ -551,6 +551,11 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		common.ErrorStrResp(c, "thumbnail not available", 404)
 		return
 	}
+	// 115 风控中禁止下载生成（视频缩略图需从网盘下载片段，会加剧风控）
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
+		return
+	}
 
 	if !thumbAcquire(false) {
 		common.ErrorStrResp(c, "thumbnail busy", 503)
@@ -935,6 +940,12 @@ func prewarmWorker() {
 }
 
 func processTask(task thumbPrewarmTask) {
+	// 115 风控中不下载视频生成缩略图（避免加剧风控）：等待后重新入队
+	if blocked, _ := isStorageBlocked(task.rawPath); blocked {
+		time.Sleep(10 * time.Minute)
+		prewarmCh <- task
+		return
+	}
 	cachePath := thumbCachePath(task.kind, task.rawPath)
 	if _, err := os.ReadFile(cachePath); err == nil {
 		prewarmDone.Store(task.rawPath, struct{}{})
@@ -1391,6 +1402,11 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	ThumbStoreRemote() bool
 	ThumbFolderName() string
 }, diskPath string) {
+	// 115 风控中禁止下载生成（会加剧风控）
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
+		return
+	}
 	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
