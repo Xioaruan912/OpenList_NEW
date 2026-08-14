@@ -45,7 +45,7 @@ var ee=()=>{
   toggle=pp=>setExp(ss=>{let z=new Set(ss);z.has(pp)?z.delete(pp):z.add(pp);return z}),
   selectDir=pp=>{setSel(pp),setExp(ss=>{let z=new Set(ss);z.add(pp);return z}),loadDir(pp)},
   TN=(nn,depth)=>_(j,{w:`$full`,get children(){return[
-    _(u,{direction:`row`,spacing:`$1`,alignItems:`center`,p:`$2`,rounded:`$md`,get _hover(){return{bgColor:U(`$neutral2`,`$neutral3`)()}},get background(){return sel()===nn.path?U(`$info2`,`$info3`)():U(`$neutral1`,`$neutral2`)()},style:{paddingLeft:(12+depth*16)+`px`,cursor:`pointer`},onClick:()=>selectDir(nn.path),get children(){return[
+    _(u,{direction:`row`,spacing:`$1`,alignItems:`center`,p:`$2`,rounded:`$md`,get _hover(){return{bgColor:U(`$neutral2`,`$neutral3`)()}},get background(){return sel()===nn.path?U(`$info2`,`$info3`)():U(`$neutral1`,`$neutral2`)()},style:{paddingLeft:(10+depth*10)+`px`,cursor:`pointer`},onClick:()=>selectDir(nn.path),get children(){return[
       _(m,{size:`xs`,onClick:q=>{q.stopPropagation(),toggle(nn.path)},get children(){return expanded().has(nn.path)?`▾`:`▸`}}),
       _(j,{mr:`$1`,get children(){return`📁`}}),
       _(j,{css:{flex:`1 1 auto`,wordBreak:`break-all`,fontSize:`$sm`},get children(){return nn.name}}),
@@ -70,7 +70,7 @@ var ee=()=>{
         _(y,{get colorScheme(){return pendingUp()?`danger`:`neutral`},get children(){return`待上传 ${pendingUp()} 个`}}),
         _(m,{size:`xs`,get colorScheme(){return ruEnabled()?`success`:`neutral`},onClick:()=>setRuEnabled(!ruEnabled()),get children(){return ruEnabled()?`已启用`:`已停用`}})
       ]}}),
-      _(u,{spacing:`$2`,alignItems:`center`,mt:`$2`,get children(){return[
+      _(u,{direction:{"@initial":`column`,"@md":`row`},spacing:`$2`,alignItems:`center`,mt:`$2`,get children(){return[
         _(j,{fontSize:`$sm`,get children(){return`上传时段`}}),
         _(Hx,{get value(){return String(ruStart())},onInput:e=>setRuStart(parseInt(e.currentTarget.value)||0),w:`$full`,maxW:`80px`}),
         _(j,{fontSize:`$sm`,get children(){return`-`}}),
@@ -84,21 +84,21 @@ var ee=()=>{
         _(m,{size:`xs`,colorScheme:`accent`,onClick:saveRu,get children(){return`保存配置`}})
       ]}})
     ]}}),
-    _(u,{spacing:`$2`,alignItems:`center`,get children(){return[
+    _(u,{spacing:`$2`,alignItems:`center`,wrap:{"@initial":`wrap`,"@md":`unset`},get children(){return[
       _(m,{colorScheme:`accent`,get loading(){return busy()===`一键`},onClick:()=>setOpen(!0),get children(){return`一键缩略图`}}),
       _(m,{colorScheme:`warning`,onClick:retryAll,get children(){return`重试全部失败`}}),_(m,{colorScheme:`danger`,get disabled(){return busy()===`全部清空`},onClick:clearAll,get children(){return`清空全部缩略图`}}),
       _(j,{fontSize:`$sm`,color:`$neutral10`,get children(){return`点击目录查看已有缩略图，可勾选排除不需要缩略图的视频；生成按 5 个一批提交（防风控）`}})
     ]}}),
-    _(u,{direction:`row`,spacing:`$3`,w:`$full`,alignItems:`flex-start`,get children(){return[
-      _(j,{css:{flex:`1 1 55%`,minWidth:`420px`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$1`,get children(){return[
+    _(u,{direction:{"@initial":`column`,"@md":`row`},spacing:`$3`,w:`$full`,alignItems:`flex-start`,get children(){return[
+      _(j,{w:{"@initial":`$full`,"@md":`50%`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$1`,get children(){return[
         _(j,{fontWeight:`$medium`,p:`$2`,get children(){return`目录`}}),
         _(V,{get when(){return scanStatus()!==`complete`},get children(){return _(j,{p:`$2`,fontSize:`$sm`,color:`$warning9`,get children(){return`115 网盘受限中，当前仅展示已有缩略图的目录；恢复后自动显示全部`}})}}),
         _(V,{get when(){return treeLoading()},get children(){return _(j,{p:`$2`,fontSize:`$sm`,color:`$neutral9`,get children(){return`加载中...`}})}}),
         _(u,{direction:`column`,w:`$full`,get children(){return _(T,{get each(){return tree()},children:q=>TN(q,0)})}})
       ]}}),
-      _(j,{css:{flex:`1 1 45%`,minWidth:`380px`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$2`,get children(){return[
+      _(j,{w:{"@initial":`$full`,"@md":`50%`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$2`,get children(){return[
         _(j,{fontWeight:`$medium`,css:{wordBreak:`break-all`},get children(){return sel()?sel():`未选择目录`}}),
-        _(u,{spacing:`$1`,mt:`$2`,get children(){return[
+        _(u,{spacing:`$1`,mt:`$2`,wrap:`wrap`,get children(){return[
           _(y,{colorScheme:`info`,get children(){return`已有缩略图 ${selCount()} 个`}}),
           _(y,{get colorScheme(){return selExcluded().length?`warning`:`neutral`},get children(){return`已排除 ${selExcluded().length} 个`}}),
           _(m,{size:`xs`,get disabled(){return!sel()},onClick:()=>genSel(!1),get children(){return`生成缺失`}}),
@@ -106,7 +106,7 @@ var ee=()=>{
           _(m,{size:`xs`,colorScheme:`warning`,get disabled(){return!sel()},onClick:retrySel,get children(){return`重试失败`}}),
           _(m,{size:`xs`,colorScheme:`danger`,get disabled(){return busy()===sel()+`-c`},onClick:clearSel,get children(){return`清空`}})
         ]}}),
-        _(u,{spacing:`$2`,alignItems:`center`,mt:`$2`,get children(){return[
+        _(u,{spacing:`$2`,alignItems:`center`,mt:`$2`,wrap:`wrap`,get children(){return[
           _(m,{size:`xs`,colorScheme:`warning`,get disabled(){return!sel()},onClick:excludeUnchecked,get children(){return`排除未勾选`}}),
           _(m,{size:`xs`,get disabled(){return!sel()||!selExcluded().length},onClick:restoreExcluded,get children(){return`恢复已排除`}}),
           _(j,{fontSize:`$xs`,color:`$neutral9`,get children(){return`取消勾选 = 不需要缩略图`}})
@@ -121,7 +121,7 @@ var ee=()=>{
     _(V,{get when(){return stale().length>0},get children(){return _(u,{spacing:`$2`,mt:`$3`,w:`$full`,direction:`column`,get children(){return[
       _(j,{fontWeight:`$medium`,get children(){return`检测到旧挂载路径（存储挂载路径已变更）：`}}),
       _(j,{fontSize:`$sm`,get children(){return stale().map(e=>e.dir+`（`+e.count+`）`).join(`、`)}}),
-      _(u,{spacing:`$2`,alignItems:`center`,get children(){return[
+      _(u,{direction:{"@initial":`column`,"@md":`row`},spacing:`$2`,alignItems:`center`,get children(){return[
         _(j,{get children(){return`旧前缀`}}),
         _(Hx,{get value(){return oldP()},onInput:e=>setOldP(e.currentTarget.value),placeholder:`如 /影视相关`,w:`$full`,maxW:`260px`}),
         _(j,{get children(){return`→ 新前缀`}}),
