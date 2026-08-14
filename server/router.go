@@ -49,9 +49,15 @@ func Init(e *gin.Engine) {
 	g.GET("/d/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.Down)
 	g.GET("/p/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.Proxy)
 	g.GET("/vt/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.VideoThumb)
+	g.GET("/at/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.AudioThumb)
+	g.GET("/it/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.ImageThumb)
+	g.GET("/ct/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.CoverThumb)
 	g.HEAD("/d/*path", middlewares.PathParse, signCheck, handles.Down)
 	g.HEAD("/p/*path", middlewares.PathParse, signCheck, handles.Proxy)
 	g.HEAD("/vt/*path", middlewares.PathParse, signCheck, handles.VideoThumb)
+	g.HEAD("/at/*path", middlewares.PathParse, signCheck, handles.AudioThumb)
+	g.HEAD("/it/*path", middlewares.PathParse, signCheck, handles.ImageThumb)
+	g.HEAD("/ct/*path", middlewares.PathParse, signCheck, handles.CoverThumb)
 	archiveSignCheck := middlewares.Down(sign.VerifyArchive)
 	g.GET("/ad/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveDown)
 	g.GET("/ap/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveProxy)
@@ -90,6 +96,9 @@ func Init(e *gin.Engine) {
 	auth.GET("/115/qrcode/status", handles.Driver115QRCodeStatus)
 	auth.POST("/115/qrcode/login", handles.Driver115QRCodeLogin)
 	auth.POST("/115/root_folders", handles.Driver115RootFolders)
+	auth.POST("/115/list_folders", handles.Driver115ListFolders)
+	auth.POST("/115/check_cookie", handles.Driver115CheckCookie)
+	auth.POST("/115/check_storage", handles.Driver115CheckStorage)
 
 	// auth
 	api.GET("/auth/sso", handles.SSOLoginRedirect)
@@ -152,6 +161,10 @@ func admin(g *gin.RouterGroup) {
 	storage.POST("/enable", handles.EnableStorage)
 	storage.POST("/disable", handles.DisableStorage)
 	storage.POST("/load_all", handles.LoadAllStorages)
+
+	thumb := g.Group("/thumb")
+	thumb.POST("/generate", handles.ThumbGenerate)
+	thumb.GET("/status", handles.ThumbStatus)
 
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)

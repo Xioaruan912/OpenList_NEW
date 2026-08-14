@@ -7,11 +7,13 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -21,6 +23,39 @@ type Pan115 struct {
 	client     *driver115.Pan115Client
 	limiter    *rate.Limiter
 	appVerOnce sync.Once
+}
+
+// multiRootID 多根模式下的虚拟根目录 ID
+const multiRootID = "__multi_root__"
+
+// GetRootId 单根返回真实根 ID；多根返回虚拟根 ID（挂载点显示各所选文件夹）
+func (d *Pan115) GetRootId() string {
+	ids := d.rootIDs()
+	if len(ids) > 1 {
+		return multiRootID
+	}
+	return ids[0]
+}
+
+// GetRoot 多根模式：返回虚拟根 obj，其下列出所有挂载的文件夹
+func (d *Pan115) GetRoot(ctx context.Context) (model.Obj, error) {
+	ids := d.rootIDs()
+	if len(ids) == 1 {
+		return &model.Object{
+			ID:       ids[0],
+			Name:     op.RootName,
+			Modified: d.GetStorage().Modified,
+			IsFolder: true,
+			Mask:     model.Locked,
+		}, nil
+	}
+	return &model.Object{
+		ID:       multiRootID,
+		Name:     op.RootName,
+		Modified: d.GetStorage().Modified,
+		IsFolder: true,
+		Mask:     model.Locked,
+	}, nil
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -54,6 +89,10 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
+	// 多根模式：虚拟根下列出所有挂载的文件夹
+	if dir.GetID() == multiRootID {
+		return d.listMultiRoots(ctx)
+	}
 	files, err := d.getFiles(dir.GetID())
 	if err != nil && !errors.Is(err, driver115.ErrNotExist) {
 		return nil, err
@@ -61,6 +100,26 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 	return utils.SliceConvert(files, func(src FileObj) (model.Obj, error) {
 		return &src, nil
 	})
+}
+
+// listMultiRoots 列出所有挂载根文件夹（虚拟文件夹，名称取自 115 真实文件夹名）
+func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
+	var objs []model.Obj
+	for _, id := range d.rootIDs() {
+		f, err := d.getNewFile(id)
+		if err != nil {
+			log.Warnf("115 get multi root [%s] failed: %v", id, err)
+			continue
+		}
+		objs = append(objs, &model.Object{
+			ID:       f.GetID(),
+			Name:     f.GetName(),
+			Modified: f.ModTime(),
+			IsFolder: true,
+			Mask:     model.Locked,
+		})
+	}
+	return objs, nil
 }
 
 func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {

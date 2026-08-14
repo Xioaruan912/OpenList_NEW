@@ -38,6 +38,9 @@ func (d *Pan115) login() error {
 		},
 	}
 	d.client = driver115.New(opts...)
+	// 115 请求必须设超时：网盘风控黑洞连接时 resty 默认永久挂起，
+	// 会导致缩略图预热等后台任务无限卡死
+	d.client.Client.SetTimeout(30 * time.Second)
 	cr := &driver115.Credential{}
 	if d.QRCodeToken != "" {
 		s := &driver115.QRCodeSession{

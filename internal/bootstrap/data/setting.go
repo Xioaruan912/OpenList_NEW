@@ -188,6 +188,18 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.HandleHookRateLimit, Value: "0", Type: conf.TypeNumber, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.IgnoreSystemFiles, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `When enabled, ignores common system files during upload (.DS_Store, desktop.ini, Thumbs.db, and files starting with ._)`},
 
+		// thumbnail settings
+		{Key: conf.ThumbVideoMaxSize, Value: "2147483648", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max video file size (bytes) to generate thumbnail, default 2GB`},
+		{Key: conf.ThumbAudioMaxSize, Value: "52428800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max audio file size (bytes) to extract cover art, default 50MB`},
+		{Key: conf.ThumbImageMaxSize, Value: "20971520", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max image file size (bytes) to generate thumbnail, default 20MB`},
+		{Key: conf.ThumbCacheTTL, Value: "30", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail cache expire days, default 30`},
+		{Key: conf.ThumbCacheMaxSize, Value: "2147483648", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max thumbnail cache total size (bytes), default 2GB`},
+		{Key: conf.ThumbCoverNames, Value: "folder.jpg,cover.jpg,thumb.jpg,folder.png,cover.png,thumb.png", Type: conf.TypeString, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `cover file names searched in a directory, comma separated`},
+		{Key: conf.ThumbDirCover, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `show directory cover images in grid view`},
+		{Key: conf.ThumbPrewarm, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `pre-generate video thumbnails in background when a directory is browsed`},
+		{Key: conf.ThumbConcurrency, Value: "8", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail generation concurrency`},
+		{Key: conf.ThumbChunkSize, Value: "3145728", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `video segment size (bytes) downloaded for thumbnail extraction, default 3MB`},
+
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},
 		{Key: conf.SearchIndex, Value: "none", Type: conf.TypeSelect, Options: "database,database_non_full_text,bleve,meilisearch,none", Group: model.INDEX},

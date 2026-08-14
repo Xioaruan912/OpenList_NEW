@@ -226,10 +226,22 @@ func pagination(objs []model.Obj, req *model.PageReq) (int, []model.Obj) {
 }
 
 func toObjsResp(c *gin.Context, objs []model.Obj, parent string, encrypt bool) []ObjResp {
+	prewarmDir(c, parent, objs)
 	var resp []ObjResp
 	for _, obj := range objs {
 		thumb, _ := model.GetThumb(obj)
-		thumb = fillVideoThumb(c, parent, obj, thumb)
+		if obj.IsDir() {
+			thumb = fillCoverThumb(c, parent, obj)
+		} else {
+			switch utils.GetFileType(obj.GetName()) {
+			case conf.VIDEO:
+				thumb = fillVideoThumb(c, parent, obj, thumb)
+			case conf.AUDIO:
+				thumb = fillAudioThumb(c, parent, obj, thumb)
+			case conf.IMAGE:
+				thumb = fillImageThumb(c, parent, obj, thumb)
+			}
+		}
 		mountDetails, _ := model.GetStorageDetails(obj)
 		resp = append(resp, ObjResp{
 			Name:         obj.GetName(),
@@ -356,6 +368,18 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	}
 	parentMeta, _ := op.GetNearestMeta(parentPath)
 	thumb, _ := model.GetThumb(obj)
+	if obj.IsDir() {
+		thumb = fillCoverThumb(c, parentPath, obj)
+	} else {
+		switch utils.GetFileType(obj.GetName()) {
+		case conf.VIDEO:
+			thumb = fillVideoThumb(c, parentPath, obj, thumb)
+		case conf.AUDIO:
+			thumb = fillAudioThumb(c, parentPath, obj, thumb)
+		case conf.IMAGE:
+			thumb = fillImageThumb(c, parentPath, obj, thumb)
+		}
+	}
 	mountDetails, _ := model.GetStorageDetails(obj)
 	common.SuccessResp(c, FsGetResp{
 		ObjResp: ObjResp{

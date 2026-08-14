@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
@@ -66,7 +67,13 @@ func Driver115QRCodeLogin(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, gin.H{"cookie": cookie})
+	resp := gin.H{"cookie": cookie}
+	info, err := driver115pkg.CheckCookie(cookie)
+	if err == nil {
+		resp["user_id"] = info.UserID
+		resp["user_name"] = info.UserName
+	}
+	common.SuccessResp(c, resp)
 }
 
 type Driver115RootFoldersReq struct {
@@ -87,4 +94,77 @@ func Driver115RootFolders(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"content": folders})
+}
+
+// Driver115ListFoldersReq POST /api/115/list_folders
+type Driver115ListFoldersReq struct {
+	Cookie string `json:"cookie" binding:"required"`
+	FileID string `json:"file_id"`
+}
+
+// Driver115ListFolders POST /api/115/list_folders
+// 使用 cookie 列出指定文件夹（file_id，空为根目录）下的子文件夹，供逐级浏览选择挂载根
+func Driver115ListFolders(c *gin.Context) {
+	var req Driver115ListFoldersReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if req.FileID == "" {
+		req.FileID = "0"
+	}
+	folders, err := driver115pkg.ListFolders(req.Cookie, req.FileID)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, gin.H{"content": folders, "file_id": req.FileID})
+}
+
+// Driver115CheckCookie POST /api/115/check_cookie
+// 校验 115 cookie 是否有效，返回账号信息
+func Driver115CheckCookie(c *gin.Context) {
+	var req Driver115RootFoldersReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	info, err := driver115pkg.CheckCookie(req.Cookie)
+	if err != nil {
+		common.SuccessResp(c, gin.H{"valid": false, "msg": err.Error()})
+		return
+	}
+	common.SuccessResp(c, gin.H{"valid": true, "user_id": info.UserID, "user_name": info.UserName})
+}
+
+// Driver115CheckStorage POST /api/115/check_storage
+// 校验已配置的 115 存储 cookie 是否有效
+func Driver115CheckStorage(c *gin.Context) {
+	var req struct {
+		MountPath string `json:"mount_path" binding:"required"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	d, err := op.GetStorageByMountPath(req.MountPath)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	addition, ok := d.GetAddition().(*driver115pkg.Addition)
+	if !ok {
+		common.ErrorStrResp(c, "storage is not a 115 driver", 400)
+		return
+	}
+	if addition.Cookie == "" {
+		common.SuccessResp(c, gin.H{"valid": false, "msg": "storage has no cookie configured"})
+		return
+	}
+	info, err := driver115pkg.CheckCookie(addition.Cookie)
+	if err != nil {
+		common.SuccessResp(c, gin.H{"valid": false, "msg": err.Error()})
+		return
+	}
+	common.SuccessResp(c, gin.H{"valid": true, "user_id": info.UserID, "user_name": info.UserName})
 }

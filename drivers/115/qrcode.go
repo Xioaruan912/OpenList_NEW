@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"strconv"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
@@ -91,13 +92,18 @@ func LoginWithQRCode(uid, app string) (string, error) {
 
 // ListRootFolders 使用 cookie 列出网盘根目录下的所有文件夹
 func ListRootFolders(cookie string) ([]FolderInfo, error) {
+	return ListFolders(cookie, "0")
+}
+
+// ListFolders 使用 cookie 列出指定 file_id 目录下的所有文件夹（file_id="0" 为根目录）
+func ListFolders(cookie, fileID string) ([]FolderInfo, error) {
 	client := newQRCodeClient()
 	cr := &driver115.Credential{}
 	if err := cr.FromCookie(cookie); err != nil {
 		return nil, err
 	}
 	client.ImportCredential(cr)
-	files, err := client.ListWithLimit("0", 1000, driver115.WithMultiUrls())
+	files, err := client.ListWithLimit(fileID, 1000, driver115.WithMultiUrls())
 	if err != nil {
 		return nil, err
 	}
@@ -112,4 +118,28 @@ func ListRootFolders(cookie string) ([]FolderInfo, error) {
 		}
 	}
 	return folders, nil
+}
+
+// UserInfo 115 账号信息
+type UserInfo struct {
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
+}
+
+// CheckCookie 校验 cookie 是否有效，返回账号信息
+func CheckCookie(cookie string) (*UserInfo, error) {
+	client := newQRCodeClient()
+	cr := &driver115.Credential{}
+	if err := cr.FromCookie(cookie); err != nil {
+		return nil, err
+	}
+	client.ImportCredential(cr)
+	u, err := client.GetUser()
+	if err != nil {
+		return nil, err
+	}
+	return &UserInfo{
+		UserID:   strconv.FormatInt(u.UserID, 10),
+		UserName: u.UserName,
+	}, nil
 }

@@ -152,6 +152,18 @@ const (
 	FTPTLSPublicCertPath     = "ftp_tls_public_cert_path"
 	SFTPDisablePasswordLogin = "sftp_disable_password_login"
 
+	// thumbnails
+	ThumbVideoMaxSize = "thumb_video_max_size"
+	ThumbAudioMaxSize = "thumb_audio_max_size"
+	ThumbImageMaxSize = "thumb_image_max_size"
+	ThumbCacheTTL     = "thumb_cache_ttl"
+	ThumbCacheMaxSize = "thumb_cache_max_size"
+	ThumbCoverNames   = "thumb_cover_names"
+	ThumbDirCover     = "thumb_dir_cover"
+	ThumbPrewarm      = "thumb_prewarm"
+	ThumbConcurrency  = "thumb_concurrency"
+	ThumbChunkSize    = "thumb_chunk_size"
+
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"
 	TaskOfflineDownloadTransferThreadsNum = "offline_download_transfer_task_threads_num"
