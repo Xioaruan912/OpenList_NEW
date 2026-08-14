@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
@@ -26,6 +27,11 @@ func ThumbGenerate(c *gin.Context) {
 	var req ThumbGenerateReq
 	if err := c.ShouldBind(&req); err != nil {
 		common.ErrorResp(c, err, 400)
+		return
+	}
+	// 风控防呆：115 风控中禁止触发缩略图生成
+	if blocked, _ := isStorageBlocked(req.Path); blocked {
+		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试（通常 30-60 分钟）", 429)
 		return
 	}
 	apiURL := common.GetApiUrl(c)
@@ -179,4 +185,14 @@ func thumbCacheStats() (cached int, failCount int, totalSize int64) {
 		}
 	}
 	return
+}
+
+// isStorageBlocked 判断路径所属存储是否处于 115 风控状态（返回是否拦截 + 存储名）
+func isStorageBlocked(fullPath string) (bool, string) {
+	storage, err := fs.GetStorage(fullPath, &fs.GetStoragesArgs{})
+	if err != nil {
+		return false, ""
+	}
+	mount := storage.GetStorage().MountPath
+	return driver115pkg.IsStorageBlocked(mount), mount
 }

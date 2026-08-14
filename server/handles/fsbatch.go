@@ -185,6 +185,11 @@ func FsBatchRename(c *gin.Context) {
 		return
 	}
 	common.GinAppendValues(c, conf.MetaKey, meta)
+	// 风控防呆：115 风控中禁止批量重命名
+	if blocked, _ := isStorageBlocked(reqPath); blocked {
+		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试（通常 30-60 分钟）", 429)
+		return
+	}
 	// 限速执行：每文件 2s，防止批量重命名高频调用触发网盘风控
 	for _, renameObject := range req.RenameObjects {
 		if renameObject.SrcName == "" || renameObject.NewName == "" {
@@ -250,6 +255,11 @@ func FsRegexRename(c *gin.Context) {
 		return
 	}
 	common.GinAppendValues(c, conf.MetaKey, meta)
+	// 风控防呆
+	if blocked, _ := isStorageBlocked(reqPath); blocked {
+		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试（通常 30-60 分钟）", 429)
+		return
+	}
 
 	srcRegexp, err := regexp.Compile(req.SrcNameRegex)
 	if err != nil {

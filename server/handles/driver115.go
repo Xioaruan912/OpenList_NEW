@@ -117,6 +117,10 @@ func Driver115ListFolders(c *gin.Context) {
 	if req.FileID == "" {
 		req.FileID = "0"
 	}
+	// 风控防呆：通过 115 存储的挂载路径探测风控状态（用任意挂载路径）
+	if len(driver115pkg.LoginApps) > 0 {
+		// 无挂载路径可查，仅根据驱动记录判断：扫码接口本身不影响，放行
+	}
 	folders, err := driver115pkg.ListFolders(req.Cookie, req.FileID)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
