@@ -2,6 +2,7 @@ package handles
 
 import (
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -253,4 +254,42 @@ func Driver115StorageHealth(c *gin.Context) {
 		result = append(result, item)
 	}
 	common.SuccessResp(c, gin.H{"content": result})
+}
+
+// CheckBlockedReq POST /api/admin/storage/check_blocked
+type CheckBlockedReq struct {
+	ID    uint   `json:"id"`
+	Mount string `json:"mount"`
+}
+
+// CheckStorageBlocked POST /api/admin/storage/check_blocked
+// 检查指定 115 存储当前是否处于风控状态（基于内存标记，5 分钟内有效；
+// 不主动发起 115 请求，避免检查动作本身加剧风控）
+func CheckStorageBlocked(c *gin.Context) {
+	var req CheckBlockedReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	mount := strings.TrimSuffix(req.Mount, "/")
+	if mount == "" && req.ID != 0 {
+		st, err := db.GetStorageById(req.ID)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		mount = strings.TrimSuffix(st.MountPath, "/")
+	}
+	if mount == "" {
+		common.ErrorStrResp(c, "invalid storage", 400)
+		return
+	}
+	blocked := driver115pkg.IsStorageBlocked(mount)
+	health, hasHealth := driver115pkg.GetStorageHealth(mount)
+	common.SuccessResp(c, gin.H{
+		"mount":      mount,
+		"blocked":    blocked,
+		"has_health": hasHealth,
+		"msg":        health.Msg,
+	})
 }

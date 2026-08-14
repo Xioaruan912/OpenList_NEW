@@ -162,6 +162,7 @@ func admin(g *gin.RouterGroup) {
 	storage.POST("/enable", handles.EnableStorage)
 	storage.POST("/disable", handles.DisableStorage)
 	storage.POST("/load_all", handles.LoadAllStorages)
+	storage.POST("/check_blocked", handles.CheckStorageBlocked)
 
 	thumb := g.Group("/thumb")
 	thumb.POST("/generate", handles.ThumbGenerate)
