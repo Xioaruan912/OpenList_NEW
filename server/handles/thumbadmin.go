@@ -42,6 +42,7 @@ func ThumbGenerate(c *gin.Context) {
 	apiURL := common.GetApiUrl(c)
 	queued := 0
 	removed := 0
+	excluded := readThumbExcluded()
 	var scanDir func(dir string) error
 	scanDir = func(dir string) error {
 		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
@@ -61,6 +62,9 @@ func ThumbGenerate(c *gin.Context) {
 				continue
 			}
 			rawPath := dir + "/" + obj.GetName()
+			if excluded[rawPath] {
+				continue
+			}
 			if req.Force {
 				if err := os.Remove(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
 					removed++
@@ -71,9 +75,18 @@ func ThumbGenerate(c *gin.Context) {
 		}
 		return nil
 	}
-	if err := scanDir(req.Path); err != nil {
-		common.ErrorResp(c, err, 500)
-		return
+	// 根目录不是有效存储路径：遍历所有挂载
+	roots := []string{req.Path}
+	if req.Path == "/" {
+		if mounts := currentMountPaths(); len(mounts) > 0 {
+			roots = mounts
+		}
+	}
+	for _, root := range roots {
+		if err := scanDir(root); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
 	}
 	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive, "force": req.Force, "removed": removed})
 }
@@ -470,27 +483,66 @@ func sliceThumbDirsPage(items []ThumbDirsEntry, page, pageSize int) []ThumbDirsE
 }
 
 // ThumbTree GET /api/admin/thumb/tree
-// 从缩略图索引构建目录树（已有缩略图的目录层级，不依赖网盘列表，115 风控下也能展示）
+// 扫描完整目录树（含没有缩略图的目录，忽略 _thumbnails），统计每目录视频数 videos
+// 与已有缩略图数 cached；扫描失败（115 风控等）时以缩略图索引兜底
 func ThumbTree(c *gin.Context) {
 	type node struct {
 		Path     string  `json:"path"`
 		Name     string  `json:"name"`
 		Cached   int     `json:"cached"`
+		Videos   int     `json:"videos"`
 		Children []*node `json:"children"`
 	}
+	// 索引：每目录已有缩略图数（直接子项）
 	indexed := readThumbIndex()
-	root := &node{}
+	cachedByDir := map[string]int{}
 	for _, p := range indexed {
-		parts := strings.Split(strings.Trim(p, "/"), "/")
+		dir := stdpath.Dir(p)
+		if dir != "" && dir != "." {
+			cachedByDir[dir]++
+		}
+	}
+	root := &node{}
+	dirsCount := 0
+	var scan func(dir string, cur *node)
+	scan = func(dir string, cur *node) {
+		if dirsCount >= thumbScanMaxDirs {
+			return
+		}
+		dirsCount++
+		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
+		if err != nil {
+			return
+		}
+		for _, obj := range objs {
+			if obj.IsDir() {
+				if obj.GetName() == "_thumbnails" {
+					continue
+				}
+				childPath := dir + "/" + obj.GetName()
+				child := &node{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath]}
+				cur.Children = append(cur.Children, child)
+				scan(childPath, child)
+			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
+				cur.Videos++
+			}
+		}
+	}
+	mounts := currentMountPaths()
+	if len(mounts) > 0 {
+		for _, m := range mounts {
+			child := &node{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m]}
+			root.Children = append(root.Children, child)
+			scan(m, child)
+		}
+	}
+	// 索引兜底：115 风控导致扫描不到时，把索引目录补入树
+	for dir, cnt := range cachedByDir {
+		parts := strings.Split(strings.Trim(dir, "/"), "/")
 		cur := root
 		path := ""
 		for _, part := range parts {
 			if part == "" {
-				continue
-			}
-			// 文件（如 .mp4）不建目录节点，计数计入父目录
-			if utils.GetFileType(part) != conf.UNKNOWN {
-				cur.Cached++
 				continue
 			}
 			path += "/" + part
@@ -502,14 +554,187 @@ func ThumbTree(c *gin.Context) {
 				}
 			}
 			if child == nil {
-				child = &node{Path: path, Name: part}
+				child = &node{Path: path, Name: part, Cached: cnt}
 				cur.Children = append(cur.Children, child)
 			}
 			cur = child
-			cur.Cached++
 		}
 	}
 	common.SuccessResp(c, gin.H{"children": root.Children})
+}
+
+// ThumbDir GET /api/admin/thumb/dir?path=
+// 返回指定目录下（含子目录）已有缩略图的视频文件清单（来自索引，不依赖网盘列表）
+func ThumbDir(c *gin.Context) {
+	path := strings.TrimSuffix(c.Query("path"), "/")
+	indexed := readThumbIndex()
+	var files []string
+	total := 0
+	prefix := path + "/"
+	for _, p := range indexed {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		total++
+		if len(files) < 200 {
+			files = append(files, p)
+		}
+	}
+	ex := readThumbExcluded()
+	var exFiles []string
+	for _, f := range files {
+		if ex[f] {
+			exFiles = append(exFiles, f)
+		}
+	}
+	common.SuccessResp(c, gin.H{"path": path, "files": files, "count": total, "excluded": exFiles})
+}
+
+// ThumbExcludeReq POST /api/admin/thumb/exclude
+type ThumbExcludeReq struct {
+	Paths   []string `json:"paths"`
+	Exclude bool     `json:"exclude"` // true=排除（不生成缩略图），false=恢复
+}
+
+// readThumbExcluded 读取被排除的视频路径集合
+func readThumbExcluded() map[string]bool {
+	m := map[string]bool{}
+	data, err := os.ReadFile(filepath.Join(thumbDir(), "excluded.jsonl"))
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			m[line] = true
+		}
+	}
+	return m
+}
+
+func writeThumbExcluded(paths []string) error {
+	var sb strings.Builder
+	for _, p := range paths {
+		sb.WriteString(p)
+		sb.WriteString("\n")
+	}
+	return os.WriteFile(filepath.Join(thumbDir(), "excluded.jsonl"), []byte(sb.String()), 0o666)
+}
+
+// ThumbExclude 排除/恢复指定视频的缩略图生成（持久化到 excluded.jsonl）
+func ThumbExclude(c *gin.Context) {
+	var req ThumbExcludeReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	cur := readThumbExcluded()
+	changed := false
+	if req.Exclude {
+		for _, p := range req.Paths {
+			p = strings.TrimSpace(p)
+			if p != "" && !cur[p] {
+				cur[p] = true
+				changed = true
+			}
+		}
+	} else {
+		for _, p := range req.Paths {
+			p = strings.TrimSpace(p)
+			if cur[p] {
+				delete(cur, p)
+				changed = true
+			}
+		}
+	}
+	if changed {
+		var list []string
+		for p := range cur {
+			list = append(list, p)
+		}
+		sort.Strings(list)
+		if err := writeThumbExcluded(list); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	common.SuccessResp(c, gin.H{"changed": changed, "excluded": len(cur)})
+}
+
+// ThumbClearReq POST /api/admin/thumb/clear
+type ThumbClearReq struct {
+	Path string `json:"path" binding:"required"`
+}
+
+// ThumbClear 清空指定目录下所有缩略图（本地缓存 + 索引 + 远程 _thumbnails），立即生效
+func ThumbClear(c *gin.Context) {
+	var req ThumbClearReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	path := strings.TrimSuffix(req.Path, "/")
+	if path == "" {
+		common.ErrorStrResp(c, "invalid path", 400)
+		return
+	}
+	if blocked, _ := isStorageBlocked(path); blocked {
+		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试", 429)
+		return
+	}
+	ctx := c.Request.Context()
+	indexed := readThumbIndex()
+	removed := 0
+	var keep []string
+	prefix := path + "/"
+	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
+	for _, p := range indexed {
+		if strings.HasPrefix(p, prefix) {
+			for _, kind := range kinds {
+				_ = os.Remove(thumbCachePath(kind, p))
+				_ = os.Remove(thumbFailPath(kind, p))
+			}
+			removed++
+			continue
+		}
+		keep = append(keep, p)
+	}
+	// 递归清空远程 _thumbnails（115 remote 模式）
+	if addition := remoteThumbStore(path); addition != nil {
+		folder := addition.ThumbFolderName()
+		if folder != "" {
+			var clearDir func(dir string)
+			clearDir = func(dir string) {
+				thumbDir := dir + "/" + folder
+				if objs, err := fs.List(ctx, thumbDir, &fs.ListArgs{}); err == nil {
+					for _, obj := range objs {
+						if !obj.IsDir() {
+							_ = fs.Remove(ctx, thumbDir+"/"+obj.GetName())
+						}
+					}
+				}
+				if objs, err := fs.List(ctx, dir, &fs.ListArgs{}); err == nil {
+					for _, obj := range objs {
+						if obj.IsDir() && obj.GetName() != folder {
+							clearDir(dir + "/" + obj.GetName())
+						}
+					}
+				}
+			}
+			clearDir(path)
+		}
+	}
+	if err := writeThumbIndex(keep); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	thumbDirsMu.Lock()
+	thumbDirsCache = map[string]struct {
+		at   time.Time
+		data []ThumbDirsEntry
+	}{}
+	thumbDirsMu.Unlock()
+	common.SuccessResp(c, gin.H{"removed": removed, "path": path})
 }
 
 // ---------- 挂载路径迁移 ----------
