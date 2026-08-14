@@ -22,7 +22,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -705,12 +704,9 @@ func remoteThumbCacheSet(rawPath string, data []byte) {
 func uploadThumbRemote(ctx context.Context, rawPath string, addition interface {
 	ThumbFolderName() string
 }, data []byte) error {
-	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
-	if err != nil {
-		return err
-	}
 	thumbName := remoteThumbName(rawPath)
-	if _, err := fs.Get(ctx, remoteThumbPath(addition, rawPath), &fs.GetArgs{NoLog: true}); err == nil {
+	thumbFullPath := remoteThumbPath(addition, rawPath)
+	if _, err := fs.Get(ctx, thumbFullPath, &fs.GetArgs{NoLog: true}); err == nil {
 		return nil // 已存在
 	}
 	s := &stream.FileStream{
@@ -721,8 +717,10 @@ func uploadThumbRemote(ctx context.Context, rawPath string, addition interface {
 		},
 		Reader: bytes.NewReader(data),
 	}
+	// fs.PutDirectly 接收完整路径（含挂载前缀），内部自动解析为驱动路径，
+	// 避免缩略图文件夹被错误创建到网盘根目录
 	dir := stdpath.Dir(rawPath) + "/" + addition.ThumbFolderName()
-	return op.Put(ctx, storage, dir, s, nil)
+	return fs.PutDirectly(ctx, dir, s)
 }
 
 // serveRemoteVideoThumb 远程模式视频缩略图：内存缓存 → 网盘已有 → 生成并上传网盘
