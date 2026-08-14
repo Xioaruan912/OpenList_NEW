@@ -112,6 +112,12 @@ func ThumbStatus(c *gin.Context) {
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
+	status["pending_upload"] = len(thumbPendingUploadList())
+	status["remote_upload_enabled"] = setting.GetStr(conf.ThumbRemoteUploadEnabled, "true") == "true"
+	status["remote_upload_start"] = setting.GetInt(conf.ThumbRemoteUploadStart, 3)
+	status["remote_upload_end"] = setting.GetInt(conf.ThumbRemoteUploadEnd, 6)
+	status["remote_upload_batch"] = setting.GetInt(conf.ThumbRemoteUploadBatch, 5)
+	status["remote_upload_interval"] = setting.GetInt(conf.ThumbRemoteUploadInterval, 30)
 	// 已有缩略图的目录清单（按目录分组，来自路径索引）
 	indexed := readThumbIndex()
 	cacheByDir := map[string]int{}

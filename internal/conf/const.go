@@ -166,6 +166,13 @@ const (
 	ThumbWidth        = "thumb_width"
 	ThumbFailTTL      = "thumb_fail_ttl"
 
+	// remote thumbnail deferred upload (avoid 115 rate control)
+	ThumbRemoteUploadEnabled  = "thumb_remote_upload_enabled"
+	ThumbRemoteUploadStart    = "thumb_remote_upload_start"
+	ThumbRemoteUploadEnd      = "thumb_remote_upload_end"
+	ThumbRemoteUploadBatch    = "thumb_remote_upload_batch"
+	ThumbRemoteUploadInterval = "thumb_remote_upload_interval"
+
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"
 	TaskOfflineDownloadTransferThreadsNum = "offline_download_transfer_task_threads_num"
