@@ -227,7 +227,6 @@ func pagination(objs []model.Obj, req *model.PageReq) (int, []model.Obj) {
 }
 
 func toObjsResp(c *gin.Context, objs []model.Obj, parent string, encrypt bool) []ObjResp {
-	prewarmDir(c, parent, objs)
 	var resp []ObjResp
 	for _, obj := range objs {
 		thumb, _ := model.GetThumb(obj)

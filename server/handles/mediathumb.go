@@ -732,85 +732,113 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	return extractVideoFrame(tmpFile)
 }
 
-// prewarmStart 启动预热 worker（低并发细水长流，避免触发网盘 API 风控）
+// prewarmStart 启动预热 worker（单 worker 分批节流，避免触发网盘 API 风控）
 func prewarmStart() {
 	prewarmOnce.Do(func() {
 		prewarmCh = make(chan thumbPrewarmTask, 2048)
-		workers := 2
-		for i := 0; i < workers; i++ {
-			go prewarmWorker()
-		}
+		go prewarmWorker()
 	})
 }
 
+const (
+	prewarmBatchSize     = 5  // 每批最多提交任务数（防风控）
+	prewarmBatchInterval = 20 * time.Second
+)
+
+// prewarmWorker 分批节流：每批最多 prewarmBatchSize 个任务串行处理，批间固定间隔
 func prewarmWorker() {
-	for task := range prewarmCh {
-		cachePath := thumbCachePath(task.kind, task.rawPath)
-		if _, err := os.ReadFile(cachePath); err == nil {
-			prewarmDone.Store(task.rawPath, struct{}{})
-			continue
-		}
-		if thumbFailed(task.kind, task.rawPath) {
-			prewarmDone.Store(task.rawPath, struct{}{})
-			continue
-		}
-		if !thumbAcquire(true) {
-			// 并发资源被直接请求占用，让位稍后重试
-			time.Sleep(500 * time.Millisecond)
-			prewarmCh <- task
-			continue
-		}
-		func() {
-			defer thumbRelease()
-			// 生成任务硬限时 90s（115 驱动内部请求无超时，网盘风控黑洞时会永久挂起，
-			// 必须用 goroutine+select 强制放弃任务，保证 worker 永不卡死）
-			done := make(chan []byte, 1)
-			errCh := make(chan error, 1)
-			go func() {
-				png, err := generateVideoThumb(context.Background(), task.rawPath, task.apiURL)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				done <- png
-			}()
-			var png []byte
-			var err error
+	for {
+		batch := make([]thumbPrewarmTask, 0, prewarmBatchSize)
+	collect:
+		for len(batch) < prewarmBatchSize {
 			select {
-			case png = <-done:
-			case err = <-errCh:
-			case <-time.After(90 * time.Second):
-				err = fmt.Errorf("thumb generation timeout (90s)")
-			}
-			if err != nil {
-				// 预热失败不写 fail 标记（可能为网盘风控等临时问题），
-				// 长间隔退避重试（风控冻结通常 10-30 分钟，短间隔只会加重风控）
-				if task.retry < 3 && !errors.Is(err, errThumbNoCover) && !errors.Is(err, errThumbTooLarge) {
-					prewarmDone.Delete(task.rawPath)
-					time.Sleep(180 * time.Second)
-					task.retry++
-					// 重试任务阻塞入队，保证不丢（新任务入队时丢弃自身而非重试任务）
-					prewarmCh <- task
-					return
+			case task := <-prewarmCh:
+				batch = append(batch, task)
+			default:
+				if len(batch) == 0 {
+					// 队列空：阻塞等待新任务
+					task, ok := <-prewarmCh
+					if !ok {
+						return
+					}
+					batch = append(batch, task)
+				} else {
+					break collect
 				}
-				log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
-				prewarmDone.Store(task.rawPath, struct{}{})
-				return
 			}
-			// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
-			if addition := remoteThumbStore(task.rawPath); addition != nil {
-				if err := uploadThumbRemote(context.Background(), task.rawPath, addition, png); err != nil {
-					log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
-				}
-				remoteThumbCacheSet(task.rawPath, png)
-				_ = os.WriteFile(cachePath, png, 0o666)
-			} else {
-				_ = os.WriteFile(cachePath, png, 0o666)
-			}
-			thumbRecord(task.rawPath)
-			prewarmDone.Store(task.rawPath, struct{}{})
-		}()
+		}
+		for _, task := range batch {
+			processTask(task)
+		}
+		// 批间间隔，限制 115 请求频率
+		time.Sleep(prewarmBatchInterval)
 	}
+}
+
+func processTask(task thumbPrewarmTask) {
+	cachePath := thumbCachePath(task.kind, task.rawPath)
+	if _, err := os.ReadFile(cachePath); err == nil {
+		prewarmDone.Store(task.rawPath, struct{}{})
+		return
+	}
+	if thumbFailed(task.kind, task.rawPath) {
+		prewarmDone.Store(task.rawPath, struct{}{})
+		return
+	}
+	if !thumbAcquire(true) {
+		// 并发资源被直接请求占用，让位稍后重试
+		time.Sleep(500 * time.Millisecond)
+		prewarmCh <- task
+		return
+	}
+	defer thumbRelease()
+	// 生成任务硬限时 90s（115 驱动内部请求无超时，网盘风控黑洞时会永久挂起，
+	// 必须用 goroutine+select 强制放弃任务，保证 worker 永不卡死）
+	done := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		png, err := generateVideoThumb(context.Background(), task.rawPath, task.apiURL)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		done <- png
+	}()
+	var png []byte
+	var err error
+	select {
+	case png = <-done:
+	case err = <-errCh:
+	case <-time.After(90 * time.Second):
+		err = fmt.Errorf("thumb generation timeout (90s)")
+	}
+	if err != nil {
+		// 生成失败不写 fail 标记（可能为网盘风控等临时问题），
+		// 长间隔退避重试（风控冻结通常 10-30 分钟，短间隔只会加重风控）
+		if task.retry < 3 && !errors.Is(err, errThumbNoCover) && !errors.Is(err, errThumbTooLarge) {
+			prewarmDone.Delete(task.rawPath)
+			time.Sleep(180 * time.Second)
+			task.retry++
+			// 重试任务阻塞入队，保证不丢（新任务入队时丢弃自身而非重试任务）
+			prewarmCh <- task
+			return
+		}
+		log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
+		prewarmDone.Store(task.rawPath, struct{}{})
+		return
+	}
+	// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
+	if addition := remoteThumbStore(task.rawPath); addition != nil {
+		if err := uploadThumbRemote(context.Background(), task.rawPath, addition, png); err != nil {
+			log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
+		}
+		remoteThumbCacheSet(task.rawPath, png)
+		_ = os.WriteFile(cachePath, png, 0o666)
+	} else {
+		_ = os.WriteFile(cachePath, png, 0o666)
+	}
+	thumbRecord(task.rawPath)
+	prewarmDone.Store(task.rawPath, struct{}{})
 }
 
 // 目录缩略图清单缓存：列表时一次性列出 _thumbnails 文件名（1 次 API），

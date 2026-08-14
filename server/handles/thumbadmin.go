@@ -469,6 +469,49 @@ func sliceThumbDirsPage(items []ThumbDirsEntry, page, pageSize int) []ThumbDirsE
 	return items[start:end]
 }
 
+// ThumbTree GET /api/admin/thumb/tree
+// 从缩略图索引构建目录树（已有缩略图的目录层级，不依赖网盘列表，115 风控下也能展示）
+func ThumbTree(c *gin.Context) {
+	type node struct {
+		Path     string  `json:"path"`
+		Name     string  `json:"name"`
+		Cached   int     `json:"cached"`
+		Children []*node `json:"children"`
+	}
+	indexed := readThumbIndex()
+	root := &node{}
+	for _, p := range indexed {
+		parts := strings.Split(strings.Trim(p, "/"), "/")
+		cur := root
+		path := ""
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			// 文件（如 .mp4）不建目录节点，计数计入父目录
+			if utils.GetFileType(part) != conf.UNKNOWN {
+				cur.Cached++
+				continue
+			}
+			path += "/" + part
+			var child *node
+			for _, cnode := range cur.Children {
+				if cnode.Path == path {
+					child = cnode
+					break
+				}
+			}
+			if child == nil {
+				child = &node{Path: path, Name: part}
+				cur.Children = append(cur.Children, child)
+			}
+			cur = child
+			cur.Cached++
+		}
+	}
+	common.SuccessResp(c, gin.H{"children": root.Children})
+}
+
 // ---------- 挂载路径迁移 ----------
 
 type ThumbMigrateReq struct {
