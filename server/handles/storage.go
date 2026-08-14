@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -20,7 +21,8 @@ import (
 
 type StorageResp struct {
 	model.Storage
-	MountDetails *model.StorageDetails `json:"mount_details,omitempty"`
+	MountDetails *model.StorageDetails     `json:"mount_details,omitempty"`
+	Health       *driver115pkg.HealthEntry `json:"health,omitempty"`
 }
 
 type detailWithIndex struct {
@@ -33,9 +35,16 @@ func makeStorageResp(ctx *gin.Context, storages []model.Storage) []*StorageResp 
 	detailsChan := make(chan detailWithIndex, len(storages))
 	workerCount := 0
 	for i, s := range storages {
+		var health *driver115pkg.HealthEntry
+		if s.Driver == "115 Cloud" || s.Driver == "115 Share" {
+			if e, ok := driver115pkg.GetStorageHealth(s.MountPath); ok {
+				health = &e
+			}
+		}
 		ret[i] = &StorageResp{
 			Storage:      s,
 			MountDetails: nil,
+			Health:       health,
 		}
 		if setting.GetBool(conf.HideStorageDetailsInManagePage) {
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/OpenListTeam/OpenList/v4/drivers/115"
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -62,6 +63,7 @@ func (d *Pan115Share) List(ctx context.Context, dir model.Obj, args model.ListAr
 	files := make([]driver115.ShareFile, 0)
 	fileResp, err := d.client.GetShareSnapWithUA(ua, d.ShareCode, d.ReceiveCode, dir.GetID(), driver115.QueryLimit(int(d.PageSize)))
 	if err != nil {
+		_115.MarkStorageError(d.GetStorage().MountPath, err)
 		return nil, err
 	}
 	files = append(files, fileResp.Data.List...)

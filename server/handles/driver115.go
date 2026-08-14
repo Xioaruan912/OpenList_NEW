@@ -7,6 +7,7 @@ import (
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	driver115sharepkg "github.com/OpenListTeam/OpenList/v4/drivers/115_share"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -223,4 +224,29 @@ func Driver115CheckStorage(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"valid": true, "user_id": info.UserID, "user_name": info.UserName})
+}
+
+// Driver115StorageHealth GET /api/115/storage_health
+// 列出所有 115 存储的健康状态（cookie 失效提示）
+func Driver115StorageHealth(c *gin.Context) {
+	storages, err := db.GetEnabledStorages()
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	var result []gin.H
+	for _, st := range storages {
+		if st.Driver != "115 Cloud" && st.Driver != "115 Share" {
+			continue
+		}
+		entry, ok := driver115pkg.GetStorageHealth(st.MountPath)
+		item := gin.H{"mount_path": st.MountPath, "driver": st.Driver, "has_error": ok}
+		if ok {
+			item["invalid"] = entry.Invalid
+			item["msg"] = entry.Msg
+			item["at"] = entry.At
+		}
+		result = append(result, item)
+	}
+	common.SuccessResp(c, gin.H{"content": result})
 }

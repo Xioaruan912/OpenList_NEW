@@ -99,6 +99,7 @@ func Init(e *gin.Engine) {
 	auth.POST("/115/list_folders", handles.Driver115ListFolders)
 	auth.POST("/115/check_cookie", handles.Driver115CheckCookie)
 	auth.POST("/115/check_storage", handles.Driver115CheckStorage)
+	auth.GET("/115/storage_health", handles.Driver115StorageHealth)
 
 	// auth
 	api.GET("/auth/sso", handles.SSOLoginRedirect)

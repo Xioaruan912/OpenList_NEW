@@ -43,6 +43,7 @@ type ObjResp struct {
 	Type         int                        `json:"type"`
 	HashInfoStr  string                     `json:"hashinfo"`
 	HashInfo     map[*utils.HashType]string `json:"hash_info"`
+	Duration     float64                    `json:"duration,omitempty"`
 	MountDetails *model.StorageDetails      `json:"mount_details,omitempty"`
 }
 
@@ -243,7 +244,7 @@ func toObjsResp(c *gin.Context, objs []model.Obj, parent string, encrypt bool) [
 			}
 		}
 		mountDetails, _ := model.GetStorageDetails(obj)
-		resp = append(resp, ObjResp{
+		objResp := ObjResp{
 			Name:         obj.GetName(),
 			Size:         obj.GetSize(),
 			IsDir:        obj.IsDir(),
@@ -255,7 +256,12 @@ func toObjsResp(c *gin.Context, objs []model.Obj, parent string, encrypt bool) [
 			Thumb:        thumb,
 			Type:         utils.GetObjType(obj.GetName(), obj.IsDir()),
 			MountDetails: mountDetails,
-		})
+		}
+		if !obj.IsDir() && utils.GetFileType(obj.GetName()) == conf.VIDEO {
+			fullPath := parent + "/" + obj.GetName()
+			objResp.Duration = videoDuration(c.Request.Context(), fullPath, common.GetApiUrl(c))
+		}
+		resp = append(resp, objResp)
 	}
 	return resp
 }
@@ -368,6 +374,10 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	}
 	parentMeta, _ := op.GetNearestMeta(parentPath)
 	thumb, _ := model.GetThumb(obj)
+	var duration float64
+	if !obj.IsDir() && utils.GetFileType(obj.GetName()) == conf.VIDEO {
+		duration = videoDuration(c.Request.Context(), reqPath, common.GetApiUrl(c))
+	}
 	if obj.IsDir() {
 		thumb = fillCoverThumb(c, parentPath, obj)
 	} else {
@@ -393,6 +403,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 			Sign:         common.Sign(obj, parentPath, isEncrypt(meta, reqPath)),
 			Type:         utils.GetFileType(obj.GetName()),
 			Thumb:        thumb,
+			Duration:     duration,
 			MountDetails: mountDetails,
 		},
 		RawURL:   rawURL,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -95,6 +96,7 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 	}
 	files, err := d.getFiles(dir.GetID())
 	if err != nil && !errors.Is(err, driver115.ErrNotExist) {
+		MarkStorageError(d.GetStorage().MountPath, err)
 		return nil, err
 	}
 	return utils.SliceConvert(files, func(src FileObj) (model.Obj, error) {
@@ -102,8 +104,29 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 	})
 }
 
+// 多根虚拟列表缓存（5 分钟），减少 115 API 调用避免触发风控
+var (
+	multiRootCacheMu sync.Mutex
+	multiRootCache   = map[string]multiRootEntry{}
+)
+
+type multiRootEntry struct {
+	objs []model.Obj
+	at   time.Time
+}
+
+const multiRootCacheTTL = 5 * time.Minute
+
 // listMultiRoots 列出所有挂载根文件夹（虚拟文件夹，名称取自 115 真实文件夹名）
 func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
+	key := d.GetStorage().MountPath
+	multiRootCacheMu.Lock()
+	if e, ok := multiRootCache[key]; ok && time.Since(e.at) < multiRootCacheTTL {
+		multiRootCacheMu.Unlock()
+		return e.objs, nil
+	}
+	multiRootCacheMu.Unlock()
+
 	var objs []model.Obj
 	for _, id := range d.rootIDs() {
 		f, err := d.getNewFile(id)
@@ -119,6 +142,9 @@ func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
 			Mask:     model.Locked,
 		})
 	}
+	multiRootCacheMu.Lock()
+	multiRootCache[key] = multiRootEntry{objs: objs, at: time.Now()}
+	multiRootCacheMu.Unlock()
 	return objs, nil
 }
 
@@ -134,6 +160,7 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	userAgent := args.Header.Get("User-Agent")
 	downloadInfo, err := d.client.DownloadWithUA(f.PickCode, userAgent)
 	if err != nil {
+		MarkStorageError(d.GetStorage().MountPath, err)
 		return nil, err
 	}
 	link := &model.Link{
