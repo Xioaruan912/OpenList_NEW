@@ -2,6 +2,8 @@ package handles
 
 import (
 	"strconv"
+	"sync"
+	"time"
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	driver115sharepkg "github.com/OpenListTeam/OpenList/v4/drivers/115_share"
@@ -122,6 +124,44 @@ func Driver115ListFolders(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"content": folders, "file_id": req.FileID})
 }
 
+// cookie 校验结果内存缓存（5 分钟），减少 115 API 调用
+var (
+	checkCookieCacheMu sync.Mutex
+	checkCookieCache   = map[string]checkCookieEntry{}
+)
+
+type checkCookieEntry struct {
+	valid bool
+	info  *driver115pkg.UserInfo
+	msg   string
+	at    time.Time
+}
+
+const checkCookieCacheTTL = 5 * time.Minute
+
+func checkCookieCached(cookie string) (valid bool, info *driver115pkg.UserInfo, msg string, hit bool) {
+	checkCookieCacheMu.Lock()
+	defer checkCookieCacheMu.Unlock()
+	e, ok := checkCookieCache[cookie]
+	if !ok || time.Since(e.at) > checkCookieCacheTTL {
+		return false, nil, "", false
+	}
+	return e.valid, e.info, e.msg, true
+}
+
+func checkCookieStore(cookie string, valid bool, info *driver115pkg.UserInfo, msg string) {
+	checkCookieCacheMu.Lock()
+	checkCookieCache[cookie] = checkCookieEntry{valid: valid, info: info, msg: msg, at: time.Now()}
+	if len(checkCookieCache) > 1000 {
+		for k, v := range checkCookieCache {
+			if time.Since(v.at) > checkCookieCacheTTL {
+				delete(checkCookieCache, k)
+			}
+		}
+	}
+	checkCookieCacheMu.Unlock()
+}
+
 // Driver115CheckCookie POST /api/115/check_cookie
 // 校验 115 cookie 是否有效，返回账号信息
 func Driver115CheckCookie(c *gin.Context) {
@@ -130,11 +170,21 @@ func Driver115CheckCookie(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	if valid, info, msg, hit := checkCookieCached(req.Cookie); hit {
+		if valid {
+			common.SuccessResp(c, gin.H{"valid": true, "user_id": info.UserID, "user_name": info.UserName})
+		} else {
+			common.SuccessResp(c, gin.H{"valid": false, "msg": msg})
+		}
+		return
+	}
 	info, err := driver115pkg.CheckCookie(req.Cookie)
 	if err != nil {
+		checkCookieStore(req.Cookie, false, nil, err.Error())
 		common.SuccessResp(c, gin.H{"valid": false, "msg": err.Error()})
 		return
 	}
+	checkCookieStore(req.Cookie, true, info, "")
 	common.SuccessResp(c, gin.H{"valid": true, "user_id": info.UserID, "user_name": info.UserName})
 }
 

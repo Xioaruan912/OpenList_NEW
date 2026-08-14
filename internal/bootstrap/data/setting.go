@@ -199,6 +199,8 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ThumbPrewarm, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `pre-generate video thumbnails in background when a directory is browsed`},
 		{Key: conf.ThumbConcurrency, Value: "8", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail generation concurrency`},
 		{Key: conf.ThumbChunkSize, Value: "3145728", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `video segment size (bytes) downloaded for thumbnail extraction, default 3MB`},
+		{Key: conf.ThumbWidth, Value: "288", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail width in pixels, default 288`},
+		{Key: conf.ThumbFailTTL, Value: "604800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `negative cache duration in seconds for failed cover/folder detection, default 7 days`},
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},

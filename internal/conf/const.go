@@ -163,6 +163,8 @@ const (
 	ThumbPrewarm      = "thumb_prewarm"
 	ThumbConcurrency  = "thumb_concurrency"
 	ThumbChunkSize    = "thumb_chunk_size"
+	ThumbWidth        = "thumb_width"
+	ThumbFailTTL      = "thumb_fail_ttl"
 
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"

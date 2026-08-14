@@ -139,12 +139,20 @@ func thumbFailPath(kind, rawPath string) string {
 	return filepath.Join(thumbDir(), fmt.Sprintf("%s-%s.fail", kind, thumbHash(rawPath)))
 }
 
+func thumbFailTTLDuration() time.Duration {
+	sec := setting.GetInt(conf.ThumbFailTTL, 7*24*60*60)
+	if sec <= 0 {
+		sec = 7 * 24 * 60 * 60
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func thumbFailed(kind, rawPath string) bool {
 	fi, err := os.Stat(thumbFailPath(kind, rawPath))
 	if err != nil {
 		return false
 	}
-	return time.Since(fi.ModTime()) < thumbFailTTL
+	return time.Since(fi.ModTime()) < thumbFailTTLDuration()
 }
 
 func markThumbFailed(kind, rawPath string) {
@@ -302,7 +310,14 @@ func resizeImageData(data []byte) ([]byte, error) {
 }
 
 func encodeThumbImage(img image.Image) ([]byte, error) {
-	thumbImg := imaging.Resize(img, thumbWidth, 0, imaging.Lanczos)
+	width := setting.GetInt(conf.ThumbWidth, thumbWidth)
+	if width < 64 {
+		width = 64
+	}
+	if width > 4096 {
+		width = 4096
+	}
+	thumbImg := imaging.Resize(img, width, 0, imaging.Lanczos)
 	var buf bytes.Buffer
 	if err := imaging.Encode(&buf, thumbImg, imaging.PNG); err != nil {
 		return nil, err
@@ -401,8 +416,27 @@ func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int
 	return io.ReadAll(io.LimitReader(rc, limit))
 }
 
+// moov 探测结果缓存（moov 位置不变，24h 内复用，省一次 Range 请求）
+var (
+	moovCacheMu sync.Mutex
+	moovCache   = map[string]moovCacheEntry{}
+)
+
+type moovCacheEntry struct {
+	atTail bool
+	at     time.Time
+}
+
+const moovCacheTTL = 24 * time.Hour
+
 // moovAtTail 探测 moov 元数据是否位于文件尾部（下载末尾 64KB 查找 moov 标记）
-func moovAtTail(ctx context.Context, link *model.Link, size int64) bool {
+func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath string) bool {
+	moovCacheMu.Lock()
+	if e, ok := moovCache[rawPath]; ok && time.Since(e.at) < moovCacheTTL {
+		moovCacheMu.Unlock()
+		return e.atTail
+	}
+	moovCacheMu.Unlock()
 	tailLen := int64(64 * 1024)
 	if size < tailLen {
 		return false
@@ -411,7 +445,18 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64) bool {
 	if err != nil {
 		return false
 	}
-	return bytes.Contains(data, []byte("moov"))
+	atTail := bytes.Contains(data, []byte("moov"))
+	moovCacheMu.Lock()
+	moovCache[rawPath] = moovCacheEntry{atTail: atTail, at: time.Now()}
+	if len(moovCache) > 20000 {
+		for k, v := range moovCache {
+			if time.Since(v.at) > moovCacheTTL {
+				delete(moovCache, k)
+			}
+		}
+	}
+	moovCacheMu.Unlock()
+	return atTail
 }
 
 // generateVideoThumb 生成视频缩略图（直接请求与预热共用）
@@ -435,7 +480,7 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	remoteURL := apiURL + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
 
 	// moov 在文件尾部时本地片段必然无法解析，直接远程抽帧，避免无谓的下载与失败尝试
-	if moovAtTail(ctx, link, size) {
+	if moovAtTail(ctx, link, size, rawPath) {
 		return extractVideoFrameRemote(remoteURL, link.Header)
 	}
 
@@ -525,10 +570,8 @@ func prewarmWorker() {
 					prewarmDone.Delete(task.rawPath)
 					time.Sleep(180 * time.Second)
 					task.retry++
-					select {
-					case prewarmCh <- task:
-					default:
-					}
+					// 重试任务阻塞入队，保证不丢（新任务入队时丢弃自身而非重试任务）
+					prewarmCh <- task
 					return
 				}
 				log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
@@ -559,7 +602,12 @@ func prewarmEnqueue(kind, rawPath, apiURL string) {
 	select {
 	case prewarmCh <- thumbPrewarmTask{kind: kind, rawPath: rawPath, apiURL: apiURL}:
 	default:
+		// 队列满：清除去重标记，30s 后重试入队
 		prewarmDone.Delete(rawPath)
+		go func() {
+			time.Sleep(30 * time.Second)
+			prewarmEnqueue(kind, rawPath, apiURL)
+		}()
 	}
 }
 
@@ -741,6 +789,11 @@ func remoteThumbCacheSet(rawPath string, data []byte) {
 func uploadThumbRemote(ctx context.Context, rawPath string, addition interface {
 	ThumbFolderName() string
 }, data []byte) error {
+	// 上传限流：与生成共用并发名额，避免多视频同时上传触发网盘风控
+	if !thumbAcquire(false) {
+		return errors.New("thumbnail upload busy")
+	}
+	defer thumbRelease()
 	thumbName := remoteThumbName(rawPath)
 	thumbFullPath := remoteThumbPath(addition, rawPath)
 	if _, err := fs.Get(ctx, thumbFullPath, &fs.GetArgs{NoLog: true}); err == nil {
