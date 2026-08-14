@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"net/http"
 	"os"
@@ -50,6 +51,12 @@ const (
 
 	thumbChunkSize = 3 * 1024 * 1024
 	thumbWidth     = 288
+
+	// 长视频内容缩略图：超过阈值时从视频中均匀取样多帧拼成 3x3 网格
+	thumbMosaicLongSec = 90
+	thumbMosaicGrid    = 3
+	thumbMosaicFrames  = 9
+	thumbProbeMinSize  = 10 * 1024 * 1024 // 小于该大小的文件不做时长探测
 )
 
 var (
@@ -293,9 +300,8 @@ func extractVideoFrame(localPath string) ([]byte, error) {
 	return nil, err
 }
 
-// extractVideoFrameRemote 通过 ffmpeg HTTP Range 直接远程抽帧，
-// 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）
-func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
+// extractVideoFrameAt 通过 ffmpeg HTTP Range 从远程 URL 指定时间点抽一帧（原始 mjpeg 字节）
+func extractVideoFrameAt(url string, header http.Header, ss string) ([]byte, error) {
 	srcBuf := bytes.NewBuffer(nil)
 	var hb strings.Builder
 	for k, vs := range header {
@@ -307,7 +313,11 @@ func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
 		}
 	}
 	hb.WriteString("\r\n")
-	stream := ffmpeg.Input(url, ffmpeg.KwArgs{"noaccurate_seek": "", "ss": "3", "timeout": "90000000"}).
+	kwargs := ffmpeg.KwArgs{"noaccurate_seek": "", "timeout": "90000000"}
+	if ss != "" {
+		kwargs["ss"] = ss
+	}
+	stream := ffmpeg.Input(url, kwargs).
 		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
 		GlobalArgs("-headers", hb.String(), "-loglevel", "error").Silent(true).
 		WithOutput(srcBuf, os.Stdout)
@@ -317,7 +327,85 @@ func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
 	if srcBuf.Len() == 0 {
 		return nil, fmt.Errorf("empty output")
 	}
-	return encodeThumb(srcBuf.Bytes())
+	return srcBuf.Bytes(), nil
+}
+
+// extractVideoFrameRemote 通过 ffmpeg HTTP Range 直接远程抽帧（3s 处单帧缩略图），
+// 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）
+func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
+	data, err := extractVideoFrameAt(url, header, "3")
+	if err != nil {
+		return nil, err
+	}
+	return encodeThumb(data)
+}
+
+// extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点）
+func extractVideoFramesAtTimes(url string, header http.Header, times []float64) ([]image.Image, error) {
+	var frames []image.Image
+	for _, t := range times {
+		if len(frames) >= thumbMosaicFrames {
+			break
+		}
+		data, err := extractVideoFrameAt(url, header, fmt.Sprintf("%.2f", t))
+		if err != nil {
+			continue
+		}
+		img, err := imaging.Decode(bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		frames = append(frames, img)
+	}
+	if len(frames) == 0 {
+		return nil, errors.New("no video frames extracted")
+	}
+	return frames, nil
+}
+
+// generateVideoMosaic 长视频内容缩略图：10%~90% 均匀取 9 帧合成 3x3 网格
+func generateVideoMosaic(url string, header http.Header, duration float64) ([]byte, error) {
+	if duration <= thumbMosaicLongSec {
+		return nil, errors.New("short video, skip mosaic")
+	}
+	n := thumbMosaicFrames
+	var times []float64
+	for i := 0; i < n; i++ {
+		if n == 1 {
+			times = append(times, duration*0.5)
+		} else {
+			times = append(times, duration*(0.1+0.8*float64(i)/float64(n-1)))
+		}
+	}
+	frames, err := extractVideoFramesAtTimes(url, header, times)
+	if err != nil {
+		return nil, err
+	}
+	return buildVideoMosaic(frames)
+}
+
+// buildVideoMosaic 将多帧合成方形网格并缩放到缩略图宽度
+func buildVideoMosaic(frames []image.Image) ([]byte, error) {
+	cols := thumbMosaicGrid
+	rows := thumbMosaicGrid
+	width := setting.GetInt(conf.ThumbWidth, thumbWidth)
+	if width < 64 {
+		width = 64
+	}
+	cell := width / cols
+	mosaic := imaging.New(cell*cols, cell*rows, color.White)
+	for i, fr := range frames {
+		if i >= cols*rows {
+			break
+		}
+		thumb := imaging.Fit(fr, cell, cell, imaging.Lanczos)
+		imaging.Paste(mosaic, thumb, image.Pt((i%cols)*cell, (i/cols)*cell))
+	}
+	var buf bytes.Buffer
+	if err := imaging.Encode(&buf, mosaic, imaging.PNG); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // extractAudioCover 从本地音频文件提取内嵌封面（无封面时返回 errThumbNoCover）
@@ -422,13 +510,14 @@ func thumbRewriteIndex() {
 	}
 }
 
-// readThumbIndex 读取索引中的路径列表
+// readThumbIndex 读取索引中的路径列表（去重，保留先后顺序）
 func readThumbIndex() []string {
 	data, err := os.ReadFile(thumbIndexPath())
 	if err != nil {
 		return nil
 	}
 	var paths []string
+	seen := map[string]struct{}{}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -438,6 +527,10 @@ func readThumbIndex() []string {
 			Path string `json:"path"`
 		}
 		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
+			if _, ok := seen[m.Path]; ok {
+				continue
+			}
+			seen[m.Path] = struct{}{}
 			paths = append(paths, m.Path)
 		}
 	}
@@ -598,6 +691,16 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	// moov 在文件尾部时本地片段必然无法解析，直接远程抽帧，避免无谓的下载与失败尝试
 	if moovAtTail(ctx, link, size, rawPath) {
 		return extractVideoFrameRemote(remoteURL, link.Header)
+	}
+
+	// 长视频：探测时长后从内容中均匀抽帧合成 3x3 网格缩略图（任一帧失败自动降级单帧）
+	if size > thumbProbeMinSize {
+		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
+			if data, err := generateVideoMosaic(remoteURL, link.Header, dur); err == nil {
+				return data, nil
+			}
+			log.Debugf("mosaic thumb failed for %s, fallback to single frame", rawPath)
+		}
 	}
 
 	cachePath := thumbCachePath(thumbKindVideo, rawPath)

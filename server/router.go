@@ -166,7 +166,9 @@ func admin(g *gin.RouterGroup) {
 	thumb := g.Group("/thumb")
 	thumb.POST("/generate", handles.ThumbGenerate)
 	thumb.GET("/status", handles.ThumbStatus)
+	thumb.GET("/dirs", handles.ThumbDirs)
 	thumb.POST("/retry_fails", handles.ThumbRetryFails)
+	thumb.POST("/migrate", handles.ThumbMigrate)
 
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)

@@ -5,10 +5,14 @@ import (
 	stdpath "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -20,6 +24,7 @@ import (
 type ThumbGenerateReq struct {
 	Path      string `json:"path" binding:"required"`
 	Recursive bool   `json:"recursive"`
+	Force     bool   `json:"force"` // 强制重建：先删除已有缓存再入队
 }
 
 // ThumbGenerate 手动批量生成指定目录下的视频缩略图
@@ -36,6 +41,7 @@ func ThumbGenerate(c *gin.Context) {
 	}
 	apiURL := common.GetApiUrl(c)
 	queued := 0
+	removed := 0
 	var scanDir func(dir string) error
 	scanDir = func(dir string) error {
 		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
@@ -54,7 +60,13 @@ func ThumbGenerate(c *gin.Context) {
 			if utils.GetFileType(obj.GetName()) != conf.VIDEO {
 				continue
 			}
-			prewarmEnqueue(thumbKindVideo, dir+"/"+obj.GetName(), apiURL)
+			rawPath := dir + "/" + obj.GetName()
+			if req.Force {
+				if err := os.Remove(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+					removed++
+				}
+			}
+			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
 		}
 		return nil
@@ -63,7 +75,7 @@ func ThumbGenerate(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive})
+	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive, "force": req.Force, "removed": removed})
 }
 
 // ThumbStatus GET /api/admin/thumb/status
@@ -114,7 +126,57 @@ func ThumbStatus(c *gin.Context) {
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i]["count"].(int) > dirs[j]["count"].(int) })
 	status["fails_by_dir"] = dirs
 	status["fails_unknown"] = unknown
+
+	// 失效挂载路径目录：索引中不属于任何当前存储挂载路径的条目（挂载路径变更后遗留）
+	status["stale_by_dir"] = thumbStaleByDir(indexed)
+	status["mounts"] = currentMountPaths()
 	common.SuccessResp(c, status)
+}
+
+// currentMountPaths 返回当前所有存储的挂载路径列表
+func currentMountPaths() []string {
+	storages, _, err := db.GetStorages(1, -1)
+	if err != nil {
+		return nil
+	}
+	mounts := make([]string, 0, len(storages))
+	for _, s := range storages {
+		if s.MountPath != "" {
+			mounts = append(mounts, strings.TrimSuffix(s.MountPath, "/"))
+		}
+	}
+	return mounts
+}
+
+// pathBelongsToMounts 判断路径是否属于任一当前挂载路径
+func pathBelongsToMounts(p string, mounts []string) bool {
+	for _, m := range mounts {
+		if p == m || strings.HasPrefix(p, m+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// thumbStaleByDir 聚合索引中属于失效挂载路径的目录
+func thumbStaleByDir(indexed []string) []gin.H {
+	mounts := currentMountPaths()
+	byDir := map[string]int{}
+	for _, p := range indexed {
+		if pathBelongsToMounts(p, mounts) {
+			continue
+		}
+		dir := stdpath.Dir(p)
+		if dir != "" && dir != "." {
+			byDir[dir]++
+		}
+	}
+	dirs := make([]gin.H, 0, len(byDir))
+	for dir, cnt := range byDir {
+		dirs = append(dirs, gin.H{"dir": dir, "count": cnt})
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i]["count"].(int) > dirs[j]["count"].(int) })
+	return dirs
 }
 
 // ThumbRetryFailsReq POST /api/admin/thumb/retry_fails
@@ -195,4 +257,297 @@ func isStorageBlocked(fullPath string) (bool, string) {
 	}
 	mount := storage.GetStorage().MountPath
 	return driver115pkg.IsStorageBlocked(mount), mount
+}
+
+// ---------- 目录缩略图完善度 ----------
+
+type ThumbDirsReq struct {
+	Path     string `json:"path"`
+	Page     int    `json:"page"`
+	PageSize int    `json:"page_size"`
+}
+
+type ThumbDirsEntry struct {
+	Dir     string `json:"dir"`
+	Videos  int    `json:"videos"`
+	Cached  int    `json:"cached"`
+	Failed  int    `json:"failed"`
+	Missing int    `json:"missing"`
+	Status  string `json:"status"`
+}
+
+var (
+	thumbDirsMu    sync.Mutex
+	thumbDirsCache = map[string]struct {
+		at   time.Time
+		data []ThumbDirsEntry
+	}{}
+)
+
+const (
+	thumbScanMaxDirs   = 4000  // 单次扫描最多遍历目录数（防止过慢）
+	thumbScanMaxVideos = 60000 // 单次扫描最多收集视频数
+)
+
+func thumbStatusFromCounts(failed, missing int) string {
+	if failed > 0 {
+		return "failed"
+	}
+	if missing > 0 {
+		return "partial"
+	}
+	return "complete"
+}
+
+// ThumbDirs GET /api/admin/thumb/dirs
+// 递归扫描目录树，统计每个目录的视频数/已缓存/失败/缺失，判断缩略图是否完善
+func ThumbDirs(c *gin.Context) {
+	var req ThumbDirsReq
+	_ = c.ShouldBind(&req)
+	path := strings.TrimSuffix(req.Path, "/")
+	if path == "" {
+		path = "/"
+	}
+	page := req.Page
+	if page <= 0 {
+		page = 1
+	}
+	pageSize := req.PageSize
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	// 60s 结果缓存
+	thumbDirsMu.Lock()
+	ent, ok := thumbDirsCache[path]
+	thumbDirsMu.Unlock()
+	if ok && time.Since(ent.at) < 60*time.Second {
+		common.SuccessResp(c, gin.H{
+			"items":  sliceThumbDirsPage(ent.data, page, pageSize),
+			"total":  len(ent.data),
+			"path":   path,
+			"cached": true,
+		})
+		return
+	}
+
+	// 当前索引与失败统计（仅统计属于扫描范围的路径）
+	indexed := readThumbIndex()
+	cachedByDir := map[string]int{}
+	for _, p := range indexed {
+		if path != "/" && !strings.HasPrefix(p, path+"/") {
+			continue
+		}
+		dir := stdpath.Dir(p)
+		if dir != "" && dir != "." {
+			cachedByDir[dir]++
+		}
+	}
+	fails := listThumbFails()
+	failedByDir := map[string]int{}
+	for _, f := range fails {
+		if f.Dir == "" {
+			continue
+		}
+		if path != "/" && !strings.HasPrefix(f.Dir, path+"/") {
+			continue
+		}
+		failedByDir[f.Dir]++
+	}
+
+	// 递归扫描视频文件
+	videoByDir := map[string]int{}
+	dirsCount := 0
+	videosCount := 0
+	truncated := false
+	var scan func(dir string) error
+	scan = func(dir string) error {
+		if dirsCount >= thumbScanMaxDirs || videosCount >= thumbScanMaxVideos {
+			truncated = true
+			return nil
+		}
+		dirsCount++
+		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
+		if err != nil {
+			return err
+		}
+		for _, obj := range objs {
+			if obj.IsDir() {
+				if err := scan(dir + "/" + obj.GetName()); err != nil {
+					return err
+				}
+				continue
+			}
+			if utils.GetFileType(obj.GetName()) != conf.VIDEO {
+				continue
+			}
+			videoByDir[dir]++
+			videosCount++
+		}
+		return nil
+	}
+	if err := scan(path); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	// 根目录不是有效存储路径：改为遍历所有挂载目录
+	if path == "/" {
+		roots := currentMountPaths()
+		if len(roots) > 0 {
+			for _, root := range roots {
+				if err := scan(root); err != nil {
+					common.ErrorResp(c, err, 500)
+					return
+				}
+			}
+		}
+	}
+
+	allDirs := map[string]struct{}{}
+	for d := range videoByDir {
+		allDirs[d] = struct{}{}
+	}
+	for d := range cachedByDir {
+		allDirs[d] = struct{}{}
+	}
+	for d := range failedByDir {
+		allDirs[d] = struct{}{}
+	}
+	entries := make([]ThumbDirsEntry, 0, len(allDirs))
+	for d := range allDirs {
+		videos := videoByDir[d]
+		cached := cachedByDir[d]
+		failed := failedByDir[d]
+		missing := videos - cached
+		if missing < 0 {
+			missing = 0
+		}
+		entries = append(entries, ThumbDirsEntry{
+			Dir:     d,
+			Videos:  videos,
+			Cached:  cached,
+			Failed:  failed,
+			Missing: missing,
+			Status:  thumbStatusFromCounts(failed, missing),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Missing != entries[j].Missing {
+			return entries[i].Missing > entries[j].Missing
+		}
+		return entries[i].Dir < entries[j].Dir
+	})
+
+	thumbDirsMu.Lock()
+	thumbDirsCache[path] = struct {
+		at   time.Time
+		data []ThumbDirsEntry
+	}{time.Now(), entries}
+	thumbDirsMu.Unlock()
+
+	common.SuccessResp(c, gin.H{
+		"items":     sliceThumbDirsPage(entries, page, pageSize),
+		"total":     len(entries),
+		"path":      path,
+		"truncated": truncated,
+		"cached":    false,
+	})
+}
+
+func sliceThumbDirsPage(items []ThumbDirsEntry, page, pageSize int) []ThumbDirsEntry {
+	start := (page - 1) * pageSize
+	if start >= len(items) {
+		return []ThumbDirsEntry{}
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	return items[start:end]
+}
+
+// ---------- 挂载路径迁移 ----------
+
+type ThumbMigrateReq struct {
+	OldPrefix string `json:"old_prefix" binding:"required"`
+	NewPrefix string `json:"new_prefix" binding:"required"`
+}
+
+// ThumbMigrate POST /api/admin/thumb/migrate
+// 存储挂载路径变更后，将缩略图索引与缓存文件从旧挂载前缀迁移到新前缀
+func ThumbMigrate(c *gin.Context) {
+	var req ThumbMigrateReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	oldP := strings.TrimSuffix(req.OldPrefix, "/")
+	newP := strings.TrimSuffix(req.NewPrefix, "/")
+	if oldP == "" || newP == "" || oldP == newP {
+		common.ErrorStrResp(c, "invalid prefix", 400)
+		return
+	}
+
+	paths := readThumbIndex()
+	migrated := 0
+	seen := map[string]struct{}{}
+	var newLines []string
+	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
+	for _, p := range paths {
+		newPath := p
+		if strings.HasPrefix(p, oldP) {
+			rel := strings.TrimPrefix(p, oldP)
+			newPath = newP + rel
+			for _, kind := range kinds {
+				oldC := thumbCachePath(kind, p)
+				newC := thumbCachePath(kind, newPath)
+				if _, err := os.Stat(oldC); err == nil {
+					if _, err := os.Stat(newC); err != nil {
+						if os.Rename(oldC, newC) == nil {
+							migrated++
+						}
+					} else {
+						_ = os.Remove(oldC)
+					}
+				}
+				oldF := thumbFailPath(kind, p)
+				newF := thumbFailPath(kind, newPath)
+				if _, err := os.Stat(oldF); err == nil {
+					if _, err := os.Stat(newF); err != nil {
+						_ = os.Rename(oldF, newF)
+					} else {
+						_ = os.Remove(oldF)
+					}
+				}
+			}
+		}
+		if _, ok := seen[newPath]; !ok {
+			seen[newPath] = struct{}{}
+			newLines = append(newLines, newPath)
+		}
+	}
+	if err := writeThumbIndex(newLines); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	// 清空目录扫描缓存
+	thumbDirsMu.Lock()
+	thumbDirsCache = map[string]struct {
+		at   time.Time
+		data []ThumbDirsEntry
+	}{}
+	thumbDirsMu.Unlock()
+	common.SuccessResp(c, gin.H{"migrated": migrated, "indexed": len(newLines)})
+}
+
+// writeThumbIndex 重写缩略图索引文件
+func writeThumbIndex(paths []string) error {
+	var sb strings.Builder
+	for _, p := range paths {
+		sb.WriteString(`{"path":` + strconv.Quote(p) + `,"at":""}` + "\n")
+	}
+	return os.WriteFile(thumbIndexPath(), []byte(sb.String()), 0o666)
 }
