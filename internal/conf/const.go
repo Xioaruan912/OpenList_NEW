@@ -163,6 +163,7 @@ const (
 	ThumbPrewarm      = "thumb_prewarm"
 	ThumbConcurrency  = "thumb_concurrency"
 	ThumbWorkerConcurrency = "thumb_worker_concurrency"
+	ThumbGenerationPower   = "thumb_generation_power"
 	ThumbChunkSize    = "thumb_chunk_size"
 	ThumbWidth        = "thumb_width"
 	ThumbFailTTL      = "thumb_fail_ttl"

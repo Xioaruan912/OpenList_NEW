@@ -83,7 +83,7 @@ var (
 // thumbAcquire 获取生成并发名额。withTimeout 为 true 时（预热任务）超时即让位，
 // 保证浏览器直接请求优先；false 时（直接请求）无限等待。
 func thumbAcquire(withTimeout bool) (got bool) {
-	limit := setting.GetInt(conf.ThumbConcurrency, 8)
+	limit := thumbGenPower().AcquireLimit
 	if limit < 1 {
 		limit = 1
 	}
@@ -357,9 +357,9 @@ func extractVideoFramesAtTimes(url string, header http.Header, times []float64) 
 			continue
 		}
 		frames = append(frames, img)
-		// 每帧之间小间隔，避免连续多次 Range 请求触发网盘限流
+		// 每帧之间按生成强度间隔，避免连续多次 Range 请求触发网盘限流
 		if i < len(times)-1 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(thumbGenPower().FrameInterval)
 		}
 	}
 	if len(frames) == 0 {
@@ -747,18 +747,32 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	return extractVideoFrame(tmpFile)
 }
 
+// thumbGenPower 返回生成强度参数（low/medium/high），兼顾速度与 115 风控
+type thumbGenPowerCfg struct {
+	Workers       int
+	BatchInterval time.Duration
+	AcquireLimit  int
+	FrameInterval time.Duration
+	EnqueueMax    int
+}
+
+func thumbGenPower() thumbGenPowerCfg {
+	switch setting.GetStr(conf.ThumbGenerationPower, "medium") {
+	case "low":
+		return thumbGenPowerCfg{Workers: 1, BatchInterval: 30 * time.Second, AcquireLimit: 2, FrameInterval: 2 * time.Second, EnqueueMax: 50}
+	case "high":
+		return thumbGenPowerCfg{Workers: 3, BatchInterval: 10 * time.Second, AcquireLimit: 8, FrameInterval: 500 * time.Millisecond, EnqueueMax: 200}
+	default:
+		return thumbGenPowerCfg{Workers: 2, BatchInterval: 20 * time.Second, AcquireLimit: 4, FrameInterval: time.Second, EnqueueMax: 100}
+	}
+}
+
 // prewarmStart 启动预热 worker（多 worker 并发生成，每批节流；
 // 115 API 请求率由驱动 limit_rate 全局限速兜底，不会因并发触发风控）
 func prewarmStart() {
 	prewarmOnce.Do(func() {
 		prewarmCh = make(chan thumbPrewarmTask, 2048)
-		n := setting.GetInt(conf.ThumbWorkerConcurrency, 3)
-		if n < 1 {
-			n = 1
-		}
-		if n > 8 {
-			n = 8
-		}
+		n := thumbGenPower().Workers
 		for i := 0; i < n; i++ {
 			go prewarmWorker()
 		}
@@ -768,8 +782,7 @@ func prewarmStart() {
 }
 
 const (
-	prewarmBatchSize     = 5  // 每批最多提交任务数（防风控）
-	prewarmBatchInterval = 10 * time.Second
+	prewarmBatchSize = 5 // 每批最多提交任务数（防风控）
 )
 
 // ---------- 远程缩略图延迟补传（规避风控）----------
@@ -963,7 +976,7 @@ func prewarmWorker() {
 			processTask(task)
 		}
 		// 批间间隔，限制 115 请求频率
-		time.Sleep(prewarmBatchInterval)
+		time.Sleep(thumbGenPower().BatchInterval)
 	}
 }
 

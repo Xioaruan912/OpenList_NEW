@@ -46,9 +46,15 @@ func ThumbGenerate(c *gin.Context) {
 	queued := 0
 	removed := 0
 	failedDirs := 0
+	truncated := false
+	enqueueMax := thumbGenPower().EnqueueMax
 	excluded := readThumbExcluded()
 	var scanDir func(dir string)
 	scanDir = func(dir string) {
+		if queued >= enqueueMax {
+			truncated = true
+			return
+		}
 		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
 		if err != nil {
 			// 目录列表失败（如 115 受限）跳过该目录，不中断整体扫描
@@ -76,6 +82,10 @@ func ThumbGenerate(c *gin.Context) {
 			}
 			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
+			if queued >= enqueueMax {
+				truncated = true
+				return
+			}
 		}
 	}
 	// 根目录不是有效存储路径：遍历所有挂载
@@ -95,7 +105,7 @@ func ThumbGenerate(c *gin.Context) {
 	common.SuccessResp(c, gin.H{
 		"queued": queued, "path": req.Path, "recursive": req.Recursive,
 		"force": req.Force, "removed": removed,
-		"failed_dirs": failedDirs,
+		"failed_dirs": failedDirs, "truncated": truncated,
 	})
 }
 
@@ -115,6 +125,12 @@ func ThumbStatus(c *gin.Context) {
 	}
 	status["pending_upload"] = len(thumbPendingUploadList())
 	status["worker_concurrency"] = setting.GetInt(conf.ThumbWorkerConcurrency, 3)
+	pw := thumbGenPower()
+	status["gen_power"] = setting.GetStr(conf.ThumbGenerationPower, "medium")
+	status["gen_workers"] = pw.Workers
+	status["gen_acquire_limit"] = pw.AcquireLimit
+	status["gen_batch_interval"] = int(pw.BatchInterval / time.Second)
+	status["gen_enqueue_max"] = pw.EnqueueMax
 	status["active_workers"] = atomic.LoadInt32(&thumbActiveWorkers)
 	// 是否有任一挂载处于 115 风控（前端提示"生成已暂停"）
 	blockedAny := false
