@@ -131,6 +131,7 @@ func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
 	for _, id := range d.rootIDs() {
 		f, err := d.getNewFile(id)
 		if err != nil {
+			MarkStorageError(d.GetStorage().MountPath, err)
 			log.Warnf("115 get multi root [%s] failed: %v", id, err)
 			continue
 		}
