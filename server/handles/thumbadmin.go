@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
@@ -114,6 +115,16 @@ func ThumbStatus(c *gin.Context) {
 	}
 	status["pending_upload"] = len(thumbPendingUploadList())
 	status["worker_concurrency"] = setting.GetInt(conf.ThumbWorkerConcurrency, 3)
+	status["active_workers"] = atomic.LoadInt32(&thumbActiveWorkers)
+	// 是否有任一挂载处于 115 风控（前端提示"生成已暂停"）
+	blockedAny := false
+	for _, m := range currentMountPaths() {
+		if driver115pkg.IsStorageBlocked(m) {
+			blockedAny = true
+			break
+		}
+	}
+	status["blocked"] = blockedAny
 	status["remote_upload_enabled"] = setting.GetStr(conf.ThumbRemoteUploadEnabled, "true") == "true"
 	status["remote_upload_start"] = setting.GetInt(conf.ThumbRemoteUploadStart, 3)
 	status["remote_upload_end"] = setting.GetInt(conf.ThumbRemoteUploadEnd, 6)
