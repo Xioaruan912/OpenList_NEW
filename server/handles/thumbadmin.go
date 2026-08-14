@@ -35,27 +35,26 @@ func ThumbGenerate(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	// 风控防呆：115 风控中禁止触发缩略图生成
-	if blocked, _ := isStorageBlocked(req.Path); blocked {
-		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试（通常 30-60 分钟）", 429)
-		return
-	}
+	// 115 风控中不拦截生成：缩略图本地生成并缓存（前端可正常展示），
+	// remote 模式上传失败自动进入待传队列，在配置的上传窗口批量补传到网盘
+	blocked, _ := isStorageBlocked(req.Path)
 	apiURL := common.GetApiUrl(c)
 	queued := 0
 	removed := 0
+	failedDirs := 0
 	excluded := readThumbExcluded()
-	var scanDir func(dir string) error
-	scanDir = func(dir string) error {
+	var scanDir func(dir string)
+	scanDir = func(dir string) {
 		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
 		if err != nil {
-			return err
+			// 目录列表失败（如 115 受限）跳过该目录，不中断整体扫描
+			failedDirs++
+			return
 		}
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if req.Recursive {
-					if err := scanDir(dir + "/" + obj.GetName()); err != nil {
-						return err
-					}
+					scanDir(dir + "/" + obj.GetName())
 				}
 				continue
 			}
@@ -74,7 +73,6 @@ func ThumbGenerate(c *gin.Context) {
 			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
 		}
-		return nil
 	}
 	// 根目录不是有效存储路径：遍历所有挂载
 	roots := []string{req.Path}
@@ -83,19 +81,14 @@ func ThumbGenerate(c *gin.Context) {
 			roots = mounts
 		}
 	}
-	// 逐存储风控防呆：跳过处于风控的挂载，避免根目录一键生成触发 115 风控
-	skipped := 0
 	for _, root := range roots {
-		if blocked, _ := isStorageBlocked(root); blocked {
-			skipped++
-			continue
-		}
-		if err := scanDir(root); err != nil {
-			common.ErrorResp(c, err, 500)
-			return
-		}
+		scanDir(root)
 	}
-	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive, "force": req.Force, "removed": removed, "skipped": skipped})
+	common.SuccessResp(c, gin.H{
+		"queued": queued, "path": req.Path, "recursive": req.Recursive,
+		"force": req.Force, "removed": removed,
+		"blocked": blocked, "failed_dirs": failedDirs,
+	})
 }
 
 // ThumbStatus GET /api/admin/thumb/status
