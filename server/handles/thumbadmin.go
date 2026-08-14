@@ -82,13 +82,19 @@ func ThumbGenerate(c *gin.Context) {
 			roots = mounts
 		}
 	}
+	// 逐存储风控防呆：跳过处于风控的挂载，避免根目录一键生成触发 115 风控
+	skipped := 0
 	for _, root := range roots {
+		if blocked, _ := isStorageBlocked(root); blocked {
+			skipped++
+			continue
+		}
 		if err := scanDir(root); err != nil {
 			common.ErrorResp(c, err, 500)
 			return
 		}
 	}
-	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive, "force": req.Force, "removed": removed})
+	common.SuccessResp(c, gin.H{"queued": queued, "path": req.Path, "recursive": req.Recursive, "force": req.Force, "removed": removed, "skipped": skipped})
 }
 
 // ThumbStatus GET /api/admin/thumb/status
@@ -208,10 +214,18 @@ func ThumbRetryFails(c *gin.Context) {
 	fails := listThumbFails()
 	retried := 0
 	cleared := 0
+	skipped := 0
 	for _, f := range fails {
 		if req.Path != "" {
 			// 指定目录：仅匹配该目录（旧格式无路径时跳过）
 			if f.Dir != req.Path {
+				continue
+			}
+		}
+		// 风控防呆：跳过处于 115 风控的存储，避免重试加剧风控
+		if f.Path != "" {
+			if blocked, _ := isStorageBlocked(f.Path); blocked {
+				skipped++
 				continue
 			}
 		}
@@ -234,7 +248,7 @@ func ThumbRetryFails(c *gin.Context) {
 		prewarmEnqueue(f.Kind, f.Path, apiURL)
 		retried++
 	}
-	common.SuccessResp(c, gin.H{"retried": retried, "cleared": cleared})
+	common.SuccessResp(c, gin.H{"retried": retried, "cleared": cleared, "skipped": skipped})
 }
 
 func thumbCacheStats() (cached int, failCount int, totalSize int64) {
