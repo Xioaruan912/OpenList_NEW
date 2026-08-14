@@ -645,10 +645,47 @@ func remoteThumbName(rawPath string) string {
 	h := md5.Sum([]byte(rawPath))
 	base := stdpath.Base(rawPath)
 	name := strings.TrimSuffix(base, stdpath.Ext(base))
+	// 清除 115 禁止的文件名字符（\ / : * ? " < > |）
+	replacer := strings.NewReplacer("\\", "_", "/", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	name = replacer.Replace(name)
 	if len(name) > 40 {
 		name = name[:40]
 	}
-	return name + "_" + hex.EncodeToString(h[:4]) + ".jpg"
+	return name + "_" + hex.EncodeToString(h[:4]) + ".png"
+}
+
+// remoteThumbMiss 远程缩略图"不存在"的内存负缓存，避免每次请求都查询 115
+var (
+	remoteThumbMissMu sync.Mutex
+	remoteThumbMiss   = map[string]time.Time{}
+)
+
+const remoteThumbMissTTL = 10 * time.Minute
+
+func remoteThumbMissCheck(rawPath string) bool {
+	remoteThumbMissMu.Lock()
+	defer remoteThumbMissMu.Unlock()
+	t, ok := remoteThumbMiss[rawPath]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > remoteThumbMissTTL {
+		delete(remoteThumbMiss, rawPath)
+		return false
+	}
+	return true
+}
+
+func remoteThumbMissMark(rawPath string) {
+	remoteThumbMissMu.Lock()
+	remoteThumbMiss[rawPath] = time.Now()
+	remoteThumbMissMu.Unlock()
+}
+
+func remoteThumbMissClear(rawPath string) {
+	remoteThumbMissMu.Lock()
+	delete(remoteThumbMiss, rawPath)
+	remoteThumbMissMu.Unlock()
 }
 
 func remoteThumbPath(addition interface {
@@ -732,23 +769,33 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 		serveThumbPNG(c, data)
 		return
 	}
+	if remoteThumbMissCheck(rawPath) {
+		common.ErrorStrResp(c, "thumbnail not available", 404)
+		return
+	}
 	remotePath := remoteThumbPath(addition, rawPath)
 	if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 		if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
 			defer link.Close()
 			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize()); err == nil {
+				remoteThumbMissClear(rawPath)
 				remoteThumbCacheSet(rawPath, data)
 				serveThumbPNG(c, data)
 				return
 			}
 		}
+	} else {
+		remoteThumbMissMark(rawPath)
 	}
 	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
+			remoteThumbMissMark(rawPath)
 			common.ErrorStrResp(c, "file too large for thumbnail", 404)
 			return
 		}
+		// 生成失败写负缓存，避免反复下载+抽帧（浪费带宽并刺激网盘风控）
+		remoteThumbMissMark(rawPath)
 		log.Warnf("thumb generate failed [video] %s: %v", rawPath, err)
 		common.ErrorResp(c, err, 500)
 		return
@@ -756,8 +803,10 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	go func() {
 		if err := uploadThumbRemote(context.WithoutCancel(c.Request.Context()), rawPath, addition, png); err != nil {
 			log.Warnf("thumb upload remote failed %s: %v", rawPath, err)
+			remoteThumbMissMark(rawPath)
 		}
 	}()
+	remoteThumbMissClear(rawPath)
 	remoteThumbCacheSet(rawPath, png)
 	serveThumbPNG(c, png)
 }

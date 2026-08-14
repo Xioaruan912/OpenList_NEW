@@ -126,8 +126,13 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
+	f, ok := file.(*FileObj)
+	if !ok {
+		// 多根虚拟文件夹等非文件对象不支持生成直链
+		return nil, errors.New("not a file object")
+	}
 	userAgent := args.Header.Get("User-Agent")
-	downloadInfo, err := d.client.DownloadWithUA(file.(*FileObj).PickCode, userAgent)
+	downloadInfo, err := d.client.DownloadWithUA(f.PickCode, userAgent)
 	if err != nil {
 		return nil, err
 	}

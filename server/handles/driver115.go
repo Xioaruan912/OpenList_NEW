@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	driver115pkg "github.com/OpenListTeam/OpenList/v4/drivers/115"
+	driver115sharepkg "github.com/OpenListTeam/OpenList/v4/drivers/115_share"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -138,7 +139,7 @@ func Driver115CheckCookie(c *gin.Context) {
 }
 
 // Driver115CheckStorage POST /api/115/check_storage
-// 校验已配置的 115 存储 cookie 是否有效
+// 校验已配置的 115 存储 cookie 是否有效（支持 115 Cloud 与 115 Share）
 func Driver115CheckStorage(c *gin.Context) {
 	var req struct {
 		MountPath string `json:"mount_path" binding:"required"`
@@ -152,16 +153,21 @@ func Driver115CheckStorage(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	addition, ok := d.GetAddition().(*driver115pkg.Addition)
-	if !ok {
+	var cookie string
+	switch a := d.GetAddition().(type) {
+	case *driver115pkg.Addition:
+		cookie = a.Cookie
+	case *driver115sharepkg.Addition:
+		cookie = a.Cookie
+	default:
 		common.ErrorStrResp(c, "storage is not a 115 driver", 400)
 		return
 	}
-	if addition.Cookie == "" {
+	if cookie == "" {
 		common.SuccessResp(c, gin.H{"valid": false, "msg": "storage has no cookie configured"})
 		return
 	}
-	info, err := driver115pkg.CheckCookie(addition.Cookie)
+	info, err := driver115pkg.CheckCookie(cookie)
 	if err != nil {
 		common.SuccessResp(c, gin.H{"valid": false, "msg": err.Error()})
 		return
