@@ -49,18 +49,26 @@ func ThumbGenerate(c *gin.Context) {
 	truncated := false
 	enqueueMax := thumbGenPower().EnqueueMax
 	excluded := readThumbExcluded()
+	consecListFails := 0
 	var scanDir func(dir string)
 	scanDir = func(dir string) {
 		if queued >= enqueueMax {
 			truncated = true
 			return
 		}
-		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
-		if err != nil {
-			// 目录列表失败（如 115 受限）跳过该目录，不中断整体扫描
-			failedDirs++
+		if consecListFails >= 3 {
+			// 列表连续失败（风控迹象）：提前停止扫描，避免无效请求加剧风控
+			truncated = true
 			return
 		}
+		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
+		if err != nil {
+			// 目录列表失败（如 115 受限）跳过该目录，连续失败达到阈值则提前停止
+			failedDirs++
+			consecListFails++
+			return
+		}
+		consecListFails = 0
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if req.Recursive {
