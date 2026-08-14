@@ -173,6 +173,23 @@ func getMainItems(config driver.Config) []driver.Item {
 		Default:  "false",
 		Required: true,
 	})
+	// 115 Cloud：隐藏用不到的通用字段（无 WebDAV、无需自定义代理/缓存策略）
+	if config.Name == "115 Cloud" {
+		hidden := map[string]bool{
+			"custom_cache_policies": true,
+			"webdav_policy":         true,
+			"proxy_range":           true,
+			"down_proxy_url":        true,
+			"disable_proxy_sign":    true,
+		}
+		filtered := make([]driver.Item, 0, len(items))
+		for _, it := range items {
+			if !hidden[it.Name] {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+	}
 	return items
 }
 func getAdditionalItems(t reflect.Type, defaultRoot string) []driver.Item {

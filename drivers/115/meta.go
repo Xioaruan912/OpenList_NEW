@@ -1,39 +1,18 @@
 package _115
 
 import (
-	"encoding/json"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
-// StringList 兼容 JSON 数组与逗号分隔字符串的字段类型
-type StringList []string
-
-func (s *StringList) UnmarshalJSON(b []byte) error {
-	var arr []string
-	if err := json.Unmarshal(b, &arr); err == nil {
-		*s = arr
-		return nil
-	}
-	var str string
-	if err := json.Unmarshal(b, &str); err == nil {
-		*s = strings.Split(str, ",")
-		return nil
-	}
-	return nil
-}
-
 type Addition struct {
-	Cookie        string     `json:"cookie" type:"text" help:"one of QR code token and cookie required"`
-	QRCodeToken   string     `json:"qrcode_token" type:"text" help:"one of QR code token and cookie required"`
-	QRCodeSource  string     `json:"qrcode_source" type:"select" options:"web,android,ios,tv,alipaymini,wechatmini,qandroid" default:"web" help:"select the QR code device, default web"`
-	PageSize      int64      `json:"page_size" type:"number" default:"1000" help:"list api per page size of 115 driver"`
-	LimitRate     float64    `json:"limit_rate" type:"float" default:"2" help:"limit all api request rate ([limit]r/1s)"`
-	ThumbStore    string     `json:"thumb_store" type:"select" options:"local,remote" default:"local" help:"local: cache thumbnails on server disk; remote: upload thumbnails to a folder next to the videos"`
-	ThumbFolder   string     `json:"thumb_folder" type:"text" default:"_thumbnails" help:"folder name to store thumbnails when thumb_store is remote"`
-	RootFolderIDs StringList `json:"root_folder_ids" type:"text" help:"mount multiple root folders, comma separated file ids; when empty use root_folder_id"`
+	Cookie      string  `json:"cookie" type:"text" help:"115 网盘 Cookie（扫码登录成功后自动填入，无需手动获取）"`
+	PageSize    int64   `json:"page_size" type:"number" default:"1000" help:"115 驱动列表接口每页大小"`
+	LimitRate   float64 `json:"limit_rate" type:"float" default:"2" help:"限制所有 115 接口请求速率（[limit] 次/秒），建议保持默认以规避风控"`
+	ThumbStore  string  `json:"thumb_store" type:"select" options:"local,remote" default:"local" help:"local：缩略图缓存在服务器磁盘；remote：缩略图上传到视频同级的 _thumbnails 文件夹（不占服务器磁盘）"`
+	ThumbFolder string  `json:"thumb_folder" type:"text" default:"_thumbnails" help:"thumb_store 为 remote 时，存储缩略图的文件夹名"`
 	driver.RootID
 }
 
@@ -50,7 +29,7 @@ func (a *Addition) ThumbFolderName() string {
 	return a.ThumbFolder
 }
 
-// rootIDs 解析挂载根：优先 root_folder_ids，其次 root_folder_id 逗号分隔，默认整盘 0
+// rootIDs 解析挂载根：root_folder_id 支持逗号分隔多根，默认整盘 0
 func (a *Addition) rootIDs() []string {
 	var ids []string
 	seen := map[string]bool{}
@@ -61,11 +40,6 @@ func (a *Addition) rootIDs() []string {
 		}
 		seen[s] = true
 		ids = append(ids, s)
-	}
-	for _, v := range a.RootFolderIDs {
-		for _, part := range strings.Split(v, ",") {
-			add(part)
-		}
 	}
 	if a.RootFolderID != "" {
 		for _, part := range strings.Split(a.RootFolderID, ",") {

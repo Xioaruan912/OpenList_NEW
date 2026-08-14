@@ -42,16 +42,7 @@ func (d *Pan115) login() error {
 	// 会导致缩略图预热等后台任务无限卡死
 	d.client.Client.SetTimeout(30 * time.Second)
 	cr := &driver115.Credential{}
-	if d.QRCodeToken != "" {
-		s := &driver115.QRCodeSession{
-			UID: d.QRCodeToken,
-		}
-		if cr, err = d.client.QRCodeLoginWithApp(s, driver115.LoginApp(d.QRCodeSource)); err != nil {
-			return errors.Wrap(err, "failed to login by qrcode")
-		}
-		d.Cookie = fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", cr.UID, cr.CID, cr.SEID, cr.KID)
-		d.QRCodeToken = ""
-	} else if d.Cookie != "" {
+	if d.Cookie != "" {
 		if err = cr.FromCookie(d.Cookie); err != nil {
 			return errors.Wrap(err, "failed to login by cookies")
 		}
