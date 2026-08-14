@@ -38,7 +38,7 @@ var ee=()=>{
   loadTree=async()=>{setTreeLoading(!0);try{let r=await v.get(`/admin/thumb/tree`);n(r,r=>{setTree(r.children||[]),setScanStatus(r.scan_status||`complete`)})}finally{setTreeLoading(!1)}},
   loadDir=async(pp)=>{if(!pp)return;let r=await v.get(`/admin/thumb/dir`,{params:{path:pp}});n(r,r=>{setSelFiles(r.files||[]),setSelCount(r.count||0),setSelExcluded(r.excluded||[]),(()=>{let z={};for(let ff of r.files||[]){z[ff]=!((r.excluded||[]).includes(ff))}setChecked(z)})()})},
   queueGen=async(pp,force)=>{setBusy(pp);try{let r=await v.post(`/admin/thumb/generate`,{path:pp,recursive:!0,force:!!force});n(r,r=>{P.success(`已加入队列：${r.queued} 个${r.blocked?`（115 风控中，缩略图本地生成，上传将在上传窗口自动进行）`:``}`),setTotalQueued(t=>t+(r.queued||0)),load()})}finally{setBusy(``)}},
-  retryAll=async()=>{try{let r=await v.post(`/admin/thumb/retry_fails`,{});n(r,r=>{P.success(`已重试：${r.retried} 个`),load()})}catch(q){}},saveRu=async()=>{let items=[{key:`thumb_remote_upload_enabled`,value:ruEnabled()?`true`:`false`},{key:`thumb_remote_upload_start`,value:String(ruStart())},{key:`thumb_remote_upload_end`,value:String(ruEnd())},{key:`thumb_remote_upload_batch`,value:String(ruBatch())},{key:`thumb_remote_upload_interval`,value:String(ruInterval())},{key:`thumb_worker_concurrency`,value:String(ruWorker())},{key:`thumb_generation_power`,value:genPower()}];try{let r=await v.post(`/admin/setting/save`,items);n(r,r=>{P.success(`已保存配置`),load()})}catch(q){P.error(`保存配置失败`)}},
+  retryAll=async()=>{try{let r=await v.post(`/admin/thumb/retry_fails`,{});n(r,r=>{P.success(`已重试：${r.retried} 个`),load()})}catch(q){}},saveGen=async()=>{let items=[{key:`thumb_worker_concurrency`,value:String(ruWorker())},{key:`thumb_generation_power`,value:genPower()}];try{let r=await v.post(`/admin/setting/save`,items);n(r,r=>{P.success(`已保存生成配置`),load()})}catch(q){P.error(`保存失败`)}},saveRu=async()=>{let items=[{key:`thumb_remote_upload_enabled`,value:ruEnabled()?`true`:`false`},{key:`thumb_remote_upload_start`,value:String(ruStart())},{key:`thumb_remote_upload_end`,value:String(ruEnd())},{key:`thumb_remote_upload_batch`,value:String(ruBatch())},{key:`thumb_remote_upload_interval`,value:String(ruInterval())}];try{let r=await v.post(`/admin/setting/save`,items);n(r,r=>{P.success(`已保存配置`),load()})}catch(q){P.error(`保存配置失败`)}},
   runAll=async()=>{setBusy(`一键`);try{let r=await v.post(`/admin/thumb/generate`,{path:startPath(),recursive:!0});n(r,r=>{P.success(`已加入队列：${r.queued} 个${r.blocked?`（115 风控中，缩略图本地生成，上传将在上传窗口自动进行）`:``}`),setTotalQueued(t=>t+(r.queued||0)),setOpen(!1),load()})}finally{setBusy(``)}},
   genSel=async(force)=>{if(!sel()){P.warning(`请先选择目录`);return}queueGen(sel(),force)},
   retrySel=async()=>{if(!sel()){P.warning(`请先选择目录`);return}try{let r=await v.post(`/admin/thumb/retry_fails`,{path:sel()});n(r,r=>{P.success(`已重试：${r.retried} 个`),load()})}catch(q){}},
@@ -74,7 +74,17 @@ var ee=()=>{
         _(y,{get colorScheme(){return genBlocked()?`danger`:genActive()>0?`success`:queued()>0?`warning`:`neutral`},get children(){return genBlocked()?`115 风控中，生成已暂停`:genActive()>0?`正在生成中`:queued()>0?`已入队，等待生成`:`空闲`}}),
         _(j,{fontSize:`$sm`,color:`$neutral9`,get children(){return`队列剩余 ${queued()} 个 · 本次已生成 ${Math.min(totalQueued()-queued(),totalQueued())} 个`}})
       ]}}),
-      _(Pg,{mt:`$2`,get value(){return totalQueued()>0?Math.min(100,Math.round((totalQueued()-queued())/totalQueued()*100)):0},get max(){return 100},get indeterminate(){return genActive()>0&&totalQueued()===0},get size(){return`sm`}})
+      _(Pg,{mt:`$2`,get value(){return totalQueued()>0?Math.min(100,Math.round((totalQueued()-queued())/totalQueued()*100)):0},get max(){return 100},get indeterminate(){return genActive()>0&&totalQueued()===0},get size(){return`sm`}}),
+      _(u,{spacing:`$2`,alignItems:`center`,mt:`$2`,wrap:{"@initial":`wrap`,"@md":`unset`},get children(){return[
+        _(j,{fontWeight:`$medium`,get children(){return`生成控制`}}),
+        _(j,{fontSize:`$sm`,get children(){return`生成强度`}}),
+        _(m,{size:`xs`,get colorScheme(){return genPower()===`low`?`accent`:`neutral`},onClick:()=>setGenPower(`low`),get children(){return`低`}}),
+        _(m,{size:`xs`,get colorScheme(){return genPower()===`medium`?`accent`:`neutral`},onClick:()=>setGenPower(`medium`),get children(){return`中`}}),
+        _(m,{size:`xs`,get colorScheme(){return genPower()===`high`?`accent`:`neutral`},onClick:()=>setGenPower(`high`),get children(){return`高`}}),
+        _(j,{fontSize:`$sm`,ml:`$3`,get children(){return`生成并发`}}),
+        _(Hx,{get value(){return String(ruWorker())},onInput:e=>setRuWorker(Math.min(8,Math.max(1,parseInt(e.currentTarget.value)||3))),w:`$full`,maxW:`70px`}),
+        _(m,{size:`xs`,colorScheme:`accent`,onClick:saveGen,get children(){return`保存生成配置`}})
+      ]}})
     ]}}),
     _(j,{mt:`$2`,rounded:`$lg`,border:`1px solid $neutral6`,p:`$2`,get children(){return[
       _(u,{spacing:`$2`,alignItems:`center`,get children(){return[
@@ -93,12 +103,6 @@ var ee=()=>{
         _(j,{fontSize:`$sm`,get children(){return`间隔`}}),
         _(Hx,{get value(){return String(ruInterval())},onInput:e=>setRuInterval(parseInt(e.currentTarget.value)||1),w:`$full`,maxW:`70px`}),
         _(j,{fontSize:`$sm`,get children(){return`秒`}}),
-        _(j,{fontSize:`$sm`,ml:`$3`,get children(){return`生成强度`}}),
-        _(m,{size:`xs`,get colorScheme(){return genPower()===`low`?`accent`:`neutral`},onClick:()=>setGenPower(`low`),get children(){return`低`}}),
-        _(m,{size:`xs`,get colorScheme(){return genPower()===`medium`?`accent`:`neutral`},onClick:()=>setGenPower(`medium`),get children(){return`中`}}),
-        _(m,{size:`xs`,get colorScheme(){return genPower()===`high`?`accent`:`neutral`},onClick:()=>setGenPower(`high`),get children(){return`高`}}),
-        _(j,{fontSize:`$sm`,ml:`$3`,get children(){return`生成并发`}}),
-        _(Hx,{get value(){return String(ruWorker())},onInput:e=>setRuWorker(Math.min(8,Math.max(1,parseInt(e.currentTarget.value)||3))),w:`$full`,maxW:`70px`}),
         _(m,{size:`xs`,colorScheme:`accent`,onClick:saveRu,get children(){return`保存配置`}})
       ]}})
     ]}}),
