@@ -544,37 +544,14 @@ type thumbTreeNode struct {
 }
 
 const (
-	thumbTreeCacheTTL = 60 * time.Second
-	thumbTreeScanTO   = 30 * time.Second
-)
-
-var (
-	thumbTreeMu        sync.Mutex
-	thumbTreeCachedAt  time.Time
-	thumbTreeData      []*thumbTreeNode
-	thumbTreeScanState string
+	thumbTreeScanTO = 30 * time.Second
 )
 
 // ThumbTree GET /api/admin/thumb/tree
 // 扫描完整目录树（含没有缩略图的目录，忽略 _thumbnails），统计每目录视频数 videos
 // 与已有缩略图数 cached；115 风控/超时时以缩略图索引兜底，scan_status 标记是否完整
 func ThumbTree(c *gin.Context) {
-	thumbTreeMu.Lock()
-	if len(thumbTreeData) > 0 && time.Since(thumbTreeCachedAt) < thumbTreeCacheTTL {
-		children := thumbTreeData
-		status := thumbTreeScanState
-		thumbTreeMu.Unlock()
-		common.SuccessResp(c, gin.H{"children": children, "scan_status": status})
-		return
-	}
-	thumbTreeMu.Unlock()
-
 	children, status := buildThumbTree(c.Request.Context())
-	thumbTreeMu.Lock()
-	thumbTreeData = children
-	thumbTreeCachedAt = time.Now()
-	thumbTreeScanState = status
-	thumbTreeMu.Unlock()
 	common.SuccessResp(c, gin.H{"children": children, "scan_status": status})
 }
 
@@ -835,11 +812,7 @@ func ThumbClear(c *gin.Context) {
 		data []ThumbDirsEntry
 	}{}
 	thumbDirsMu.Unlock()
-	thumbTreeMu.Lock()
-	thumbTreeData = nil
-	thumbTreeCachedAt = time.Time{}
-	thumbTreeMu.Unlock()
-	common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
+		common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
 }
 
 // ThumbClearAll POST /api/admin/thumb/clear_all
@@ -864,11 +837,7 @@ func ThumbClearAll(c *gin.Context) {
 			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
-	thumbTreeMu.Lock()
-	thumbTreeData = nil
-	thumbTreeCachedAt = time.Time{}
-	thumbTreeMu.Unlock()
-	thumbDirsMu.Lock()
+		thumbDirsMu.Lock()
 	thumbDirsCache = map[string]struct {
 		at   time.Time
 		data []ThumbDirsEntry
