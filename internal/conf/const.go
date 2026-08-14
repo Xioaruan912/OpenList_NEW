@@ -166,11 +166,6 @@ const (
 	ThumbWidth        = "thumb_width"
 	ThumbFailTTL      = "thumb_fail_ttl"
 
-	// ai rename
-	AiRenameApiUrl  = "ai_rename_api_url"
-	AiRenameApiKey  = "ai_rename_api_key"
-	AiRenameModel   = "ai_rename_model"
-
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"
 	TaskOfflineDownloadTransferThreadsNum = "offline_download_transfer_task_threads_num"
