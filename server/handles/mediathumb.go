@@ -585,12 +585,100 @@ func prewarmWorker() {
 					log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
 				}
 				remoteThumbCacheSet(task.rawPath, png)
+				_ = os.WriteFile(cachePath, png, 0o666)
 			} else {
 				_ = os.WriteFile(cachePath, png, 0o666)
 			}
 			prewarmDone.Store(task.rawPath, struct{}{})
 		}()
 	}
+}
+
+// 目录缩略图清单缓存：列表时一次性列出 _thumbnails 文件名（1 次 API），
+// 之后 /vt 读取依据清单判断远程缩略图是否存在，避免每个视频都查询 115
+var (
+	thumbListingMu    sync.Mutex
+	thumbListing      = map[string]thumbListingEntry{}
+	thumbListingProbe sync.Map // 目录防抖
+)
+
+type thumbListingEntry struct {
+	names map[string]bool
+	at    time.Time
+}
+
+const (
+	thumbListingTTL = 5 * time.Minute
+	thumbListingDeb = 4 * time.Minute
+)
+
+// loadRemoteThumbListing 列出目录 _thumbnails 文件夹的文件名集合（1 次 API，带缓存）
+func loadRemoteThumbListing(ctx context.Context, dirPath string, addition interface {
+	ThumbFolderName() string
+}) map[string]bool {
+	if dirPath != "" && !strings.HasPrefix(dirPath, "/") {
+		dirPath = "/" + dirPath
+	}
+	thumbListingMu.Lock()
+	if e, ok := thumbListing[dirPath]; ok && time.Since(e.at) < thumbListingTTL {
+		thumbListingMu.Unlock()
+		return e.names
+	}
+	thumbListingMu.Unlock()
+	if _, probing := thumbListingProbe.LoadOrStore(dirPath, struct{}{}); probing {
+		return nil
+	}
+	defer thumbListingProbe.Delete(dirPath)
+
+	thumbDir := dirPath + "/" + addition.ThumbFolderName()
+	objs, err := fs.List(ctx, thumbDir, &fs.ListArgs{NoLog: true})
+	names := map[string]bool{}
+	if err == nil {
+		for _, obj := range objs {
+			names[obj.GetName()] = true
+		}
+	}
+	thumbListingMu.Lock()
+	thumbListing[dirPath] = thumbListingEntry{names: names, at: time.Now()}
+	if len(thumbListing) > 2000 {
+		for k, v := range thumbListing {
+			if time.Since(v.at) > thumbListingTTL {
+				delete(thumbListing, k)
+			}
+		}
+	}
+	thumbListingMu.Unlock()
+	return names
+}
+
+// preloadRemoteListing 异步预载目录缩略图清单（列表时不阻塞）
+func preloadRemoteListing(ctx context.Context, dirPath string, addition interface {
+	ThumbFolderName() string
+}) {
+	if dirPath != "" && !strings.HasPrefix(dirPath, "/") {
+		dirPath = "/" + dirPath
+	}
+	thumbListingMu.Lock()
+	if e, ok := thumbListing[dirPath]; ok && time.Since(e.at) < thumbListingTTL {
+		thumbListingMu.Unlock()
+		return
+	}
+	thumbListingMu.Unlock()
+	go func() {
+		loadRemoteThumbListing(context.WithoutCancel(ctx), dirPath, addition)
+	}()
+}
+
+// remoteThumbInListing 判断目录清单中是否存在该视频的缩略图
+func remoteThumbInListing(dirPath, rawPath string) (bool, bool) {
+	thumbListingMu.Lock()
+	e, ok := thumbListing[dirPath]
+	thumbListingMu.Unlock()
+	if !ok || time.Since(e.at) >= thumbListingTTL {
+		return false, false
+	}
+	_, exists := e.names[remoteThumbName(rawPath)]
+	return exists, true
 }
 
 // prewarmEnqueue 入队预热任务（去重）
@@ -829,7 +917,15 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	ThumbStoreRemote() bool
 	ThumbFolderName() string
 }) {
+	// 1) 内存缓存
 	if data, ok := remoteThumbCacheGet(rawPath); ok {
+		serveThumbPNG(c, data)
+		return
+	}
+	// 2) 本地磁盘缓存（零 115 API）
+	diskPath := thumbCachePath(thumbKindVideo, rawPath)
+	if data, err := os.ReadFile(diskPath); err == nil {
+		remoteThumbCacheSet(rawPath, data)
 		serveThumbPNG(c, data)
 		return
 	}
@@ -837,6 +933,33 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 		common.ErrorStrResp(c, "thumbnail not available", 404)
 		return
 	}
+	// 3) 目录清单判断远程缩略图是否存在（清单由列表时 1 次 API 建立）
+	dirPath := stdpath.Dir(rawPath)
+	if exists, known := remoteThumbInListing(dirPath, rawPath); known {
+		if !exists {
+			// 清单明确无缩略图：走生成
+			generateAndServeRemote(c, rawPath, addition, diskPath)
+			return
+		}
+		// 清单确认存在：从 115 读取一次，之后磁盘/内存缓存
+		remotePath := remoteThumbPath(addition, rawPath)
+		if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
+			if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
+				defer link.Close()
+				if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize()); err == nil {
+					remoteThumbMissClear(rawPath)
+					remoteThumbCacheSet(rawPath, data)
+					_ = os.WriteFile(diskPath, data, 0o666)
+					serveThumbPNG(c, data)
+					return
+				}
+			}
+		}
+		// 读取失败，回退生成
+		generateAndServeRemote(c, rawPath, addition, diskPath)
+		return
+	}
+	// 4) 清单未建立：直接查远程（保持兼容），失败则生成
 	remotePath := remoteThumbPath(addition, rawPath)
 	if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 		if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
@@ -844,6 +967,7 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize()); err == nil {
 				remoteThumbMissClear(rawPath)
 				remoteThumbCacheSet(rawPath, data)
+				_ = os.WriteFile(diskPath, data, 0o666)
 				serveThumbPNG(c, data)
 				return
 			}
@@ -851,6 +975,14 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	} else {
 		remoteThumbMissMark(rawPath)
 	}
+	generateAndServeRemote(c, rawPath, addition, diskPath)
+}
+
+// generateAndServeRemote 生成缩略图并上传远程、写入本地磁盘缓存
+func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
+	ThumbStoreRemote() bool
+	ThumbFolderName() string
+}, diskPath string) {
 	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
@@ -867,11 +999,11 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	go func() {
 		if err := uploadThumbRemote(context.WithoutCancel(c.Request.Context()), rawPath, addition, png); err != nil {
 			log.Warnf("thumb upload remote failed %s: %v", rawPath, err)
-			remoteThumbMissMark(rawPath)
 		}
 	}()
 	remoteThumbMissClear(rawPath)
 	remoteThumbCacheSet(rawPath, png)
+	_ = os.WriteFile(diskPath, png, 0o666)
 	serveThumbPNG(c, png)
 }
 
@@ -1068,6 +1200,11 @@ func fillVideoThumb(c *gin.Context, parent string, obj model.Obj, thumb string) 
 	}
 	if utils.GetFileType(obj.GetName()) != conf.VIDEO {
 		return ""
+	}
+	// remote 模式：异步预载目录缩略图清单（1 次 API/目录，缓存 5 分钟），
+	// 使 /vt 读取后续零 API
+	if addition := remoteThumbStore(parent + "/" + obj.GetName()); addition != nil {
+		preloadRemoteListing(c.Request.Context(), parent, addition)
 	}
 	return thumbURL(c, "vt", parent, obj)
 }
