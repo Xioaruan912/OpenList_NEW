@@ -344,34 +344,19 @@ func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
 // extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点；帧间小间隔降频，防网盘限流）
 func extractVideoFramesAtTimes(url string, header http.Header, times []float64) ([]image.Image, error) {
 	var frames []image.Image
-	consecutiveFails := 0
-	for i, t := range times {
+	for _, t := range times {
 		if len(frames) >= thumbMosaicFrames {
 			break
 		}
 		data, err := extractVideoFrameAt(url, header, fmt.Sprintf("%.2f", t))
 		if err != nil {
-			// 连续失败 3 帧视为下载受限（风控迹象），立即降级返回已成功帧，避免继续下载
-			consecutiveFails++
-			if consecutiveFails >= 3 {
-				break
-			}
 			continue
 		}
 		img, err := imaging.Decode(bytes.NewReader(data))
 		if err != nil {
-			consecutiveFails++
-			if consecutiveFails >= 3 {
-				break
-			}
 			continue
 		}
 		frames = append(frames, img)
-		consecutiveFails = 0
-		// 每帧之间按生成强度间隔，避免连续多次 Range 请求触发网盘限流
-		if i < len(times)-1 {
-			time.Sleep(thumbGenPower().FrameInterval)
-		}
 	}
 	if len(frames) == 0 {
 		return nil, errors.New("no video frames extracted")
@@ -720,15 +705,12 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	}
 
 	// 长视频：探测时长后从内容中均匀抽帧合成 3x3 网格缩略图（任一帧失败自动降级单帧）
-	// 115 风控迹象时直接跳过 mosaic（省 9 帧远程抽帧下载），走单帧
 	if size > thumbProbeMinSize {
-		if blocked, _ := isStorageBlocked(rawPath); !blocked {
-			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-				if data, err := generateVideoMosaic(remoteURL, link.Header, dur); err == nil {
-					return data, nil
-				}
-				log.Debugf("mosaic thumb failed for %s, fallback to single frame", rawPath)
+		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
+			if data, err := generateVideoMosaic(remoteURL, link.Header, dur); err == nil {
+				return data, nil
 			}
+			log.Debugf("mosaic thumb failed for %s, fallback to single frame", rawPath)
 		}
 	}
 
@@ -772,13 +754,13 @@ type thumbGenPowerCfg struct {
 }
 
 func thumbGenPower() thumbGenPowerCfg {
-	switch setting.GetStr(conf.ThumbGenerationPower, "medium") {
+	switch setting.GetStr(conf.ThumbGenerationPower, "high") {
 	case "low":
 		return thumbGenPowerCfg{Workers: 1, BatchInterval: 30 * time.Second, AcquireLimit: 2, FrameInterval: 2 * time.Second, TaskInterval: 8 * time.Second, EnqueueMax: 50}
-	case "high":
-		return thumbGenPowerCfg{Workers: 3, BatchInterval: 10 * time.Second, AcquireLimit: 8, FrameInterval: 500 * time.Millisecond, TaskInterval: 2 * time.Second, EnqueueMax: 200}
-	default:
-		return thumbGenPowerCfg{Workers: 2, BatchInterval: 20 * time.Second, AcquireLimit: 4, FrameInterval: time.Second, TaskInterval: 5 * time.Second, EnqueueMax: 100}
+	case "medium":
+		return thumbGenPowerCfg{Workers: 2, BatchInterval: 15 * time.Second, AcquireLimit: 4, FrameInterval: time.Second, TaskInterval: 3 * time.Second, EnqueueMax: 150}
+	default: // high：最大速度，不再限制批内间隔与吞吐
+		return thumbGenPowerCfg{Workers: 4, BatchInterval: 5 * time.Second, AcquireLimit: 8, FrameInterval: 500 * time.Millisecond, TaskInterval: 0, EnqueueMax: 300}
 	}
 }
 
