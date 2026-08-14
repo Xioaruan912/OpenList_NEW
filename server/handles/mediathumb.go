@@ -340,10 +340,10 @@ func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
 	return encodeThumb(data)
 }
 
-// extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点）
+// extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点；帧间小间隔降频，防网盘限流）
 func extractVideoFramesAtTimes(url string, header http.Header, times []float64) ([]image.Image, error) {
 	var frames []image.Image
-	for _, t := range times {
+	for i, t := range times {
 		if len(frames) >= thumbMosaicFrames {
 			break
 		}
@@ -356,6 +356,10 @@ func extractVideoFramesAtTimes(url string, header http.Header, times []float64) 
 			continue
 		}
 		frames = append(frames, img)
+		// 每帧之间小间隔，避免连续多次 Range 请求触发网盘限流
+		if i < len(times)-1 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 	if len(frames) == 0 {
 		return nil, errors.New("no video frames extracted")
@@ -877,6 +881,8 @@ func thumbFlushPendingUploads() {
 		sleepSec = 1
 	}
 	batch := 0
+	fails := 0
+	const flushFailMax = 10 // 单轮连续失败上限：超过则停止本轮，下个窗口再试（避免反复请求加剧风控）
 	for _, rawPath := range list {
 		if !thumbInUploadWindow() {
 			return
@@ -896,9 +902,15 @@ func thumbFlushPendingUploads() {
 			continue
 		}
 		if err := uploadThumbRemote(context.Background(), rawPath, addition, png); err != nil {
+			fails++
+			if fails >= flushFailMax {
+				// 连续失败过多：停止本轮，等待下个上传窗口
+				return
+			}
 			continue // 失败保留队列，下一轮再试
 		}
 		thumbPendingUploadRemove(rawPath)
+		fails = 0
 		batch++
 		if batch >= batchMax {
 			time.Sleep(time.Duration(sleepSec) * time.Second)
@@ -940,10 +952,11 @@ func prewarmWorker() {
 }
 
 func processTask(task thumbPrewarmTask) {
-	// 115 风控中不下载视频生成缩略图（避免加剧风控）：等待后重新入队
+	// 115 风控中不下载视频生成缩略图（避免加剧风控）：
+	// 放回队列尾部并短暂让位，不阻塞其他存储（如 Onedrive）的任务处理
 	if blocked, _ := isStorageBlocked(task.rawPath); blocked {
-		time.Sleep(10 * time.Minute)
 		prewarmCh <- task
+		time.Sleep(2 * time.Second)
 		return
 	}
 	cachePath := thumbCachePath(task.kind, task.rawPath)

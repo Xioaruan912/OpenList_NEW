@@ -85,6 +85,10 @@ func ThumbGenerate(c *gin.Context) {
 		}
 	}
 	for _, root := range roots {
+		// 逐挂载风控检查：风控中的挂载跳过遍历（不发起 115 列表请求，避免加剧风控）
+		if blocked, _ := isStorageBlocked(root); blocked {
+			continue
+		}
 		scanDir(root)
 	}
 	common.SuccessResp(c, gin.H{
@@ -908,6 +912,27 @@ func ThumbMigrate(c *gin.Context) {
 	if err := writeThumbIndex(newLines); err != nil {
 		common.ErrorResp(c, err, 500)
 		return
+	}
+	// 同步迁移待上传队列与排除列表中的路径前缀
+	for _, file := range []string{"pending_upload.jsonl", "excluded.jsonl"} {
+		p := filepath.Join(thumbDir(), file)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var sb strings.Builder
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, oldP) {
+				line = newP + strings.TrimPrefix(line, oldP)
+			}
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+		_ = os.WriteFile(p, []byte(sb.String()), 0o666)
 	}
 	// 清空目录扫描缓存
 	thumbDirsMu.Lock()
