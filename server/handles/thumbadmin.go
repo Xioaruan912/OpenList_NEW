@@ -814,6 +814,41 @@ func ThumbClear(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
 }
 
+// ThumbClearAll POST /api/admin/thumb/clear_all
+// 清空全部缩略图缓存与索引（含未索引的孤儿缓存文件），保留排除列表 excluded.jsonl；
+// 纯本地操作，不依赖网盘，任何情况下都可执行
+func ThumbClearAll(c *gin.Context) {
+	dir := thumbDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".png") || strings.HasSuffix(name, ".fail") {
+			_ = os.Remove(filepath.Join(dir, name))
+			removed++
+			continue
+		}
+		if name == "index.jsonl" || name == "pending_upload.jsonl" {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+	thumbTreeMu.Lock()
+	thumbTreeData = nil
+	thumbTreeCachedAt = time.Time{}
+	thumbTreeMu.Unlock()
+	thumbDirsMu.Lock()
+	thumbDirsCache = map[string]struct {
+		at   time.Time
+		data []ThumbDirsEntry
+	}{}
+	thumbDirsMu.Unlock()
+	common.SuccessResp(c, gin.H{"removed": removed})
+}
+
 // ---------- 挂载路径迁移 ----------
 
 type ThumbMigrateReq struct {
