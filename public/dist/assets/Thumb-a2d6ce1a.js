@@ -13,6 +13,8 @@ var ee=()=>{
   [selExcluded,setSelExcluded]=B([]),
   [checked,setChecked]=B({}),
   [expanded,setExp]=B(new Set()),
+  [treeLoading,setTreeLoading]=B(!1),
+  [scanStatus,setScanStatus]=B(`complete`),
   [open,setOpen]=B(!1),
   [startPath,setStart]=B(`/`),
   [stale,setStale]=B([]),
@@ -22,14 +24,14 @@ var ee=()=>{
   flat=()=>{let out=[];let walk=(ns,d)=>{for(let k of ns||[]){out.push({path:k.path,name:k.name,cached:k.cached,depth:d});if(k.children&&k.children.length)walk(k.children,d+1)}};walk(tree(),0);return out},
   allDirs=()=>[{path:`/`,name:`/`,cached:st()?st().cached_files:0,depth:0}].concat(flat()),
   load=async()=>{let r=await v.get(`/admin/thumb/status`);n(r,r=>{setSt(r),setQueued(r.prewarm_queued||0),setStale(r.stale_by_dir||[]),setMounts(r.mounts||[]),setOldP((r.stale_by_dir||[]).length?(r.stale_by_dir[0].dir.split(`/`).slice(0,2).join(`/`)):``),setNewP((r.mounts||[])[0]||``)})},
-  loadTree=async()=>{let r=await v.get(`/admin/thumb/tree`);n(r,r=>setTree(r.children||[]))},
+  loadTree=async()=>{setTreeLoading(!0);try{let r=await v.get(`/admin/thumb/tree`);n(r,r=>{setTree(r.children||[]),setScanStatus(r.scan_status||`complete`),(()=>{let s=new Set(expanded());for(let k of r.children||[]){s.add(k.path)}setExp(s)})()})}finally{setTreeLoading(!1)}},
   loadDir=async(pp)=>{if(!pp)return;let r=await v.get(`/admin/thumb/dir`,{params:{path:pp}});n(r,r=>{setSelFiles(r.files||[]),setSelCount(r.count||0),setSelExcluded(r.excluded||[]),(()=>{let z={};for(let ff of r.files||[]){z[ff]=!((r.excluded||[]).includes(ff))}setChecked(z)})()})},
   queueGen=async(pp,force)=>{setBusy(pp);try{let r=await v.post(`/admin/thumb/generate`,{path:pp,recursive:!0,force:!!force});n(r,r=>{P.success(`已加入队列：${r.queued} 个`),load()})}finally{setBusy(``)}},
   retryAll=async()=>{try{let r=await v.post(`/admin/thumb/retry_fails`,{});n(r,r=>{P.success(`已重试：${r.retried} 个`),load()})}catch(q){}},
   runAll=async()=>{setBusy(`一键`);try{let r=await v.post(`/admin/thumb/generate`,{path:startPath(),recursive:!0});n(r,r=>{P.success(`已加入队列：${r.queued} 个`),setOpen(!1),load()})}finally{setBusy(``)}},
   genSel=async(force)=>{if(!sel()){P.warning(`请先选择目录`);return}queueGen(sel(),force)},
   retrySel=async()=>{if(!sel()){P.warning(`请先选择目录`);return}try{let r=await v.post(`/admin/thumb/retry_fails`,{path:sel()});n(r,r=>{P.success(`已重试：${r.retried} 个`),load()})}catch(q){}},
-  clearSel=async()=>{if(!sel()){P.warning(`请先选择目录`);return}if(!window.confirm(`确认清空该目录下所有缩略图？（${sel()}）`))return;setBusy(sel()+`-c`);try{let r=await v.post(`/admin/thumb/clear`,{path:sel()});n(r,r=>{P.success(`已清空 ${r.removed} 个缩略图`),loadTree(),loadDir(sel()),load()})}finally{setBusy(``)}},
+  clearSel=async()=>{if(!sel()){P.warning(`请先选择目录`);return}if(!window.confirm(`确认清空该目录下所有缩略图？（${sel()}）`))return;setBusy(sel()+`-c`);try{let r=await v.post(`/admin/thumb/clear`,{path:sel()});n(r,r=>{P.success(`已清空 ${r.removed} 个缩略图${r.remote_skipped?`（115 风控中，远程缩略图待恢复后清理）`:``}`),loadTree(),loadDir(sel()),load()})}catch(q){P.error(`清空失败：`+(q&&q.message||q))}finally{setBusy(``)}},
   toggleFile=p=>setChecked(cc=>{let z={};for(let k in cc){z[k]=cc[k]}z[p]=!z[p];return z}),
   excludeUnchecked=async()=>{if(!sel()){P.warning(`请先选择目录`);return}let paths=selFiles().filter(p=>!checked()[p]);if(!paths.length){P.warning(`没有需要排除的视频`);return}try{let r=await v.post(`/admin/thumb/exclude`,{paths,exclude:!0});n(r,r=>{P.success(`已排除 ${paths.length} 个视频`),loadDir(sel())})}catch(q){}},
   restoreExcluded=async()=>{if(!sel()){P.warning(`请先选择目录`);return}let ex=selExcluded();if(!ex.length){P.warning(`没有已排除的视频`);return}try{let r=await v.post(`/admin/thumb/exclude`,{paths:ex,exclude:!1});n(r,r=>{P.success(`已恢复 ${ex.length} 个视频`),loadDir(sel())})}catch(q){}},
@@ -64,6 +66,8 @@ var ee=()=>{
     _(u,{direction:`row`,spacing:`$3`,w:`$full`,alignItems:`flex-start`,get children(){return[
       _(j,{css:{flex:`1 1 55%`,minWidth:`420px`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$1`,get children(){return[
         _(j,{fontWeight:`$medium`,p:`$2`,get children(){return`目录`}}),
+        _(V,{get when(){return scanStatus()!==`complete`},get children(){return _(j,{p:`$2`,fontSize:`$sm`,color:`$warning9`,get children(){return`115 网盘受限中，当前仅展示已有缩略图的目录；恢复后自动显示全部`}})}}),
+        _(V,{get when(){return treeLoading()},get children(){return _(j,{p:`$2`,fontSize:`$sm`,color:`$neutral9`,get children(){return`加载中...`}})}}),
         _(u,{direction:`column`,w:`$full`,get children(){return _(T,{get each(){return tree()},children:q=>TN(q,0)})}})
       ]}}),
       _(j,{css:{flex:`1 1 45%`,minWidth:`380px`},rounded:`$lg`,border:`1px solid $neutral6`,p:`$2`,get children(){return[

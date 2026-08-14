@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"context"
 	"os"
 	stdpath "path"
 	"path/filepath"
@@ -499,14 +500,53 @@ func sliceThumbDirsPage(items []ThumbDirsEntry, page, pageSize int) []ThumbDirsE
 // ThumbTree GET /api/admin/thumb/tree
 // 扫描完整目录树（含没有缩略图的目录，忽略 _thumbnails），统计每目录视频数 videos
 // 与已有缩略图数 cached；扫描失败（115 风控等）时以缩略图索引兜底
+// thumbTreeNode 目录树节点
+type thumbTreeNode struct {
+	Path     string           `json:"path"`
+	Name     string           `json:"name"`
+	Cached   int              `json:"cached"`
+	Videos   int              `json:"videos"`
+	Children []*thumbTreeNode `json:"children"`
+}
+
+const (
+	thumbTreeCacheTTL = 60 * time.Second
+	thumbTreeScanTO   = 30 * time.Second
+)
+
+var (
+	thumbTreeMu        sync.Mutex
+	thumbTreeCachedAt  time.Time
+	thumbTreeData      []*thumbTreeNode
+	thumbTreeScanState string
+)
+
+// ThumbTree GET /api/admin/thumb/tree
+// 扫描完整目录树（含没有缩略图的目录，忽略 _thumbnails），统计每目录视频数 videos
+// 与已有缩略图数 cached；115 风控/超时时以缩略图索引兜底，scan_status 标记是否完整
 func ThumbTree(c *gin.Context) {
-	type node struct {
-		Path     string  `json:"path"`
-		Name     string  `json:"name"`
-		Cached   int     `json:"cached"`
-		Videos   int     `json:"videos"`
-		Children []*node `json:"children"`
+	thumbTreeMu.Lock()
+	if len(thumbTreeData) > 0 && time.Since(thumbTreeCachedAt) < thumbTreeCacheTTL {
+		children := thumbTreeData
+		status := thumbTreeScanState
+		thumbTreeMu.Unlock()
+		common.SuccessResp(c, gin.H{"children": children, "scan_status": status})
+		return
 	}
+	thumbTreeMu.Unlock()
+
+	children, status := buildThumbTree(c.Request.Context())
+	thumbTreeMu.Lock()
+	thumbTreeData = children
+	thumbTreeCachedAt = time.Now()
+	thumbTreeScanState = status
+	thumbTreeMu.Unlock()
+	common.SuccessResp(c, gin.H{"children": children, "scan_status": status})
+}
+
+func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
+	scanCtx, cancel := context.WithTimeout(ctx, thumbTreeScanTO)
+	defer cancel()
 	// 索引：每目录已有缩略图数（直接子项）
 	indexed := readThumbIndex()
 	cachedByDir := map[string]int{}
@@ -516,16 +556,21 @@ func ThumbTree(c *gin.Context) {
 			cachedByDir[dir]++
 		}
 	}
-	root := &node{}
+	root := &thumbTreeNode{}
 	dirsCount := 0
-	var scan func(dir string, cur *node)
-	scan = func(dir string, cur *node) {
+	scanFailed := 0
+	var scan func(dir string, cur *thumbTreeNode)
+	scan = func(dir string, cur *thumbTreeNode) {
+		if scanCtx.Err() != nil {
+			return
+		}
 		if dirsCount >= thumbScanMaxDirs {
 			return
 		}
 		dirsCount++
-		objs, err := fs.List(c.Request.Context(), dir, &fs.ListArgs{})
+		objs, err := fs.List(scanCtx, dir, &fs.ListArgs{})
 		if err != nil {
+			scanFailed++
 			return
 		}
 		for _, obj := range objs {
@@ -534,7 +579,7 @@ func ThumbTree(c *gin.Context) {
 					continue
 				}
 				childPath := dir + "/" + obj.GetName()
-				child := &node{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath]}
+				child := &thumbTreeNode{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath]}
 				cur.Children = append(cur.Children, child)
 				scan(childPath, child)
 			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
@@ -545,7 +590,7 @@ func ThumbTree(c *gin.Context) {
 	mounts := currentMountPaths()
 	if len(mounts) > 0 {
 		for _, m := range mounts {
-			child := &node{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m]}
+			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m]}
 			root.Children = append(root.Children, child)
 			scan(m, child)
 		}
@@ -560,7 +605,7 @@ func ThumbTree(c *gin.Context) {
 				continue
 			}
 			path += "/" + part
-			var child *node
+			var child *thumbTreeNode
 			for _, cnode := range cur.Children {
 				if cnode.Path == path {
 					child = cnode
@@ -568,13 +613,17 @@ func ThumbTree(c *gin.Context) {
 				}
 			}
 			if child == nil {
-				child = &node{Path: path, Name: part, Cached: cnt}
+				child = &thumbTreeNode{Path: path, Name: part, Cached: cnt}
 				cur.Children = append(cur.Children, child)
 			}
 			cur = child
 		}
 	}
-	common.SuccessResp(c, gin.H{"children": root.Children})
+	status := "complete"
+	if scanFailed > 0 || scanCtx.Err() != nil || dirsCount == 0 {
+		status = "partial"
+	}
+	return root.Children, status
 }
 
 // ThumbDir GET /api/admin/thumb/dir?path=
@@ -692,10 +741,9 @@ func ThumbClear(c *gin.Context) {
 		common.ErrorStrResp(c, "invalid path", 400)
 		return
 	}
-	if blocked, _ := isStorageBlocked(path); blocked {
-		common.ErrorStrResp(c, "115 网盘正在风控保护中，请稍后再试", 429)
-		return
-	}
+	// 风控检查：本地缓存与索引清空不依赖网盘，始终执行；
+	// 仅当存储处于风控时跳过远程 _thumbnails 删除（remote 模式尽力而为）
+	blocked, _ := isStorageBlocked(path)
 	ctx := c.Request.Context()
 	indexed := readThumbIndex()
 	removed := 0
@@ -713,30 +761,35 @@ func ThumbClear(c *gin.Context) {
 		}
 		keep = append(keep, p)
 	}
-	// 递归清空远程 _thumbnails（115 remote 模式）
-	if addition := remoteThumbStore(path); addition != nil {
-		folder := addition.ThumbFolderName()
-		if folder != "" {
-			var clearDir func(dir string)
-			clearDir = func(dir string) {
-				thumbDir := dir + "/" + folder
-				if objs, err := fs.List(ctx, thumbDir, &fs.ListArgs{}); err == nil {
-					for _, obj := range objs {
-						if !obj.IsDir() {
-							_ = fs.Remove(ctx, thumbDir+"/"+obj.GetName())
+	// 递归清空远程 _thumbnails（115 remote 模式，风控中跳过）
+	remoteSkipped := false
+	if !blocked {
+		if addition := remoteThumbStore(path); addition != nil {
+			folder := addition.ThumbFolderName()
+			if folder != "" {
+				var clearDir func(dir string)
+				clearDir = func(dir string) {
+					thumbDir := dir + "/" + folder
+					if objs, err := fs.List(ctx, thumbDir, &fs.ListArgs{}); err == nil {
+						for _, obj := range objs {
+							if !obj.IsDir() {
+								_ = fs.Remove(ctx, thumbDir+"/"+obj.GetName())
+							}
+						}
+					}
+					if objs, err := fs.List(ctx, dir, &fs.ListArgs{}); err == nil {
+						for _, obj := range objs {
+							if obj.IsDir() && obj.GetName() != folder {
+								clearDir(dir + "/" + obj.GetName())
+							}
 						}
 					}
 				}
-				if objs, err := fs.List(ctx, dir, &fs.ListArgs{}); err == nil {
-					for _, obj := range objs {
-						if obj.IsDir() && obj.GetName() != folder {
-							clearDir(dir + "/" + obj.GetName())
-						}
-					}
-				}
+				clearDir(path)
 			}
-			clearDir(path)
 		}
+	} else {
+		remoteSkipped = true
 	}
 	if err := writeThumbIndex(keep); err != nil {
 		common.ErrorResp(c, err, 500)
@@ -748,7 +801,11 @@ func ThumbClear(c *gin.Context) {
 		data []ThumbDirsEntry
 	}{}
 	thumbDirsMu.Unlock()
-	common.SuccessResp(c, gin.H{"removed": removed, "path": path})
+	thumbTreeMu.Lock()
+	thumbTreeData = nil
+	thumbTreeCachedAt = time.Time{}
+	thumbTreeMu.Unlock()
+	common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
 }
 
 // ---------- 挂载路径迁移 ----------
