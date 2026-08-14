@@ -2,6 +2,8 @@ package handles
 
 import (
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -58,7 +60,7 @@ func ThumbGenerate(c *gin.Context) {
 }
 
 // ThumbStatus GET /api/admin/thumb/status
-// 缩略图缓存与预热队列状态
+// 缩略图缓存与预热队列状态（含按目录失败统计）
 func ThumbStatus(c *gin.Context) {
 	cached, failCount, totalSize := thumbCacheStats()
 	status := gin.H{
@@ -71,7 +73,70 @@ func ThumbStatus(c *gin.Context) {
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
+	// 失败明细（按目录分组）
+	fails := listThumbFails()
+	byDir := map[string]int{}
+	unknown := 0
+	for _, f := range fails {
+		if f.Dir == "" {
+			unknown++
+			continue
+		}
+		byDir[f.Dir]++
+	}
+	dirs := make([]gin.H, 0, len(byDir))
+	for dir, cnt := range byDir {
+		dirs = append(dirs, gin.H{"dir": dir, "count": cnt})
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i]["count"].(int) > dirs[j]["count"].(int) })
+	status["fails_by_dir"] = dirs
+	status["fails_unknown"] = unknown
 	common.SuccessResp(c, status)
+}
+
+// ThumbRetryFailsReq POST /api/admin/thumb/retry_fails
+type ThumbRetryFailsReq struct {
+	Path string `json:"path"` // 为空则重试全部失败
+}
+
+// ThumbRetryFails 重试失败缩略图（清除失败标记并重新加入预热队列）
+func ThumbRetryFails(c *gin.Context) {
+	var req ThumbRetryFailsReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	apiURL := common.GetApiUrl(c)
+	fails := listThumbFails()
+	retried := 0
+	cleared := 0
+	for _, f := range fails {
+		if req.Path != "" {
+			// 指定目录：仅匹配该目录（旧格式无路径时跳过）
+			if f.Dir != req.Path {
+				continue
+			}
+		}
+		// 清除失败标记
+		failFile := filepath.Join(thumbDir(), f.Kind+"-"+thumbHash(f.Path)+".fail")
+		if f.Path == "" {
+			// 旧格式（无路径信息）：按文件名匹配删除（kind 从文件名解析，hash 需要原始路径——无法反查）
+			// 直接扫描目录删除该 kind 的所有 fail
+			entries, _ := os.ReadDir(thumbDir())
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".fail") && strings.HasPrefix(e.Name(), f.Kind+"-") {
+					_ = os.Remove(filepath.Join(thumbDir(), e.Name()))
+					cleared++
+				}
+			}
+			continue
+		}
+		_ = os.Remove(failFile)
+		cleared++
+		prewarmEnqueue(f.Kind, f.Path, apiURL)
+		retried++
+	}
+	common.SuccessResp(c, gin.H{"retried": retried, "cleared": cleared})
 }
 
 func thumbCacheStats() (cached int, failCount int, totalSize int64) {

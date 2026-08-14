@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -157,7 +158,49 @@ func thumbFailed(kind, rawPath string) bool {
 }
 
 func markThumbFailed(kind, rawPath string) {
-	_ = os.WriteFile(thumbFailPath(kind, rawPath), nil, 0o666)
+	// 记录失败路径，便于按目录统计失败与重试
+	data, _ := json.Marshal(map[string]string{
+		"path": rawPath,
+		"at":   time.Now().Format(time.RFC3339),
+	})
+	_ = os.WriteFile(thumbFailPath(kind, rawPath), data, 0o666)
+}
+
+// thumbFailItem 失败缩略图信息
+type thumbFailItem struct {
+	Kind string `json:"kind"`
+	Path string `json:"path"`
+	Dir  string `json:"dir"`
+	At   string `json:"at"`
+}
+
+// listThumbFails 扫描 fail 标记文件，解析出失败路径（旧格式无内容视为路径未知）
+func listThumbFails() []thumbFailItem {
+	dir := thumbDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var items []thumbFailItem
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".fail") {
+			continue
+		}
+		kind := strings.SplitN(e.Name(), "-", 2)[0]
+		item := thumbFailItem{Kind: kind}
+		if data, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil && len(data) > 0 {
+			var m map[string]string
+			if json.Unmarshal(data, &m) == nil {
+				item.Path = m["path"]
+				item.At = m["at"]
+				if item.Path != "" {
+					item.Dir = stdpath.Dir(item.Path)
+				}
+			}
+		}
+		items = append(items, item)
+	}
+	return items
 }
 
 func ffmpegBin() (string, error) {
