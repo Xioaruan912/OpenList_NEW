@@ -48,9 +48,18 @@
 现在 **视频文件会自动生成缩略图**，在网格视图中直接显示视频画面：
 
 - 首次访问时通过 ffmpeg 从视频流中抽取画面生成缩略图
-- **浏览即预热**：打开目录时后台自动批量生成该目录所有视频的缩略图（默认开启，可设置 `thumb_prewarm` 关闭），无需等浏览器逐个加载
+- **长视频内容缩略图**：超过 90 秒的视频会从 10%~90% 均匀抽取 9 帧合成 **3×3 网格拼图**，展示视频各段内容而非只显示开头；抽帧失败自动降级为单帧
 - **两种存储模式**（`thumb_store` 设置）：`local` 存服务器 `data/thumb_cache/`（重启不丢失）；`remote` 上传到视频同级目录的 `_thumbnails/` 文件夹（不占服务器磁盘，115 网盘内可读）
 - 支持所有通过本程序挂载的视频存储（115 / 阿里云盘 / 本地等）
+
+**缩略图管理后台**（侧边栏「缩略图」）：
+
+- **目录树**：展示全部目录（含没有缩略图的），显示每目录「已缓存」数与「缺 N」标记，点击目录查看该目录已有缩略图的视频清单
+- **生成**：点击目录的「生成」按钮、目录详情的「生成缺失 / 重建优化」，或「一键缩略图」弹窗选择起始目录（默认根目录）递归生成缺失缩略图
+- **排除**：目录详情中勾选/取消视频，可排除不需要缩略图的视频（持久化到 `data/thumb_cache/excluded.jsonl`）
+- **清空**：一键清空某目录所有缩略图（本地缓存 + 索引 + 远程 `_thumbnails`）
+- **挂载迁移**：存储挂载路径变更后，一键把旧路径的缩略图索引与缓存迁移到新路径
+- **防风控**：生成按 **5 个一批**节流提交（批间 20s），自动跳过处于 115 风控的存储，避免触发网盘限流
 
 新增后端 API：
 
@@ -60,14 +69,23 @@
 | `/at/*path` | GET | 提取音频内嵌专辑封面 |
 | `/it/*path` | GET | 图片文件缩略图 |
 | `/ct/*path` | GET | 目录封面（自动查找 folder.jpg 等） |
+| `/api/admin/thumb/status` | GET | 缩略图统计（缓存/队列/失败/占用/失效挂载） |
+| `/api/admin/thumb/tree` | GET | 目录树（含无缩略图目录，videos/cached 统计） |
+| `/api/admin/thumb/dir?path=` | GET | 指定目录已有缩略图视频清单与排除项 |
+| `/api/admin/thumb/generate` | POST | 批量生成指定目录缩略图（body: path/recursive/force） |
+| `/api/admin/thumb/retry_fails` | POST | 重试失败项（自动跳过风控存储） |
+| `/api/admin/thumb/clear` | POST | 清空指定目录所有缩略图 |
+| `/api/admin/thumb/exclude` | POST | 排除/恢复不需要缩略图的视频 |
+| `/api/admin/thumb/migrate` | POST | 挂载路径变更后迁移缩略图索引与缓存 |
 | `/api/115/check_cookie` | POST | 校验 115 Cookie 是否有效（返回账号信息） |
 | `/api/115/check_storage` | POST | 校验已配置的 115 存储 Cookie 是否有效 |
 
 **缩略图增强特性**：
 
-- 视频缩略图：优先下载开头 8MB 本地抽帧；遇到 moov 在文件尾部的视频（非快速启动编码）自动回退为 ffmpeg 远程 Range 抽帧，大视频也能快速出图
+- 视频缩略图：优先下载开头 3MB 本地抽帧；遇到 moov 在文件尾部的视频（非快速启动编码）自动回退为 ffmpeg 远程 Range 抽帧，大视频也能快速出图
+- 长视频（>90s）自动生成 3×3 内容拼图缩略图；生成在后台按 5 个一批节流提交，避免触发网盘风控
 - 支持文件大小上限（默认视频 2GB / 音频 50MB / 图片 20MB，超限跳过），避免大文件卡住
-- 抽帧失败会写入负缓存（7 天），不会反复重试
+- 抽帧失败会写入失败标记（7 天），不会反复重试；后台失败重试带长间隔退避（180s，最多 3 次）
 - 缓存自动清理：过期（默认 30 天）与总量（默认 2GB）超限时后台自动删除
 - 缺失 ffmpeg 时视频/音频缩略图自动禁用并记录日志，不影响其他功能
 - 网格视图下：视频显示视频画面、音频显示专辑封面、图片显示缩略图、目录显示封面图片
@@ -135,10 +153,64 @@ go build -o openlist ./main.go
 |---|---|
 | Web 端口 | `5244` |
 | 数据目录 | `<安装目录>/data/` |
+| 数据库 | `data/data.db`（用户、存储配置、分享、任务） |
 | 视频缩略图缓存 | `data/thumb_cache/`（重启保留） |
-| 批量生成缩略图 | 管理后台接口 `POST /api/admin/thumb/generate`（body: path/recursive） |
-| 缩略图状态 | 管理后台接口 `GET /api/admin/thumb/status` |
+| 缩略图索引 | `data/thumb_cache/index.jsonl` |
+| 排除列表 | `data/thumb_cache/excluded.jsonl` |
+| 批量生成缩略图 | 管理后台「缩略图」页或 `POST /api/admin/thumb/generate` |
 | 默认登录设备（115） | `web` |
+
+## 数据备份与迁移
+
+升级、重装或迁移服务器时，**只需备份整个数据目录**（默认 `<安装目录>/data/`，可通过 `-data` 启动参数或 `config.json` 调整），即包含全部配置与数据：
+
+| 内容 | 路径 | 说明 |
+|---|---|---|
+| **数据库** | `data/data.db` | **最核心**：管理员账号、所有存储配置（含 115 Cookie / 各网盘 Token）、分享、任务、设置 |
+| **缩略图缓存** | `data/thumb_cache/` | 已生成的视频/音频/图片缩略图（`*.png`），删除后会自动按需重新生成 |
+| **缩略图索引** | `data/thumb_cache/index.jsonl` | 已生成缩略图的文件路径清单（备份后恢复无需重新扫描） |
+| **排除列表** | `data/thumb_cache/excluded.jsonl` | 你手动排除（不需要缩略图）的视频列表 |
+| **失败标记** | `data/thumb_cache/*.fail` | 生成失败的记录（7 天内不重试），可删 |
+| **临时文件** | `data/temp/` | 上传/抽帧临时文件，可不备份 |
+| **运行配置** | `data/config.json` | 端口等运行参数（若存在） |
+
+### 备份方法
+
+```bash
+# 停止服务后复制（推荐，保证数据一致）
+systemctl stop openlist
+cp -a /opt/openlist/data /backup/openlist-data-$(date +%F)
+systemctl start openlist
+
+# 或在线备份数据库（SQLite 热备）
+sqlite3 /opt/openlist/data/data.db ".backup '/backup/data.db.bak'"
+```
+
+> 提示：`thumb_cache/` 若体积较大（可设置 `thumb_cache_max_size` 上限），可只备份 `data.db` + `index.jsonl` + `excluded.jsonl`，缩略图丢失后会在浏览/生成时自动重建。
+
+### 恢复 / 迁移
+
+1. 全新安装（一键脚本或手动部署）后，**停止服务**
+2. 将备份的 `data/` 覆盖到新安装的数据目录（保持 `data.db`、`thumb_cache/` 等）
+3. 启动服务，登录原有账号即可；缩略图缓存与索引自动恢复，无需重新生成
+
+### 一键安装脚本
+
+根目录 `install.sh` 提供全新服务器一键部署：
+
+```bash
+# Debian / Ubuntu / CentOS 一键安装
+curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bash
+```
+
+脚本自动完成：
+1. 安装系统依赖（git、gcc、ffmpeg、Go）
+2. 克隆本仓库并编译
+3. 初始化数据目录
+4. 注册 systemd 服务并开机自启
+5. 启动并验证服务可用（`/ping`）
+
+可选环境变量：`INSTALL_DIR`（安装目录）、`OPENLIST_PORT`（端口）、`INSTALL_BRANCH`（分支）。脚本已在纯净环境验证：仓库不包含任何数据文件，克隆后可直接 `go build ./main.go` 成功。
 
 ## 支持功能
 
@@ -158,7 +230,7 @@ go build -o openlist ./main.go
 
 <details>
 <summary><b>视频缩略图加载很慢？</b></summary>
-首次访问每个视频需要下载视频片段并用 ffmpeg 抽帧，通常需要数秒到十几秒。生成后会缓存，之后秒开。如果视频很多，建议先浏览一次预热。超过 `thumb_video_max_size`（默认 2GB）的视频不会生成缩略图。
+首次访问每个视频需要下载视频片段并用 ffmpeg 抽帧，通常需要数秒到十几秒。生成后会缓存，之后秒开。可在管理后台「缩略图」页对需要展示的目录点击「生成」或使用「一键缩略图」批量预生成。超过 `thumb_video_max_size`（默认 2GB）的视频不会生成缩略图。
 </details>
 
 <details>
@@ -173,12 +245,27 @@ go build -o openlist ./main.go
 
 <details>
 <summary><b>如何清理缩略图缓存？</b></summary>
-缩略图缓存在 `data/thumb_cache/`。系统会按 `thumb_cache_ttl`（默认 30 天）和 `thumb_cache_max_size`（默认 2GB）自动清理；也可手动删除该目录后重启服务。
+管理后台「缩略图」页选中目录后点「清空」，会删除该目录所有缩略图（本地缓存、索引、远程 `_thumbnails`）。也可整体删除 `data/thumb_cache/` 后重启服务。系统还会按 `thumb_cache_ttl`（默认 30 天）和 `thumb_cache_max_size`（默认 2GB）自动清理。
 </details>
 
 <details>
 <summary><b>缩略图加载还是很慢？</b></summary>
-默认已开启「浏览即预热」，打开目录时后台自动生成缩略图。也可以手动批量生成：`POST /api/admin/thumb/generate`，body `{"path":"/目录路径","recursive":true}`。生成状态查询：`GET /api/admin/thumb/status`。
+在管理后台「缩略图」页，展开目录树，对缺失缩略图的目录点击「生成」，或用「一键缩略图」选择起始目录批量生成。生成在后台按 5 个一批节流提交，避免触发网盘风控。已排除的视频不会生成缩略图。
+</details>
+
+<details>
+<summary><b>某些视频不想生成缩略图？</b></summary>
+管理后台「缩略图」页选中目录后，在右侧视频清单中取消勾选对应视频，点「排除未勾选」即可；之后批量生成会跳过它们。「恢复已排除」可撤销。
+</details>
+
+<details>
+<summary><b>长视频缩略图只显示开头？</b></summary>
+超过 90 秒的视频会自动生成 3×3 网格内容缩略图（从视频 10%~90% 均匀取样 9 帧）。对已有的长视频缩略图，可在管理后台「缩略图」页对目录点「重建优化」（force）重新生成。
+</details>
+
+<details>
+<summary><b>修改了存储挂载路径后缩略图目录没更新？</b></summary>
+管理后台「缩略图」页会检测到失效的旧挂载路径，在页面底部「挂载迁移」工具中填写旧/新前缀后点「迁移」，旧路径的缩略图缓存与索引会自动迁移到新路径。
 </details>
 
 <details>
