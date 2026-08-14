@@ -560,6 +560,11 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
 		return
 	}
+	// 用户手动排除的视频不生成缩略图（避免无谓下载）
+	if readThumbExcluded()[rawPath] {
+		common.ErrorStrResp(c, "thumbnail not available", 404)
+		return
+	}
 
 	if !thumbAcquire(false) {
 		common.ErrorStrResp(c, "thumbnail busy", 503)
@@ -1420,6 +1425,11 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
 		return
 	}
+	// 用户手动排除的视频不生成缩略图
+	if readThumbExcluded()[rawPath] {
+		common.ErrorStrResp(c, "thumbnail not available", 404)
+		return
+	}
 	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
@@ -1619,6 +1629,8 @@ func thumbCleanupOnceRun() {
 			total -= f.size
 		}
 	}
+	// 清理删除了缓存文件后重写索引，只保留缓存仍存在的条目，保证统计与实际一致
+	thumbRewriteIndex()
 }
 
 // thumbURL 构造指向缩略图接口的 URL
