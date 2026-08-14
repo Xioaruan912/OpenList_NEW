@@ -162,6 +162,7 @@ const (
 	ThumbDirCover     = "thumb_dir_cover"
 	ThumbPrewarm      = "thumb_prewarm"
 	ThumbConcurrency  = "thumb_concurrency"
+	ThumbWorkerConcurrency = "thumb_worker_concurrency"
 	ThumbChunkSize    = "thumb_chunk_size"
 	ThumbWidth        = "thumb_width"
 	ThumbFailTTL      = "thumb_fail_ttl"

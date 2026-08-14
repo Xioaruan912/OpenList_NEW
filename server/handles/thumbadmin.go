@@ -113,6 +113,7 @@ func ThumbStatus(c *gin.Context) {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
 	status["pending_upload"] = len(thumbPendingUploadList())
+	status["worker_concurrency"] = setting.GetInt(conf.ThumbWorkerConcurrency, 3)
 	status["remote_upload_enabled"] = setting.GetStr(conf.ThumbRemoteUploadEnabled, "true") == "true"
 	status["remote_upload_start"] = setting.GetInt(conf.ThumbRemoteUploadStart, 3)
 	status["remote_upload_end"] = setting.GetInt(conf.ThumbRemoteUploadEnd, 6)

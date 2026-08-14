@@ -746,11 +746,21 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	return extractVideoFrame(tmpFile)
 }
 
-// prewarmStart 启动预热 worker（单 worker 分批节流，避免触发网盘 API 风控）
+// prewarmStart 启动预热 worker（多 worker 并发生成，每批节流；
+// 115 API 请求率由驱动 limit_rate 全局限速兜底，不会因并发触发风控）
 func prewarmStart() {
 	prewarmOnce.Do(func() {
 		prewarmCh = make(chan thumbPrewarmTask, 2048)
-		go prewarmWorker()
+		n := setting.GetInt(conf.ThumbWorkerConcurrency, 3)
+		if n < 1 {
+			n = 1
+		}
+		if n > 8 {
+			n = 8
+		}
+		for i := 0; i < n; i++ {
+			go prewarmWorker()
+		}
 		// 远程缩略图凌晨批量补传 worker
 		go thumbRemoteUploadLoop()
 	})
@@ -758,7 +768,7 @@ func prewarmStart() {
 
 const (
 	prewarmBatchSize     = 5  // 每批最多提交任务数（防风控）
-	prewarmBatchInterval = 20 * time.Second
+	prewarmBatchInterval = 10 * time.Second
 )
 
 // ---------- 远程缩略图延迟补传（规避风控）----------
