@@ -152,33 +152,36 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bas
 
 #### 一键部署代理脚本
 
-仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理与流量统计服务（trafficd）部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）：
+仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理与流量统计服务（trafficd）部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）。
+
+**在代理 VPS 上直接执行**（与根目录 `install.sh` 同样的一键方式，脚本自带 trafficd，无需额外文件）：
 
 ```bash
-cd scripts/proxy
-
 # http 代理（OpenList 直接使用）
-./proxy_deploy.sh --host <VPS地址> --type http --port 1080 --password 你的密码 \
-    --traffic-port 9386 --traffic-token 统计token
+curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/proxy_deploy.sh \
+  | bash -s -- --type http --port 1080 --password 你的密码
 
 # ss 代理（自动补一个 http 端口供 OpenList 用）
-./proxy_deploy.sh --host <VPS地址> --type ss --port 8388 --password 你的密码 \
-    --http-port 1080 --traffic-port 9386 --traffic-token 统计token
-
-# 查看实时流量
-./proxy_status.sh --host <VPS地址> --traffic-port 9386 --traffic-token 统计token
+curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/proxy_deploy.sh \
+  | bash -s -- --type ss --port 8388 --password 你的密码 --http-port 1080
 ```
 
-脚本自动完成：SSH 连接检测 → 下载/上传 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 部署 trafficd 统计服务 → 注册 systemd 服务并开机自启 → 输出部署摘要与 OpenList 填法。
+脚本自动完成：root 检查 → 检测架构下载 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 部署 trafficd 统计服务 → 注册 systemd 服务并开机自启（无 systemd 的环境自动回退 nohup 后台运行）→ 输出部署摘要与 OpenList 填法。
 
 可选参数：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--ssh-user` | root | SSH 用户 |
-| `--ssh-port` | 22 | SSH 端口 |
+| `--type` | http | 代理协议：http / ss / socks5 |
+| `--port` | 1080 | 代理端口 |
+| `--password` | 自动生成 | 代理密码（自动生成时会在输出中打印） |
+| `--http-port` | 端口+1000 | ss 模式下供 OpenList 使用的 http 端口 |
+| `--traffic-port` | 9386 | trafficd 统计服务端口 |
+| `--traffic-token` | 自动生成 | 统计鉴权 token（自动生成时会在输出中打印） |
 | `--admin-ip` | 0.0.0.0/0 | 允许访问流量统计的网段（建议限定为 OpenList 服务器公网 IP） |
 | `--dev` | 空 | 只统计指定网卡（如 eth0），默认统计全部网卡 |
+| `--no-trafficd` | 关 | 不部署流量统计 |
+| `--dry-run` | 关 | 只打印将执行的命令，不实际部署 |
 
 #### 流量查看
 
@@ -198,7 +201,7 @@ cd scripts/proxy
 | `/api/admin/proxy/delete` | POST | 删除节点 |
 | `/api/admin/proxy/traffic` | GET | 批量查询各节点实时流量（rx/tx 累计与速率、连接数、运行时长） |
 
-流量统计由部署在代理 VPS 上的 **trafficd**（`scripts/proxy/trafficd.py`，零依赖纯 Python 标准库）提供：通过 `/proc/net/dev` 差值统计累计流量与实时速率、`/proc/net/tcp` 统计当前连接数；`GET /stats?token=xxx` 返回 JSON，带网段白名单与 token 鉴权。
+流量统计由部署在代理 VPS 上的 **trafficd** 提供（已内置在 `proxy_deploy.sh` 中，零依赖纯 Python 标准库）：通过 `/proc/net/dev` 差值统计累计流量与实时速率、`/proc/net/tcp` 统计当前连接数；`GET /stats?token=xxx` 返回 JSON，带网段白名单与 token 鉴权。
 
 ## 快速部署
 
