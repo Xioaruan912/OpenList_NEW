@@ -1,4 +1,5 @@
 import {
+  Box,
   Button,
   HStack,
   Modal,
@@ -71,12 +72,18 @@ export const FolderPicker115 = (props: {
     setFolders(data?.content || [])
   }
 
-  // 每次弹窗打开时重置并加载根目录
+  // 每次弹窗打开时重置并加载根目录（用 wasOpened 防抖，避免
+  // effect 读到 crumbs 又写入 [] 造成重渲染循环，导致"进入"子目录被反复重置）
+  let wasOpened = false
   createEffect(() => {
-    if (props.opened()) {
+    const op = props.opened()
+    if (op && !wasOpened) {
+      wasOpened = true
       setCrumbs([])
       setFolders([])
       void loadFolders()
+    } else if (!op) {
+      wasOpened = false
     }
   })
 
@@ -97,6 +104,18 @@ export const FolderPicker115 = (props: {
     setCrumbs(crumbs().slice(0, i + 1))
     setFolders([])
     void loadFolders()
+  }
+
+  // 选择当前所在目录（已进入的子目录）作为挂载根
+  const pickCurrent = () => {
+    const last = crumbs()[crumbs().length - 1]
+    if (!last) {
+      notify.warning("当前已在根目录，请选择要挂载的文件夹")
+      return
+    }
+    props.onPick(last.file_id, last.name)
+    props.onClose()
+    notify.success(`已选择挂载文件夹: ${last.name}`)
   }
 
   const confirm = () => {
@@ -140,6 +159,9 @@ export const FolderPicker115 = (props: {
                 <Tag size="sm" colorScheme="accent">
                   {crumbs()[crumbs().length - 1].name}
                 </Tag>
+                <Button size="xs" colorScheme="success" onClick={pickCurrent}>
+                  选择当前目录
+                </Button>
               </Show>
             </HStack>
           </Show>
@@ -160,16 +182,27 @@ export const FolderPicker115 = (props: {
               <Stack direction="column" spacing="$1" maxHeight="$80" overflow="auto">
                 <For each={folders()}>
                   {(folder) => (
-                    <HStack spacing="$2" alignItems="center">
+                    <HStack
+                      spacing="$2"
+                      alignItems="center"
+                      p="$1"
+                      rounded="$sm"
+                      cursor="pointer"
+                      _hover={{ bgColor: "$neutral2" }}
+                      onClick={() => setSelectedId(folder.file_id)}
+                    >
                       <Radio value={folder.file_id}>{folder.name}</Radio>
-                      <Tag
-                        size="sm"
+                      <Box flex="1" />
+                      <Button
+                        size="xs"
                         colorScheme="info"
-                        cursor="pointer"
-                        onClick={() => openFolder(folder)}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          openFolder(folder)
+                        }}
                       >
                         进入
-                      </Tag>
+                      </Button>
                     </HStack>
                   )}
                 </For>
