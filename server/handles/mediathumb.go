@@ -618,9 +618,10 @@ func thumbRecord(rawPath string) {
 	}
 }
 
-// thumbRewriteIndex 重写索引：只保留缓存文件仍存在的条目
+// thumbRewriteIndex 重写索引：只保留仍有效（本地缓存存在或已上传到网盘）的条目
 func thumbRewriteIndex() {
 	lines := readThumbIndex()
+	cloud := readThumbCloudIndex()
 	f, err := os.Create(thumbIndexPath())
 	if err != nil {
 		return
@@ -629,6 +630,9 @@ func thumbRewriteIndex() {
 	for _, p := range lines {
 		h := thumbHash(p)
 		if _, err := os.Stat(filepath.Join(thumbDir(), "video-"+h+".png")); err == nil {
+			_, _ = f.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+		} else if cloud[p] {
+			// 本地已删除（上传到网盘后），网盘仍持有缩略图：保留索引
 			_, _ = f.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
 		}
 	}
@@ -660,6 +664,77 @@ func readThumbIndex() []string {
 	}
 	return paths
 }
+
+// ---------- 网盘缩略图索引（cloud.jsonl）----------
+// 记录已成功上传到网盘 _thumbnails 的路径；用于统计"网盘+本地"并集与索引重写时保留网盘条目。
+
+var (
+	thumbCloudMu  sync.Mutex
+	thumbCloudSet map[string]bool
+)
+
+const thumbCloudFile = "cloud.jsonl"
+
+func thumbCloudIndexPath() string {
+	return filepath.Join(thumbDir(), thumbCloudFile)
+}
+
+// thumbCloudRecord 记录一条已上传到网盘的缩略图（内存去重 + append 持久化）
+func thumbCloudRecord(rawPath string) {
+	if rawPath == "" {
+		return
+	}
+	thumbCloudMu.Lock()
+	defer thumbCloudMu.Unlock()
+	if thumbCloudSet == nil {
+		thumbCloudSet = readThumbCloudIndex()
+	}
+	if thumbCloudSet[rawPath] {
+		return
+	}
+	thumbCloudSet[rawPath] = true
+	line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
+		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
+	f, err := os.OpenFile(thumbCloudIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+}
+
+// readThumbCloudIndex 读取网盘已上传缩略图的路径集合
+func readThumbCloudIndex() map[string]bool {
+	data, err := os.ReadFile(thumbCloudIndexPath())
+	if err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var m struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
+			out[m.Path] = true
+		}
+	}
+	return out
+}
+
+// thumbCloudCount 网盘已上传缩略图数量（内存缓存）
+func thumbCloudCount() int {
+	thumbCloudMu.Lock()
+	defer thumbCloudMu.Unlock()
+	if thumbCloudSet == nil {
+		thumbCloudSet = readThumbCloudIndex()
+	}
+	return len(thumbCloudSet)
+}
+
 
 // serveThumb 通用缩略图入口：缓存命中直接返回，未命中则串行生成
 func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, error)) {

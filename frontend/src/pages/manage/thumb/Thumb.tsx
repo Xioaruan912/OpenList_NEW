@@ -25,6 +25,8 @@ import { SelectOptions } from "~/components"
 
 type ThumbStatus = {
   cached_files: number
+  local_files: number
+  cloud_files: number
   fail_markers: number
   cache_size: number
   cache_dir: string
@@ -458,7 +460,7 @@ const Thumb = () => {
   const clearAll = async () => {
     if (
       !window.confirm(
-        `确认清空全部缩略图缓存与索引？（已生成 ${st()?.cached_files || 0} 个缩略图将被删除，可重新生成）`,
+        `确认清空本地缩略图缓存与索引？（本地 ${st()?.local_files || 0} 个将被删除；网盘上已上传的 ${st()?.cloud_files || 0} 个缩略图保留，不会删除）`,
       )
     )
       return
@@ -683,6 +685,9 @@ const Thumb = () => {
           background={useColorModeValue("$neutral1", "$neutral2")()}
         >
           缓存 {st()?.cached_files || 0} 个
+          <Text fontSize="$sm" color="$neutral9">
+            网盘 {st()?.cloud_files || 0} · 本地 {st()?.local_files || 0}
+          </Text>
         </Box>
         <Box
           p="$3"

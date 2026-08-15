@@ -121,12 +121,23 @@ func ThumbGenerate(c *gin.Context) {
 // ThumbStatus GET /api/admin/thumb/status
 // 缩略图缓存与预热队列状态（含按目录失败统计）
 func ThumbStatus(c *gin.Context) {
-	cached, failCount, totalSize := thumbCacheStats()
+	localFiles, failCount, totalSize := thumbCacheStats()
+	cloudCount := thumbCloudCount()
+	// 并集统计：本地 + 网盘，两边都有的只算一次（如恢复预览后又本地缓存）
+	overlap := 0
+	for p := range readThumbCloudIndex() {
+		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
+			overlap++
+		}
+	}
+	union := localFiles + cloudCount - overlap
 	status := gin.H{
-		"cache_dir":       thumbDir(),
-		"cached_files":    cached,
-		"fail_markers":    failCount,
-		"cache_size":      totalSize,
+		"cache_dir":    thumbDir(),
+		"cached_files": union,
+		"local_files":  localFiles,
+		"cloud_files":  cloudCount,
+		"fail_markers": failCount,
+		"cache_size":   totalSize,
 		"prewarm_enabled": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
 		"queue_paused":    thumbQueuePaused.Load(),
 	}
@@ -973,11 +984,14 @@ func ThumbClearAll(c *gin.Context) {
 			removed++
 			continue
 		}
-		if name == "index.jsonl" {
+		if name == "index.jsonl" || name == "cloud.jsonl" {
 			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
-		thumbDirsMu.Lock()
+	thumbCloudMu.Lock()
+	thumbCloudSet = nil
+	thumbCloudMu.Unlock()
+	thumbDirsMu.Lock()
 	thumbDirsCache = map[string]struct {
 		at   time.Time
 		data []ThumbDirsEntry
@@ -1355,6 +1369,9 @@ func thumbUploadBatch(batch []string) {
 		names := loadRemoteThumbListing(ctx, d, folderNameOnly{folder})
 		for _, p := range ps {
 			if names[remoteThumbName(p)] {
+				// 网盘清单已确认存在：记录网盘索引并删除本地（同一缩略图不会同时占用两边）
+				thumbCloudRecord(p)
+				_ = os.Remove(thumbCachePath(thumbKindVideo, p))
 				thumbUploadAdd("skipped", 1) // 已上传，去重跳过
 				continue
 			}
@@ -1369,6 +1386,9 @@ func thumbUploadBatch(batch []string) {
 			}
 			// 更新目录清单缓存，后续批次/轮次去重跳过
 			thumbListingMarkUploaded(d, remoteThumbName(p))
+			// 确认上传成功后才删除本地缩略图，并记录网盘索引
+			thumbCloudRecord(p)
+			_ = os.Remove(thumbCachePath(thumbKindVideo, p))
 			thumbUploadAdd("done", 1)
 		}
 	}
