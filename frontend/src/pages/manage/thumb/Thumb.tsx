@@ -382,14 +382,6 @@ const Thumb = () => {
     saveProxy("manual", pick)
   }
 
-  const recoverNode = async (id: number) => {
-    const resp = await r.post("/admin/proxy/recover", { id })
-    handleResp(resp, () => {
-      notify.success("已解除风控")
-      loadProxy()
-    })
-  }
-
   const toggle = (pp: string) =>
     setExp((ss) => {
       const z = new Set(ss)
@@ -617,10 +609,7 @@ const Thumb = () => {
                     {nodeStatusText(n)}
                   </Tag>
                   <Show when={n.is_risk}>
-                    <Tag colorScheme="warning">{Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000)} 分钟后恢复</Tag>
-                    <Button size="xs" onClick={() => recoverNode(n.id)}>
-                      解除风控
-                    </Button>
+                    <Tag colorScheme="warning">{Math.max(0, Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000))} 分钟后自动恢复</Tag>
                   </Show>
                   <Text fontSize="$xs" color="$neutral9">
                     收 {fmtBytes(n.window_rx)} · 发 {fmtBytes(n.window_tx)} · 速率 {fmtBytes(n.rx_rate)}/s · 连接 {n.conns}

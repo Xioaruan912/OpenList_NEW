@@ -67,17 +67,6 @@ func AddProxyNodeTraffic(nodeID uint, rx, tx int64) {
 	})
 }
 
-// ClearProxyNodeRisk 手动解除节点风控状态并清零失败计数
-func ClearProxyNodeRisk(nodeID uint) error {
-	now := time.Now()
-	return errors.WithStack(db.Model(&model.ProxyNode{}).Where("id = ?", nodeID).Updates(map[string]interface{}{
-		"status":     model.ProxyNodeStatusNormal,
-		"risk_until": nil,
-		"fail_count": 0,
-		"updated_at": now,
-	}).Error)
-}
-
 // SetProxyNodeStatus 设置节点状态（normal/risk/disabled）
 func SetProxyNodeStatus(nodeID uint, status string) error {
 	return errors.WithStack(db.Model(&model.ProxyNode{}).Where("id = ?", nodeID).Update("status", status).Error)

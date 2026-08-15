@@ -188,7 +188,6 @@ func admin(g *gin.RouterGroup) {
 	proxy.POST("/delete", handles.DeleteProxyNode)
 	proxy.GET("/traffic", handles.ProxyTraffic)
 	proxy.GET("/install", handles.ProxyInstall)
-	proxy.POST("/recover", handles.ProxyRecover)
 	proxy.POST("/enable", handles.ProxyEnable)
 
 	driver := g.Group("/driver")

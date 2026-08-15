@@ -23,7 +23,7 @@ const (
 // 风控自动切换参数
 const (
 	proxyRiskThreshold = 3                // 连续失败达到该次数标记为风控
-	proxyRiskCooldown  = 30 * time.Minute // 风控持续时长（过后自动恢复）
+	proxyRiskCooldown  = 1 * time.Hour    // 风控持续时长：等待 30 分钟~1 小时后自动恢复可用；之后复用成功即自动解除风控状态
 )
 
 // ---- 配置读取 ----
@@ -143,18 +143,26 @@ func recordProxyUse(nodeID uint, rx, tx int64) {
 	db.AddProxyNodeTraffic(nodeID, rx, tx)
 }
 
-// recordProxySuccess 记录成功请求（重置连续失败计数）
+// recordProxySuccess 记录成功请求：重置连续失败计数；风控冷却期过后被复用且成功即视为已安全，自动解除风控状态
 func recordProxySuccess(nodeID uint) {
 	if nodeID == 0 {
 		return
 	}
-	// 失败计数清零（仅当有失败记录时避免无谓写入）
 	node, err := db.GetProxyNodeById(nodeID)
 	if err != nil {
 		return
 	}
+	changed := false
 	if node.FailCount != 0 {
 		node.FailCount = 0
+		changed = true
+	}
+	if node.Status == model.ProxyNodeStatusRisk {
+		node.Status = model.ProxyNodeStatusNormal
+		node.RiskUntil = nil
+		changed = true
+	}
+	if changed {
 		_ = db.UpdateProxyNode(node)
 	}
 }
@@ -330,23 +338,6 @@ func ThumbProxySet(c *gin.Context) {
 // 返回节点清单与 OpenList 侧统计的代理使用流量（仅统计经代理的请求，非整机流量）
 func ProxyTraffic(c *gin.Context) {
 	common.SuccessResp(c, proxyNodesWithTraffic())
-}
-
-// ProxyRecover POST /api/admin/proxy/recover
-// 手动解除节点风控状态
-func ProxyRecover(c *gin.Context) {
-	var req struct {
-		ID uint `json:"id" binding:"required"`
-	}
-	if err := c.ShouldBind(&req); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if err := db.ClearProxyNodeRisk(req.ID); err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	common.SuccessResp(c, nil)
 }
 
 // ProxyEnable POST /api/admin/proxy/enable 启用/停用节点

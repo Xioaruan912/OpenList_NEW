@@ -150,14 +150,6 @@ const Proxy = () => {
     })
   }
 
-  const recover = async (id: number) => {
-    const resp = await r.post("/admin/proxy/recover", { id })
-    handleResp(resp, () => {
-      notify.success("已解除风控")
-      load()
-    })
-  }
-
   const setStatus = async (n: ProxyNode, status: string) => {
     const resp = await r.post("/admin/proxy/enable", { id: n.id, status })
     handleResp(resp, () => {
@@ -249,7 +241,7 @@ const Proxy = () => {
               </Tag>
               <Show when={n.is_risk && n.risk_until}>
                 <Tag colorScheme="warning">
-                  {Math.max(0, Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000))} 分钟后恢复
+                  {Math.max(0, Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000))} 分钟后自动恢复
                 </Tag>
               </Show>
               <Show when={n.agent}>
@@ -265,11 +257,6 @@ const Proxy = () => {
                   {Math.floor(n.agent!.uptime / 3600)}h
                 </Show>
               </Text>
-              <Show when={n.is_risk}>
-                <Button size="xs" colorScheme="warning" onClick={() => recover(n.id)}>
-                  解除风控
-                </Button>
-              </Show>
               <Button size="xs" onClick={() => openInstall(n)} loading={installLoading()}>
                 安装命令
               </Button>
