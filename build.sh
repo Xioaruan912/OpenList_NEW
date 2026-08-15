@@ -96,33 +96,36 @@ AssertStaticBinary() {
   return 0
 }
 
-FetchWebRolling() {
-  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
-  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
-  
-  # There is no lite for rolling
-  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+# Build the forked frontend from source (frontend/) instead of downloading
+# the upstream release, so the embedded web UI contains all fork features
+# (115 qrcode login, thumbnails, proxy nodes).
+BuildLocalFrontend() {
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ ! -f "$root/frontend/package.json" ]; then
+    echo "Error: frontend/ source not found (got $root/frontend)"
+    exit 1
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    if command -v npm >/dev/null 2>&1; then
+      npm i -g pnpm@11.20.0
+    else
+      echo "Error: pnpm not found. Install Node.js (>=20) first."
+      exit 1
+    fi
+  fi
+  (cd "$root/frontend" && CI=true pnpm install && CI=true pnpm build)
+  rm -rf "$root/public/dist"
+  mkdir -p "$root/public/dist"
+  cp -r "$root/frontend/dist/." "$root/public/dist/"
+}
 
-  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
-  rm -rf public/dist && mkdir -p public/dist
-  tar -zxvf dist.tar.gz -C public/dist
-  rm -rf dist.tar.gz
+FetchWebRolling() {
+  BuildLocalFrontend
 }
 
 FetchWebRelease() {
-  release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
-  release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
-  
-  if [ "$useLite" = true ]; then
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
-  else
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
-  fi
-  
-  curl -fsSL "$release_tar_url" -o dist.tar.gz
-  rm -rf public/dist && mkdir -p public/dist
-  tar -zxvf dist.tar.gz -C public/dist
-  rm -rf dist.tar.gz
+  BuildLocalFrontend
 }
 
 BuildWinArm64() {

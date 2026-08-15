@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
-# OpenList (fork with 115 qrcode login + video thumbnails) one-click installer
+# OpenList (fork with 115 qrcode login + video thumbnails + anti-risk proxy) one-click installer
 # Supports Debian/Ubuntu (apt) and CentOS/RHEL/Fedora (yum/dnf)
+#
+# The forked frontend (frontend/) is built from source automatically, so the
+# installed web UI contains all fork features.
 #
 # Usage:
 #   curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bash
@@ -90,6 +93,39 @@ install_go() {
   log "Go: $(go version)"
 }
 
+# ---------- 2.5 Install Node.js (>=20) + pnpm (for building the forked frontend) ----------
+install_node() {
+  if command -v node >/dev/null 2>&1; then
+    local major
+    major="$(node --version | sed 's/v//' | cut -d. -f1)"
+    if [ "$major" -ge 20 ]; then
+      log "Node: $(node --version)"
+    else
+      log "Node $(node --version) too old for frontend build, upgrading..."
+      node=""
+    fi
+  fi
+  if ! command -v node >/dev/null 2>&1 || [ -z "${node:-}" ]; then
+    log "Installing Node.js 22 LTS via NodeSource..."
+    case "$PKG_MGR" in
+      apt)
+        export DEBIAN_FRONTEND=noninteractive
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y -qq nodejs
+        ;;
+      dnf|yum)
+        curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+        "$PKG_MGR" install -y -q nodejs
+        ;;
+    esac
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    log "Installing pnpm..."
+    npm i -g pnpm@11.20.0
+  fi
+  log "Node: $(node --version), pnpm: $(pnpm --version)"
+}
+
 # ---------- 3. Clone repository ----------
 clone_repo() {
   if [ -d "$INSTALL_DIR/.git" ]; then
@@ -104,7 +140,20 @@ clone_repo() {
   fi
 }
 
-# ---------- 4. Build ----------
+# ---------- 4. Build frontend (fork web UI from frontend/ source) ----------
+build_frontend() {
+  cd "$INSTALL_DIR/frontend"
+  log "Building frontend from source (this may take a few minutes)..."
+  CI=true pnpm install
+  CI=true pnpm build
+  mkdir -p "$INSTALL_DIR/public/dist"
+  rm -rf "$INSTALL_DIR/public/dist/assets"
+  cp -r dist/assets "$INSTALL_DIR/public/dist/"
+  cp dist/index.html "$INSTALL_DIR/public/dist/"
+  log "Frontend built and copied to public/dist"
+}
+
+# ---------- 5. Build backend ----------
 build() {
   cd "$INSTALL_DIR"
   log "Building openlist binary (this may take several minutes)..."
@@ -113,14 +162,14 @@ build() {
   log "Build done: $(ls -lh ${BIN_NAME} | awk '{print $5}')"
 }
 
-# ---------- 5. Prepare data dir ----------
+# ---------- 6. Prepare data dir ----------
 prepare_data() {
   mkdir -p "$INSTALL_DIR/data"
   chmod 700 "$INSTALL_DIR/data"
   log "Data directory ready: $INSTALL_DIR/data"
 }
 
-# ---------- 6. Create systemd service ----------
+# ---------- 7. Create systemd service ----------
 create_service() {
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -190,7 +239,9 @@ show_credentials() {
 # ================= main =================
 install_deps
 install_go
+install_node
 clone_repo
+build_frontend
 build
 prepare_data
 create_service
