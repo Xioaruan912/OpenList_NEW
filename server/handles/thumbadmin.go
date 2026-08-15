@@ -1294,6 +1294,10 @@ func ThumbUpload(c *gin.Context) {
 // ThumbUploadAll POST /api/admin/thumb/upload_all
 // 一键上传：把所有已有本地缩略图的视频加入上传队列（批量 50 / 间隔 5s / 去重）。
 func ThumbUploadAll(c *gin.Context) {
+	if globalAnyStorageBlocked() {
+		common.ErrorStrResp(c, "115 网盘风控中，上传已暂停，请稍后再试", 429)
+		return
+	}
 	targets := collectUploadTargets("")
 	if len(targets) == 0 {
 		common.SuccessResp(c, gin.H{"queued": 0, "total": 0})
@@ -1317,6 +1321,7 @@ func ThumbUploadStatus(c *gin.Context) {
 	}
 	common.SuccessResp(c, gin.H{
 		"active":     thumbUploadActive,
+		"paused":     thumbUploadPaused.Load(),
 		"queued":     len(thumbUploadQueue),
 		"remaining":  remaining,
 		"total":      thumbUploadTotal,
@@ -1362,23 +1367,25 @@ func collectUploadTargets(dir string) []string {
 // ---- 缩略图上传队列（批量 50 / 间隔 5s / 路径级去重 / 失败自动重试）----
 
 const (
-	thumbUploadBatchSize        = 50
-	thumbUploadBlockedBatchSize = 20 // 风控时动态降低批大小，间隔不变
-	thumbUploadInterval         = 5 * time.Second
-	thumbUploadMaxAttempts      = 3 // 单个文件最多尝试上传次数（首次 + 2 次自动重试），超次进入失败清单
+	thumbUploadBatchSize   = 50
+	thumbUploadInterval    = 5 * time.Second
+	thumbUploadPauseCheck  = 5 * time.Second // 暂停/风控中每次检查间隔
+	thumbUploadMaxAttempts = 3               // 单个文件最多尝试上传次数（首次 + 2 次自动重试），超次进入失败清单
 )
 
 var (
-	thumbUploadMu       sync.Mutex
-	thumbUploadQueue    []string
-	thumbUploadTotal    int // 本轮唯一路径总数（手动重试会累加）
-	thumbUploadDone     int
-	thumbUploadFailed   int
-	thumbUploadExists   int
-	thumbUploadActive   bool
-	thumbUploadFails    []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
-	thumbUploadAttempts = map[string]int{}
-	thumbUploadStatus   = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
+	thumbUploadMu        sync.Mutex
+	thumbUploadQueue     []string
+	thumbUploadTotal     int // 本轮唯一路径总数（手动重试会累加）
+	thumbUploadDone      int
+	thumbUploadFailed    int
+	thumbUploadExists    int
+	thumbUploadActive    bool
+	thumbUploadFails     []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
+	thumbUploadAttempts  = map[string]int{}
+	thumbUploadStatus    = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
+	thumbUploadPaused    atomic.Bool           // 用户手动暂停上传队列（保留队列）
+	thumbUploadStopped   atomic.Bool           // 删除队列：取消进行中批次并清空队列
 )
 
 // thumbUploadFailItem 上传失败记录（含原因）
@@ -1394,6 +1401,7 @@ func thumbUploadEnqueue(paths []string) {
 		return
 	}
 	thumbUploadMu.Lock()
+	thumbUploadStopped.Store(false)
 	if !thumbUploadActive {
 		thumbUploadTotal = 0
 		thumbUploadDone = 0
@@ -1428,17 +1436,35 @@ func thumbUploadEnqueue(paths []string) {
 func thumbUploadWorker() {
 	for {
 		thumbUploadMu.Lock()
+		if thumbUploadStopped.Load() {
+			thumbUploadQueue = nil
+			thumbUploadActive = false
+			thumbUploadStopped.Store(false)
+			thumbUploadMu.Unlock()
+			return
+		}
 		if len(thumbUploadQueue) == 0 {
 			thumbUploadActive = false
 			thumbUploadMu.Unlock()
 			return
 		}
-		// 风控中动态降低批大小（正常 50 / 风控 20），间隔保持不变
-		batchSize := thumbUploadBatchSize
-		if globalAnyStorageBlocked() {
-			batchSize = thumbUploadBlockedBatchSize
+		thumbUploadMu.Unlock()
+
+		// 暂停或 115 风控中：完全停手（保留队列），等待解除后再继续，避免继续打 115
+		if thumbUploadPaused.Load() || globalAnyStorageBlocked() {
+			time.Sleep(thumbUploadPauseCheck)
+			continue
 		}
-		n := min(batchSize, len(thumbUploadQueue))
+
+		thumbUploadMu.Lock()
+		if thumbUploadStopped.Load() {
+			thumbUploadQueue = nil
+			thumbUploadActive = false
+			thumbUploadStopped.Store(false)
+			thumbUploadMu.Unlock()
+			return
+		}
+		n := min(thumbUploadBatchSize, len(thumbUploadQueue))
 		batch := append([]string(nil), thumbUploadQueue[:n]...)
 		thumbUploadQueue = thumbUploadQueue[n:]
 		thumbUploadActive = true
@@ -1462,6 +1488,9 @@ func thumbUploadBatch(batch []string) {
 		folder := thumbFolderNameForPath(d)
 		names := loadRemoteThumbListing(ctx, d, folderNameOnly{folder})
 		for _, p := range ps {
+			if thumbUploadStopped.Load() {
+				return // 队列已删除：丢弃剩余
+			}
 			if names[remoteThumbName(p)] {
 				// 网盘清单已确认存在：记录网盘索引并删除本地（同一缩略图不会同时占用两边）
 				thumbCloudRecord(p)
@@ -1484,6 +1513,9 @@ func thumbUploadBatch(batch []string) {
 			// 确认上传成功后才删除本地缩略图，并记录网盘索引
 			thumbCloudRecord(p)
 			_ = os.Remove(thumbCachePath(thumbKindVideo, p))
+			if thumbUploadStopped.Load() {
+				return
+			}
 			thumbUploadFinalize(p, "done")
 		}
 	}
@@ -1519,6 +1551,9 @@ func thumbUploadFailNow(p, msg string) {
 // thumbUploadFailRetry 记录一次上传失败：未超过自动重试次数则重新入队（批间隔天然退避），
 // 超过后判定为最终失败并进入失败清单。
 func thumbUploadFailRetry(p, msg string) {
+	if thumbUploadStopped.Load() {
+		return // 队列已删除：不再重试
+	}
 	thumbUploadMu.Lock()
 	thumbUploadAttempts[p]++
 	if thumbUploadAttempts[p] < thumbUploadMaxAttempts {
@@ -1534,6 +1569,7 @@ func thumbUploadFailRetry(p, msg string) {
 // 将上传失败清单重新加入上传队列（失败超过自动重试次数后由用户手动触发）
 func ThumbUploadRetry(c *gin.Context) {
 	thumbUploadMu.Lock()
+	thumbUploadStopped.Store(false)
 	fails := append([]thumbUploadFailItem(nil), thumbUploadFails...)
 	thumbUploadFails = nil
 	// 回退失败计数并重置这些路径的最终状态/尝试次数，允许重新计
@@ -1555,6 +1591,39 @@ func ThumbUploadRetry(c *gin.Context) {
 		go thumbUploadWorker()
 	}
 	common.SuccessResp(c, gin.H{"retried": len(fails), "total": thumbUploadTotal})
+}
+
+// ThumbUploadPause POST /api/admin/thumb/upload/pause
+// 暂停上传队列：worker 停止处理（保留队列），可恢复。
+func ThumbUploadPause(c *gin.Context) {
+	thumbUploadPaused.Store(true)
+	common.SuccessResp(c, gin.H{"paused": true})
+}
+
+// ThumbUploadResume POST /api/admin/thumb/upload/resume
+// 恢复上传队列。
+func ThumbUploadResume(c *gin.Context) {
+	thumbUploadPaused.Store(false)
+	common.SuccessResp(c, gin.H{"paused": false})
+}
+
+// ThumbUploadClear POST /api/admin/thumb/upload/clear
+// 删除上传队列：清空队列并取消进行中批次（相当于停止上传），重置本轮计数。
+func ThumbUploadClear(c *gin.Context) {
+	thumbUploadStopped.Store(true)
+	thumbUploadMu.Lock()
+	dropped := len(thumbUploadQueue)
+	thumbUploadQueue = nil
+	thumbUploadActive = false
+	thumbUploadTotal = 0
+	thumbUploadDone = 0
+	thumbUploadFailed = 0
+	thumbUploadExists = 0
+	thumbUploadFails = nil
+	thumbUploadAttempts = map[string]int{}
+	thumbUploadStatus = map[string]string{}
+	thumbUploadMu.Unlock()
+	common.SuccessResp(c, gin.H{"dropped": dropped})
 }
 
 // thumbListingMarkUploaded 在目录缩略图清单缓存中标记已上传（去重）

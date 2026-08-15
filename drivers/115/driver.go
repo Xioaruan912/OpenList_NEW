@@ -2,6 +2,7 @@ package _115
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -263,7 +264,14 @@ func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
 	return d.client.Delete(obj.GetID())
 }
 
-func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
+func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (obj model.Obj, err error) {
+	// 上传内部（流式读取/签名校验等）异常时兜底为可读错误，避免 panic 导致上传任务异常终止
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("upload internal error: %v", r)
+			MarkUploadError(d.GetStorage().MountPath, err)
+		}
+	}()
 	var (
 		fastInfo *driver115.UploadInitResp
 		dirID    = dstDir.GetID()

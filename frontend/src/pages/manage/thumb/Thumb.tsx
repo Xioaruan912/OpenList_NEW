@@ -125,6 +125,7 @@ const Thumb = () => {
   const [uploadLive, setUploadLive] = createSignal(false) // 本次会话是否有上传运行（控制轮询）
   const upDefault = {
     active: false,
+    paused: false,
     queued: 0,
     remaining: 0,
     done: 0,
@@ -385,6 +386,7 @@ const Thumb = () => {
     handleRespWithoutNotify(resp, (d) => {
       const s = d as {
         active: boolean
+        paused: boolean
         queued: number
         remaining: number
         done: number
@@ -395,6 +397,10 @@ const Thumb = () => {
         fail_items?: { path: string; msg: string }[]
       }
       setUpStatus({ ...upDefault, ...s })
+      // 有运行中的上传（含暂停/风控暂停）时保持快轮询
+      if (s.active || s.queued > 0 || s.remaining > 0) {
+        setUploadLive(true)
+      }
       if (uploadLive() && !s.active && s.remaining === 0 && s.total > 0) {
         notify.success(
           `上传完成：成功 ${s.done}，已存在(网盘已有) ${s.exists}，失败 ${s.failed}${s.fails > 0 ? "（可重试）" : ""}`,
@@ -403,6 +409,44 @@ const Thumb = () => {
         setUploadLive(false)
       }
     })
+  }
+
+  // 暂停上传队列（保留队列，可恢复）
+  const uploadPause = async () => {
+    setBusy("upload-pause")
+    try {
+      const resp = await r.post("/admin/thumb/upload/pause", {})
+      handleResp(resp, () => void pollUploadStatus())
+    } finally {
+      setBusy("")
+    }
+  }
+
+  // 恢复上传队列
+  const uploadResume = async () => {
+    setBusy("upload-resume")
+    try {
+      const resp = await r.post("/admin/thumb/upload/resume", {})
+      handleResp(resp, () => void pollUploadStatus())
+    } finally {
+      setBusy("")
+    }
+  }
+
+  // 删除上传队列（相当于停止上传，未上传的保留本地）
+  const uploadClear = async () => {
+    if (!window.confirm("确认删除上传队列？（未上传的缩略图保留在本地，可稍后重传）")) return
+    setBusy("upload-clear")
+    try {
+      const resp = await r.post("/admin/thumb/upload/clear", {})
+      handleResp(resp, () => {
+        setUpStatus((s) => ({ ...upDefault, ...s, active: false, paused: false, queued: 0, remaining: 0 }))
+        setUploadLive(false)
+        void pollUploadStatus()
+      })
+    } finally {
+      setBusy("")
+    }
   }
 
   // 重试上传失败清单（超过自动重试次数的）
@@ -766,6 +810,8 @@ const Thumb = () => {
   load()
   loadTree()
   loadProxy()
+  // 挂载时拉一次上传状态，恢复"正在上传 N"（若服务端有运行中则启动快轮询）
+  void pollUploadStatus()
   // 10s 计时器仅刷新缩略图状态；upload_status 只在有上传运行时轮询，避免无意义的持续请求
   const timer = setInterval(() => {
     load()
@@ -807,35 +853,17 @@ const Thumb = () => {
         >
           占用 {((st()?.cache_size || 0) / 1048576).toFixed(1)} MB
         </Box>
-        <Show when={st()?.cache_dir}>
-          <Box
-            p="$3"
-            rounded="$lg"
-            border="1px solid $neutral7"
-            background={useColorModeValue("$neutral1", "$neutral2")()}
-          >
-            缓存目录 {st()!.cache_dir}
-          </Box>
-        </Show>
-        <HStack spacing="$2" alignItems="center">
-          <Button
-            size="xs"
-            colorScheme={st()?.queue_paused ? "success" : "warning"}
-            disabled={busy() === "queue-pause" || busy() === "queue-resume"}
-            onClick={() => (st()?.queue_paused ? resumeQueue() : pauseQueue())}
-          >
-            {st()?.queue_paused ? "恢复队列" : "暂停队列"}
-          </Button>
-          <Button
-            size="xs"
-            colorScheme="danger"
-            disabled={busy() === "queue-clear" || !queued()}
-            onClick={clearQueue}
-          >
-            删除队列
-          </Button>
-        </HStack>
-      </HStack>
+         <Show when={st()?.cache_dir}>
+           <Box
+             p="$3"
+             rounded="$lg"
+             border="1px solid $neutral7"
+             background={useColorModeValue("$neutral1", "$neutral2")()}
+           >
+             缓存目录 {st()!.cache_dir}
+           </Box>
+         </Show>
+       </HStack>
 
       {/* 代理节点选择 */}
       <Box mt="$2" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
@@ -978,17 +1006,33 @@ const Thumb = () => {
             {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个 · 失败{" "}
             {st()?.fail_markers || 0} 个
           </Text>
-          <Show when={(st()?.fail_markers || 0) > 0}>
-            <Button
-              size="xs"
-              variant="outline"
-              colorScheme="danger"
-              onClick={() => openFailLog()}
-            >
-              查看失败日志
-            </Button>
-          </Show>
-        </HStack>
+           <Show when={(st()?.fail_markers || 0) > 0}>
+             <Button
+               size="xs"
+               variant="outline"
+               colorScheme="danger"
+               onClick={() => openFailLog()}
+             >
+               查看失败日志
+             </Button>
+           </Show>
+           <Button
+             size="xs"
+             colorScheme={st()?.queue_paused ? "success" : "warning"}
+             disabled={busy() === "queue-pause" || busy() === "queue-resume"}
+             onClick={() => (st()?.queue_paused ? resumeQueue() : pauseQueue())}
+           >
+             {st()?.queue_paused ? "恢复队列" : "暂停队列"}
+           </Button>
+           <Button
+             size="xs"
+             colorScheme="danger"
+             disabled={busy() === "queue-clear" || !queued()}
+             onClick={clearQueue}
+           >
+             删除队列
+           </Button>
+         </HStack>
         <Show when={(st()?.active_tasks || []).length > 0}>
           <Box mt="$2" rounded="$md" border="1px solid $neutral6" p="$1">
             <For each={st()!.active_tasks}>
@@ -1023,26 +1067,28 @@ const Thumb = () => {
         <HStack spacing="$2" alignItems="center" wrap="wrap">
           <Tag
             colorScheme={
-              st()?.blocked
-                ? "danger"
-                : upStatus().active
-                  ? "success"
-                  : upStatus().remaining > 0
-                    ? "warning"
-                    : upStatus().total > 0
-                      ? "neutral"
+              upStatus().paused
+                ? "warning"
+                : st()?.blocked
+                  ? "danger"
+                  : upStatus().active
+                    ? "success"
+                    : upStatus().remaining > 0
+                      ? "warning"
                       : "neutral"
             }
           >
-            {st()?.blocked
-              ? "115 风控中，上传变慢"
-              : upStatus().active
-                ? "正在上传"
-                : upStatus().remaining > 0
-                  ? "已入队，等待上传"
-                  : upStatus().total > 0
-                    ? "上传完成"
-                    : "空闲"}
+            {upStatus().paused
+              ? "上传已暂停"
+              : st()?.blocked
+                ? "115 风控中，上传暂停"
+                : upStatus().active
+                  ? "正在上传"
+                  : upStatus().remaining > 0
+                    ? "已入队，等待上传"
+                    : upStatus().total > 0
+                      ? "上传完成"
+                      : "空闲"}
           </Tag>
           <Text fontSize="$sm" color="$neutral9">
             剩余 {upStatus().remaining} 个 · 成功 {upStatus().done} · 已存在(网盘已有){" "}
@@ -1061,6 +1107,24 @@ const Thumb = () => {
               重试上传失败
             </Button>
           </Show>
+          <Button
+            size="xs"
+            variant="outline"
+            colorScheme={upStatus().paused ? "success" : "warning"}
+            disabled={busy() === "upload-pause" || busy() === "upload-resume"}
+            onClick={() => (upStatus().paused ? uploadResume() : uploadPause())}
+          >
+            {upStatus().paused ? "恢复上传" : "暂停上传"}
+          </Button>
+          <Button
+            size="xs"
+            variant="outline"
+            colorScheme="danger"
+            disabled={busy() === "upload-clear" || upStatus().total === 0}
+            onClick={uploadClear}
+          >
+            删除上传队列
+          </Button>
         </HStack>
         <Progress
           mt="$2"
