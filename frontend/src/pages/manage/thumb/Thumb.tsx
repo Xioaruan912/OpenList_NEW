@@ -3,6 +3,12 @@ import {
   Button,
   HStack,
   Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
   Progress,
   ProgressIndicator,
   ProgressLabel,
@@ -102,6 +108,9 @@ const Thumb = () => {
   const [newP, setNewP] = createSignal("")
   const [pxCfg, setPxCfg] = createSignal<ThumbProxyConfig>()
   const [pxLoading, setPxLoading] = createSignal(false)
+  const [viewPath, setViewPath] = createSignal("")
+  const [viewUrl, setViewUrl] = createSignal("")
+  const [viewLoading, setViewLoading] = createSignal(false)
 
   const load = async () => {
     const resp = await r.get("/admin/thumb/status")
@@ -194,6 +203,34 @@ const Thumb = () => {
     } finally {
       setBusy("")
     }
+  }
+
+  const viewThumb = async (pp: string) => {
+    setViewPath(pp)
+    setViewLoading(true)
+    try {
+      const resp = await r.get("/admin/thumb/view", {
+        params: { path: pp },
+        responseType: "blob",
+      })
+      if (resp instanceof Blob && resp.type.startsWith("image/")) {
+        setViewUrl(URL.createObjectURL(resp))
+      } else {
+        notify.error("无法查看缩略图（未生成或生成失败）")
+        setViewPath("")
+      }
+    } catch {
+      notify.error("查看缩略图失败")
+      setViewPath("")
+    } finally {
+      setViewLoading(false)
+    }
+  }
+
+  const closeView = () => {
+    if (viewUrl()) URL.revokeObjectURL(viewUrl())
+    setViewUrl("")
+    setViewPath("")
   }
 
   const retryAll = async () => {
@@ -839,7 +876,11 @@ const Thumb = () => {
                       "word-break": "break-all",
                       "font-size": "$sm",
                       opacity: checked()[q] ? "1" : "0.5",
+                      cursor: "pointer",
                     }}
+                    title="点击查看缩略图"
+                    onClick={() => viewThumb(q)}
+                    _hover={{ color: "$info9" }}
                   >
                     {q.replace(sel(), "").replace(/^\//, "")}
                   </Box>
@@ -886,6 +927,42 @@ const Thumb = () => {
           </HStack>
         </VStack>
       </Show>
+
+      <Modal opened={!!viewPath()} onClose={closeView} size={{ "@initial": "sm", "@md": "md" }}>
+        <ModalOverlay />
+        <ModalContent>
+          <ModalHeader css={{ "word-break": "break-all", "font-size": "$sm" }}>
+            {viewPath().split("/").pop()}
+          </ModalHeader>
+          <ModalBody>
+            <Show when={viewLoading()} fallback={<Box />}>
+              <Text p="$4" fontSize="$sm" color="$neutral9">
+                加载中…
+              </Text>
+            </Show>
+            <Show when={viewUrl()}>
+              <Box
+                rounded="$md"
+                border="1px solid $neutral6"
+                overflow="hidden"
+                background="#000"
+                css={{ display: "flex", justifyContent: "center", alignItems: "center", maxH: "70vh" }}
+              >
+                <img
+                  src={viewUrl()}
+                  alt={viewPath()}
+                  css={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain" }}
+                />
+              </Box>
+            </Show>
+          </ModalBody>
+          <ModalFooter display="flex" gap="$2" justifyContent="flex-end">
+            <Button colorScheme="neutral" onClick={closeView}>
+              关闭
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
     </VStack>
   )
 }

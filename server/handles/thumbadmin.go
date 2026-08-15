@@ -1168,3 +1168,37 @@ func ThumbDeleteFolder(c *gin.Context) {
 	}
 	common.SuccessResp(c, gin.H{"removed": removed, "folder": full})
 }
+
+// ThumbView GET /api/admin/thumb/view?path=
+// 返回指定视频的缩略图 PNG（优先读本地缓存；缺失时生成并缓存，走代理→直连回退）。
+// 供管理页"点击文件查看缩略图"使用，无需下载签名。
+func ThumbView(c *gin.Context) {
+	path := c.Query("path")
+	if path == "" {
+		common.ErrorStrResp(c, "invalid path", 400)
+		return
+	}
+	serve := func(data []byte) {
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Data(200, "image/png", data)
+	}
+	cachePath := thumbCachePath(thumbKindVideo, path)
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if !isBlankThumb(data) {
+			serve(data)
+			return
+		}
+	}
+	png, err := generateVideoThumb(c.Request.Context(), path, common.GetApiUrl(c))
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	if len(png) == 0 || isBlankThumb(png) {
+		common.ErrorStrResp(c, "该视频无法生成缩略图（生成结果为空白图）", 422)
+		return
+	}
+	_ = os.WriteFile(cachePath, png, 0o666)
+	thumbRecord(path)
+	serve(png)
+}

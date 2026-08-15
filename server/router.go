@@ -175,6 +175,7 @@ func admin(g *gin.RouterGroup) {
 	thumb.GET("/dirs", handles.ThumbDirs)
 	thumb.GET("/tree", handles.ThumbTree)
 	thumb.GET("/dir", handles.ThumbDir)
+	thumb.GET("/view", handles.ThumbView)
 	thumb.POST("/retry_fails", handles.ThumbRetryFails)
 	thumb.POST("/clear", handles.ThumbClear)
 	thumb.POST("/clear_all", handles.ThumbClearAll)
