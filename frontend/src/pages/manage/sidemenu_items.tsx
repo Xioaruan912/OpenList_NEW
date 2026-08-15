@@ -8,13 +8,13 @@ import {
   BsJoystick,
   BsMedium,
   BsFingerprint,
-  BsFront,
   BsCloudUploadFill,
   BsSearch,
   BsBucket,
   BsHddNetwork,
   BsArrowLeftRight,
   BsImages,
+  BsBoxArrowUpRight,
 } from "solid-icons/bs"
 import { FiLogIn } from "solid-icons/fi"
 import { SiMetabase } from "solid-icons/si"
@@ -213,11 +213,11 @@ export const side_menu_items: SideMenuItem[] = [
     component: lazy(() => import("./backup-restore")),
   },
   {
-    title: "manage.sidemenu.about",
-    icon: BsFront,
-    to: "/@manage/about",
+    title: "manage.sidemenu.api",
+    icon: BsBoxArrowUpRight,
+    to: "https://api.oplist.org/",
     role: UserRole.GUEST,
-    component: lazy(() => import("./About")),
+    external: true,
   },
   {
     title: "manage.sidemenu.docs",
