@@ -549,22 +549,23 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		return
 	}
 	if thumbFailed(kind, rawPath) {
-		common.ErrorStrResp(c, "thumbnail not available", 404)
-		return
-	}
-	// 115 风控中禁止下载生成（视频缩略图需从网盘下载片段，会加剧风控）
-	if blocked, _ := isStorageBlocked(rawPath); blocked {
-		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
+		serveThumbPlaceholder(c)
 		return
 	}
 	// 用户手动排除的视频不生成缩略图（避免无谓下载）
 	if readThumbExcluded()[rawPath] {
-		common.ErrorStrResp(c, "thumbnail not available", 404)
+		serveThumbPlaceholder(c)
+		return
+	}
+	// 115 风控中禁止下载生成（视频缩略图需从网盘下载片段，会加剧风控）
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		serveThumbPlaceholder(c)
 		return
 	}
 
 	if !thumbAcquire(false) {
-		common.ErrorStrResp(c, "thumbnail busy", 503)
+		// 并发占用：返回占位图（不写负缓存，下次有机会自动重试）
+		serveThumbPlaceholder(c)
 		return
 	}
 	defer thumbRelease()
@@ -578,21 +579,39 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	if err != nil {
 		if errors.Is(err, errThumbNoCover) {
 			markThumbFailed(kind, rawPath)
-			common.ErrorStrResp(c, "no cover art or cover file found", 404)
+			serveThumbPlaceholder(c)
 			return
 		}
 		if errors.Is(err, errThumbTooLarge) {
-			common.ErrorStrResp(c, "file too large for thumbnail", 404)
+			markThumbFailed(kind, rawPath)
+			serveThumbPlaceholder(c)
 			return
 		}
+		// 所有生成失败都写负缓存，避免反复重试加重风控
 		markThumbFailed(kind, rawPath)
 		log.Warnf("thumb generate failed [%s] %s: %v", kind, rawPath, err)
-		common.ErrorResp(c, err, 500)
+		serveThumbPlaceholder(c)
 		return
 	}
 	_ = os.WriteFile(cachePath, png, 0o666)
 	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
+}
+
+// serveThumbPlaceholder 返回 1x1 透明 PNG 占位图（避免前端 img 破图）
+func serveThumbPlaceholder(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=60")
+	c.Data(200, "image/png", thumbPlaceholderPNG)
+}
+
+// thumbPlaceholderPNG 1x1 透明 PNG
+var thumbPlaceholderPNG = []byte{
+	0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+	0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+	0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+	0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 }
 
 // downloadRangeBytes 从链接读取 [offset, offset+limit) 字节返回
@@ -1057,6 +1076,8 @@ func processTask(task thumbPrewarmTask) {
 		_ = os.WriteFile(cachePath, png, 0o666)
 	}
 	thumbRecord(task.rawPath)
+	// 生成成功后清除远程 miss 标记（remote 模式可能之前被标 miss）
+	remoteThumbMissClear(task.rawPath)
 	prewarmDone.Store(task.rawPath, struct{}{})
 }
 
@@ -1396,7 +1417,17 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 		return
 	}
 	if remoteThumbMissCheck(rawPath) {
-		common.ErrorStrResp(c, "thumbnail not available", 404)
+		serveThumbPlaceholder(c)
+		return
+	}
+	// 风控中：不调 115 远程查询或下载生成，直接返回占位图（避免加剧风控）
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		serveThumbPlaceholder(c)
+		return
+	}
+	// 排除的视频不生成
+	if readThumbExcluded()[rawPath] {
+		serveThumbPlaceholder(c)
 		return
 	}
 	// 3) 目录清单判断远程缩略图是否存在（清单由列表时 1 次 API 建立）
@@ -1450,27 +1481,26 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	ThumbStoreRemote() bool
 	ThumbFolderName() string
 }, diskPath string) {
-	// 115 风控中禁止下载生成（会加剧风控）
+	// 风控中 / 排除：返回占位图（不调 115）
 	if blocked, _ := isStorageBlocked(rawPath); blocked {
-		common.ErrorStrResp(c, "115 风控中，缩略图生成需下载视频，暂不可用", 503)
+		serveThumbPlaceholder(c)
 		return
 	}
-	// 用户手动排除的视频不生成缩略图
 	if readThumbExcluded()[rawPath] {
-		common.ErrorStrResp(c, "thumbnail not available", 404)
+		serveThumbPlaceholder(c)
 		return
 	}
 	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
 			remoteThumbMissMark(rawPath)
-			common.ErrorStrResp(c, "file too large for thumbnail", 404)
+			serveThumbPlaceholder(c)
 			return
 		}
-		// 生成失败写负缓存，避免反复下载+抽帧（浪费带宽并刺激网盘风控）
+		// 所有生成失败写负缓存，避免反复下载+抽帧（浪费带宽并刺激网盘风控）
 		remoteThumbMissMark(rawPath)
 		log.Warnf("thumb generate failed [video] %s: %v", rawPath, err)
-		common.ErrorResp(c, err, 500)
+		serveThumbPlaceholder(c)
 		return
 	}
 	go func() {
@@ -1683,9 +1713,11 @@ func fillVideoThumb(c *gin.Context, parent string, obj model.Obj, thumb string) 
 		return ""
 	}
 	// remote 模式：异步预载目录缩略图清单（1 次 API/目录，缓存 5 分钟），
-	// 使 /vt 读取后续零 API
+	// 使 /vt 读取后续零 API；风控中跳过，避免列表时触发 115 API 加剧风控
 	if addition := remoteThumbStore(parent + "/" + obj.GetName()); addition != nil {
-		preloadRemoteListing(c.Request.Context(), parent, addition)
+		if blocked, _ := isStorageBlocked(parent); !blocked {
+			preloadRemoteListing(c.Request.Context(), parent, addition)
+		}
 	}
 	return thumbURL(c, "vt", parent, obj)
 }

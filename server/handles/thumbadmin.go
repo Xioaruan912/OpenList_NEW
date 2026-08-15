@@ -47,16 +47,12 @@ func ThumbGenerate(c *gin.Context) {
 	removed := 0
 	failedDirs := 0
 	truncated := false
-	enqueueMax := thumbGenPower().EnqueueMax
+	_ = thumbGenPower() // 生成强度参数由 worker 读取，这里无需引用
 	excluded := readThumbExcluded()
 	consecListFails := 0
 	var scanDir func(dir string)
 	scanDir = func(dir string) {
-		if queued >= enqueueMax {
-			truncated = true
-			return
-		}
-		if consecListFails >= 3 {
+		if consecListFails >= 5 {
 			// 列表连续失败（风控迹象）：提前停止扫描，避免无效请求加剧风控
 			truncated = true
 			return
@@ -90,10 +86,6 @@ func ThumbGenerate(c *gin.Context) {
 			}
 			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
-			if queued >= enqueueMax {
-				truncated = true
-				return
-			}
 		}
 	}
 	// 根目录不是有效存储路径：遍历所有挂载
