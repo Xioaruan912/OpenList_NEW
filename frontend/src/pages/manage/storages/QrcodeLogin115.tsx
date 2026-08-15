@@ -1,15 +1,6 @@
 import {
   Button,
-  Divider,
   Image,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  ModalOverlay,
-  Radio,
-  RadioGroup,
   Select,
   SelectContent,
   SelectIcon,
@@ -20,7 +11,6 @@ import {
   SelectPlaceholder,
   SelectTrigger,
   SelectValue,
-  Spinner,
   Stack,
   Text,
   VStack,
@@ -28,6 +18,7 @@ import {
 import { createSignal, For, onCleanup, Show } from "solid-js"
 import { notify, r } from "~/utils"
 import { PResp } from "~/types"
+import { FolderPicker115 } from "./FolderPicker115"
 
 interface QRCodeInfo {
   uid: string
@@ -39,12 +30,6 @@ interface QRCodeInfo {
 interface QRCodeStatusInfo {
   status: number
   msg: string
-}
-
-interface FolderInfo {
-  file_id: string
-  parent_id: string
-  name: string
 }
 
 const LOGIN_APPS = [
@@ -74,9 +59,7 @@ export const QrcodeLogin115 = (props: {
   const [polling, setPolling] = createSignal(false)
   const [logging, setLogging] = createSignal(false)
   const [folderModal, setFolderModal] = createSignal(false)
-  const [folders, setFolders] = createSignal<FolderInfo[]>([])
-  const [selectedId, setSelectedId] = createSignal("")
-  const [loadingFolders, setLoadingFolders] = createSignal(false)
+  const [lastCookie, setLastCookie] = createSignal("")
 
   let timer: ReturnType<typeof setInterval> | null = null
 
@@ -143,37 +126,13 @@ export const QrcodeLogin115 = (props: {
     }
     const cookie = loginData.cookie
     props.setAddition("cookie", cookie)
+    setLastCookie(cookie)
     notify.success("扫码登录成功，Cookie 已自动填入")
-    await openFolderPicker(cookie)
-  }
-
-  const openFolderPicker = async (cookie: string) => {
-    setLoadingFolders(true)
     setFolderModal(true)
-    const resp: PResp<{ content: FolderInfo[] }> = r.post("/115/root_folders", {
-      cookie,
-    })
-    const { code, message, data } = await resp
-    setLoadingFolders(false)
-    if (code !== 200) {
-      notify.error(message)
-      setFolderModal(false)
-      return
-    }
-    setFolders(data.content || [])
-    setSelectedId("")
   }
 
-  const confirmFolder = () => {
-    const id = selectedId()
-    if (!id) {
-      notify.warning("请选择一个文件夹")
-      return
-    }
+  const confirmFolder = (id: string, name: string) => {
     props.setAddition("root_folder_id", id)
-    setFolderModal(false)
-    const folder = folders().find((f) => f.file_id === id)
-    notify.success(`已选择挂载文件夹: ${folder?.name ?? id}`)
   }
 
   return (
@@ -244,49 +203,16 @@ export const QrcodeLogin115 = (props: {
           </Show>
         </VStack>
       </Show>
-      <Divider />
       <Text size="sm" color="$neutral9">
         提示：请选择平时不常用的设备登录，否则会挤掉该设备上的原有登录。获取 Cookie 后会自动弹出挂载文件夹选择框。
       </Text>
 
-      <Modal blockScrollOnMount={false} opened={folderModal()} onClose={() => setFolderModal(false)}>
-        <ModalOverlay />
-        <ModalContent>
-          <ModalHeader>选择要挂载的文件夹</ModalHeader>
-          <ModalBody>
-            <Show when={loadingFolders()} fallback={<Text>选择需要挂载的文件夹，将自动填入根文件夹 ID</Text>}>
-              <VStack spacing="$2">
-                <Spinner />
-                <Text size="sm">正在读取 115 网盘根目录...</Text>
-              </VStack>
-            </Show>
-            <Show when={!loadingFolders() && folders().length === 0}>
-              <Text color="$danger9">未获取到文件夹列表，请确认 Cookie 是否有效</Text>
-            </Show>
-            <Show when={!loadingFolders() && folders().length > 0}>
-              <RadioGroup value={selectedId()} onChange={setSelectedId}>
-                <Stack direction="column" spacing="$1" maxHeight="$80" overflow="auto">
-                  <For each={folders()}>
-                    {(folder) => (
-                      <Radio value={folder.file_id}>
-                        {folder.name} ({folder.file_id})
-                      </Radio>
-                    )}
-                  </For>
-                </Stack>
-              </RadioGroup>
-            </Show>
-          </ModalBody>
-          <ModalFooter display="flex" gap="$2">
-            <Button onClick={() => setFolderModal(false)} colorScheme="neutral">
-              取消
-            </Button>
-            <Button onClick={confirmFolder} disabled={!selectedId()}>
-              确定
-            </Button>
-          </ModalFooter>
-        </ModalContent>
-      </Modal>
+      <FolderPicker115
+        opened={folderModal}
+        cookie={lastCookie}
+        onClose={() => setFolderModal(false)}
+        onPick={confirmFolder}
+      />
     </VStack>
   )
 }

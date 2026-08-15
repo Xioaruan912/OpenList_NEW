@@ -77,6 +77,9 @@ const (
 	// 115
 	Pan115TempDir = "115_temp_dir"
 
+	// 存储驱动显示白名单（"add storage" 下拉仅显示这些类型，逗号分隔；留空显示全部）
+	PanDriversShow = "pan_drivers_show"
+
 	// 123
 	Pan123TempDir = "123_temp_dir"
 

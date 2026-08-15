@@ -14,6 +14,7 @@ import {
   Addition,
   DriverConfig,
   DriverItem,
+  Group,
   PResp,
   Storage,
   Type,
@@ -21,6 +22,7 @@ import {
 import { createStore, produce } from "solid-js/store"
 import { Item } from "./Item"
 import { QrcodeLogin115 } from "./QrcodeLogin115"
+import { FolderPicker115 } from "./FolderPicker115"
 import { ResponsiveGrid } from "../common/ResponsiveGrid"
 
 interface DriverInfo {
@@ -65,9 +67,31 @@ const AddOrEdit = () => {
     true,
   )
   const [drivers, setDrivers] = createSignal<Drivers>({})
+  const [panDriversShow, setPanDriversShow] = createSignal("")
+  const loadPanDriversShow = async () => {
+    const resp: PResp<{ key: string; value: string }[]> = r.get(
+      `/admin/setting/list?group=${Group.GLOBAL}`,
+    )
+    const { code, data } = await resp
+    if (code === 200) {
+      setPanDriversShow(
+        data.find((i) => i.key === "pan_drivers_show")?.value || "",
+      )
+    }
+  }
+  const shownDrivers = createMemo(() => {
+    const all = Object.keys(drivers())
+    const allow = panDriversShow()
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (allow.length === 0) return all
+    return all.filter((d) => allow.includes(d))
+  })
   const initAdd = async () => {
     const resp = await loadDrivers()
     handleResp(resp, setDrivers)
+    void loadPanDriversShow()
   }
 
   const [storageLoading, loadStorage] = useFetch(
@@ -110,6 +134,7 @@ const AddOrEdit = () => {
   })
   const [exportOpened, setExportOpened] = createSignal(false)
   const [importOpened, setImportOpened] = createSignal(false)
+  const [pickerOpen, setPickerOpen] = createSignal(false)
   return (
     <MaybeLoading
       loading={id ? storageLoading() || driverLoading() : driversLoading()}
@@ -123,7 +148,7 @@ const AddOrEdit = () => {
           required
           searchable
           type={Type.Select}
-          options={id ? storage.driver : Object.keys(drivers()).join(",")}
+          options={id ? storage.driver : shownDrivers().join(",")}
           value={storage.driver}
           full_name_path="storages.common.driver"
           options_prefix="drivers.drivers"
@@ -190,6 +215,26 @@ const AddOrEdit = () => {
       <Show when={storage.driver === "115 Cloud"}>
         <QrcodeLogin115
           setAddition={(name: string, value: any) => setAddition(name, value)}
+        />
+        <HStack mt="$2" spacing="$2">
+          <Button
+            colorScheme="primary"
+            disabled={!addition.cookie}
+            onClick={() => setPickerOpen(true)}
+          >
+            选择挂载文件夹
+          </Button>
+          <Show when={addition.root_folder_id}>
+            <Heading size="sm" color="$neutral9">
+              当前挂载文件夹 ID: {addition.root_folder_id}
+            </Heading>
+          </Show>
+        </HStack>
+        <FolderPicker115
+          opened={pickerOpen}
+          cookie={() => addition.cookie || ""}
+          onClose={() => setPickerOpen(false)}
+          onPick={(id) => setAddition("root_folder_id", id)}
         />
       </Show>
       <HStack

@@ -46,6 +46,8 @@ type ThumbStatus = {
   fails_by_dir?: ThumbDirStat[]
 }
 
+type BlockedResult = { mount: string; blocked: boolean; msg: string }
+
 const Storages = () => {
   const t = useT()
   useManageTitle("manage.sidemenu.storages")
@@ -116,6 +118,34 @@ const Storages = () => {
   const thumbPageCount = () =>
     Math.max(1, Math.ceil(thumbDirs().length / 5))
   const thumbPageDirs = () => thumbDirs().slice((thumbPage() - 1) * 5, thumbPage() * 5)
+  const [fengkongOpen, setFengkongOpen] = createSignal(false)
+  const [blockResults, setBlockResults] = createSignal<BlockedResult[]>([])
+  const [checkingBlocked, setCheckingBlocked] = createSignal(false)
+  const check115Blocked = async () => {
+    setCheckingBlocked(true)
+    setBlockResults([])
+    const targets = storages().filter(
+      (s) => s.driver === "115 Cloud" || s.driver === "115 Share",
+    )
+    const results: BlockedResult[] = []
+    for (const s of targets) {
+      const resp: Resp<BlockedResult> = await r.post("/admin/storage/check_blocked", {
+        id: s.id,
+      })
+      if (resp.code === 200) {
+        results.push({
+          mount: resp.data.mount,
+          blocked: !!resp.data.blocked,
+          msg: resp.data.msg || "",
+        })
+      } else {
+        results.push({ mount: s.mount_path, blocked: false, msg: resp.message })
+      }
+    }
+    setBlockResults(results)
+    setCheckingBlocked(false)
+    setFengkongOpen(true)
+  }
   return (
     <VStack spacing="$3" alignItems="start" w="$full">
       <HStack
@@ -147,6 +177,14 @@ const Storages = () => {
           onClick={loadAll}
         >
           {t("storages.other.load_all")}
+        </Button>
+        <Button
+          colorScheme="danger"
+          variant="outline"
+          loading={checkingBlocked()}
+          onClick={check115Blocked}
+        >
+          115 风控检查
         </Button>
         <Button
           onClick={async () => {
@@ -319,6 +357,63 @@ const Storages = () => {
             <Button onClick={retryThumbFails}>重试失败</Button>
             <Button onClick={loadThumbStatus}>刷新</Button>
             <Button colorScheme="neutral" onClick={() => setThumbOpen(false)}>
+              关闭
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
+      <Modal
+        opened={fengkongOpen()}
+        onClose={() => setFengkongOpen(false)}
+        size={{ "@initial": "xs", "@md": "xl" }}
+      >
+        <ModalOverlay />
+        <ModalContent>
+          <ModalHeader>115 风控检查</ModalHeader>
+          <ModalBody>
+            <Text size="sm" color="$neutral9" mb="$2">
+              基于内存中的风控标记（5 分钟内有效，不主动请求 115 接口）。风控中时缩略图生成将自动暂停。
+            </Text>
+            <Show
+              when={blockResults().length > 0}
+              fallback={<Box color="$neutral9">未配置 115 存储</Box>}
+            >
+              <VStack direction="column" spacing="$1" w="$full">
+                <For each={blockResults()}>
+                  {(r) => (
+                    <HStack
+                      spacing="$2"
+                      alignItems="center"
+                      w="$full"
+                      rounded="$md"
+                      border="1px solid $neutral6"
+                      p="$2"
+                    >
+                      <Tag colorScheme={r.blocked ? "danger" : "success"}>
+                        {r.blocked ? "风控中" : "正常"}
+                      </Tag>
+                      <Text
+                        fontWeight="$medium"
+                        css={{ "word-break": "break-all" }}
+                      >
+                        {r.mount}
+                      </Text>
+                      <Show when={r.msg}>
+                        <Text size="sm" color="$neutral9">
+                          {r.msg}
+                        </Text>
+                      </Show>
+                    </HStack>
+                  )}
+                </For>
+              </VStack>
+            </Show>
+          </ModalBody>
+          <ModalFooter display="flex" gap="$2">
+            <Button loading={checkingBlocked()} onClick={check115Blocked}>
+              重新检查
+            </Button>
+            <Button colorScheme="neutral" onClick={() => setFengkongOpen(false)}>
               关闭
             </Button>
           </ModalFooter>
