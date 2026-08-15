@@ -1062,11 +1062,6 @@ const Thumb = () => {
             </Button>
           </Show>
         </HStack>
-        <Show when={upStatus().total === 0}>
-          <Text mt="$1" fontSize="$sm" color="$neutral9">
-            尚未上传：点击"一键上传"或目录行上的"上传"按钮开始（每批 50，间隔 5 秒，失败自动重试 3 次）
-          </Text>
-        </Show>
         <Progress
           mt="$2"
           value={

@@ -70,6 +70,8 @@ func ThumbGenerate(c *gin.Context) {
 			return
 		}
 		consecListFails = 0
+		// 本目录视频文件（先生成队列时检测本地与网盘）
+		var videos []string
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if req.Recursive {
@@ -77,10 +79,17 @@ func ThumbGenerate(c *gin.Context) {
 				}
 				continue
 			}
-			if utils.GetFileType(obj.GetName()) != conf.VIDEO {
-				continue
+			if utils.GetFileType(obj.GetName()) == conf.VIDEO {
+				videos = append(videos, dir+"/"+obj.GetName())
 			}
-			rawPath := dir + "/" + obj.GetName()
+		}
+		if len(videos) == 0 {
+			return
+		}
+		// 网盘 _thumbnails 清单（1 API/目录带缓存）：网盘已上传的缩略图不再重新生成
+		folder := thumbFolderNameForPath(dir)
+		remoteNames := loadRemoteThumbListing(c.Request.Context(), dir, folderNameOnly{folder})
+		for _, rawPath := range videos {
 			if excluded[rawPath] {
 				continue
 			}
@@ -88,11 +97,17 @@ func ThumbGenerate(c *gin.Context) {
 				if err := os.Remove(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
 					removed++
 				}
-			} else if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
-				// 已有缩略图：跳过，避免重复入队与计数（仅统计真正缺失的）
-				continue
+			} else {
+				if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+					// 已有本地缩略图：跳过，避免重复入队与计数
+					continue
+				}
+				if remoteNames[remoteThumbName(rawPath)] {
+					// 网盘已有缩略图（本地已随上传删除）：无需重新生成
+					continue
+				}
 			}
-			// 缺失缩略图的视频：清除 done 标记以便重新入队（含之前失败/中断的）
+			// 本地与网盘都缺失的视频：清除 done 标记以便重新入队（含之前失败/中断的）
 			prewarmDone.Delete(rawPath)
 			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
