@@ -437,7 +437,7 @@ func extractVideoFrame(ctx context.Context, localPath string) ([]byte, error) {
 			kwargs["ss"] = ss
 		}
 		stream := ffmpeg.Input(localPath, kwargs).
-			Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
+			Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
 			GlobalArgs("-loglevel", "error").Silent(true).
 			WithOutput(srcBuf, os.Stdout)
 		setStreamContext(stream, ctx)
@@ -490,7 +490,7 @@ func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss
 		kwargs["ss"] = ss
 	}
 	stream := ffmpeg.Input(url, kwargs).
-		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
+		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
 		GlobalArgs("-headers", hb.String(), "-loglevel", "error").Silent(true).
 		WithOutput(srcBuf, os.Stdout)
 	setStreamContext(stream, ctx)
@@ -504,24 +504,30 @@ func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss
 }
 
 // extractVideoFrameRemote 通过 ffmpeg HTTP Range 直接远程抽帧（3s 处单帧缩略图），
-// 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）
+// 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）。
+// 深偏移 seek 对部分文件（moov 在尾部/结构稀疏）抽不到帧，回退到首帧（offset 0）。
 func extractVideoFrameRemote(ctx context.Context, url string, header http.Header) ([]byte, error) {
 	data, err := extractVideoFrameAt(ctx, url, header, "3")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		return encodeThumb(data)
 	}
-	return encodeThumb(data)
+	data, err = extractVideoFrameAt(ctx, url, header, "0")
+	if err == nil {
+		return encodeThumb(data)
+	}
+	return nil, err
 }
 
 // generateVideoAdaptiveFrame 长视频单帧缩略图（1x1）：按"中间优先"依次尝试远程 seek
-// 深度 50%→30%→15%→7%→3%，取第一个成功的帧（越深越接近中间内容）。
+// 深度 50%→30%→15%→7%→3%，最后兜底首帧（0），取第一个成功的帧（越深越接近中间内容）。
 // 115 对大文件深偏移 Range 常返回 403（每次失败 ~0.5s 快速跳过），
+// 部分文件深偏移 seek 抽不到帧（moov 在尾部），此时首帧兜底。
 // 单帧+自适应比多帧网格更快更可靠。
 func generateVideoAdaptiveFrame(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
 	if duration <= 0 {
 		return nil, errors.New("invalid duration")
 	}
-	for _, ratio := range []float64{0.5, 0.3, 0.15, 0.07, 0.03} {
+	for _, ratio := range []float64{0.5, 0.3, 0.15, 0.07, 0.03, 0.0} {
 		data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", duration*ratio))
 		if err != nil {
 			continue
@@ -535,7 +541,7 @@ func generateVideoAdaptiveFrame(ctx context.Context, url string, header http.Hea
 func extractAudioCover(ctx context.Context, localPath string) ([]byte, error) {
 	srcBuf := bytes.NewBuffer(nil)
 	stream := ffmpeg.Input(localPath).
-		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
+		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
 		GlobalArgs("-map", "0:v:0", "-an", "-loglevel", "error").Silent(true).
 		WithOutput(srcBuf, os.Stdout)
 	setStreamContext(stream, ctx)
