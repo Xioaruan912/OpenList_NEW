@@ -20,7 +20,7 @@ import {
 } from "@hope-ui/solid"
 import { createSignal, createEffect, For, Show, onCleanup } from "solid-js"
 import { useManageTitle } from "~/hooks"
-import { handleResp, notify, r } from "~/utils"
+import { handleResp, handleRespWithoutNotify, notify, r } from "~/utils"
 import { SelectOptions } from "~/components"
 
 type ThumbStatus = {
@@ -120,6 +120,7 @@ const Thumb = () => {
   const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
   let firstStatusLoaded = false
+  const [uploadLive, setUploadLive] = createSignal(false) // 本次会话是否有上传运行（控制轮询）
   const [upStatus, setUpStatus] = createSignal<{
     active: boolean
     queued: number
@@ -129,7 +130,28 @@ const Thumb = () => {
     fails: number
     total: number
   }>()
-  let wasUpActive = false
+  const [logOpen, setLogOpen] = createSignal(false)
+  const [logItems, setLogItems] = createSignal<{ path: string; msg: string; at: string }[]>([])
+
+  // 失败日志：path 为空查看全部，否则查看单个文件
+  const openFailLog = (path?: string) => {
+    const items = (st()?.fail_items || []).map((i) => ({
+      path: i.path,
+      msg: i.msg || "生成失败",
+      at: i.at || "",
+    }))
+    if (path) {
+      const hit = items.find((i) => i.path === path)
+      if (hit) {
+        setLogItems([hit])
+      } else {
+        setLogItems(failedMap()[path] ? [{ path, msg: failedMap()[path]!, at: "" }] : [])
+      }
+    } else {
+      setLogItems(items)
+    }
+    setLogOpen(true)
+  }
 
   const load = async () => {
     const resp = await r.get("/admin/thumb/status")
@@ -297,8 +319,9 @@ const Thumb = () => {
           notify.info("该目录没有可上传的本地缩略图")
         } else {
           notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
+          setUploadLive(true)
+          void pollUploadStatus()
         }
-        void pollUploadStatus()
       })
     } finally {
       setBusy("")
@@ -315,18 +338,20 @@ const Thumb = () => {
           notify.info("没有可上传的本地缩略图")
         } else {
           notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
+          setUploadLive(true)
+          void pollUploadStatus()
         }
-        void pollUploadStatus()
       })
     } finally {
       setBusy("")
     }
   }
 
-  // 轮询上传队列状态；检测完成时提示并刷新
+  // 轮询上传队列状态；静默失败（不弹 Network Error 刷屏），完成后提示并停止轮询
   const pollUploadStatus = async () => {
-    const resp = await r.get("/admin/thumb/upload_status")
-    handleResp(resp, (d) => {
+    const resp = await r.get("/admin/thumb/upload_status").catch(() => null)
+    if (!resp) return
+    handleRespWithoutNotify(resp, (d) => {
       const s = d as {
         active: boolean
         queued: number
@@ -337,13 +362,13 @@ const Thumb = () => {
         total: number
       }
       setUpStatus(s)
-      if (wasUpActive && !s.active && s.total > 0) {
+      if (uploadLive() && !s.active && s.queued === 0 && s.total > 0) {
         notify.success(
           `上传完成：成功 ${s.done}，已存在(网盘已有) ${s.exists}，失败 ${s.failed}${s.fails > 0 ? "（可重试）" : ""}`,
         )
         loadTree()
+        setUploadLive(false)
       }
-      wasUpActive = !!s.active
     })
   }
 
@@ -355,7 +380,10 @@ const Thumb = () => {
       handleResp(resp, (d) => {
         const data = d as { retried?: number }
         notify.success(`已重新入队 ${data.retried || 0} 个上传失败`)
-        void pollUploadStatus()
+        if (data.retried) {
+          setUploadLive(true)
+          void pollUploadStatus()
+        }
       })
     } finally {
       setBusy("")
@@ -688,14 +716,14 @@ const Thumb = () => {
   load()
   loadTree()
   loadProxy()
+  // 10s 计时器仅刷新缩略图状态；upload_status 只在有上传运行时轮询，避免无意义的持续请求
   const timer = setInterval(() => {
     load()
-    void pollUploadStatus()
   }, 10000)
-  // 上传运行时 2s 快轮询，进度条实时跳动；空闲时回落到 10s 计时器
+  // 上传运行时 2s 快轮询，进度条实时跳动；空闲时完全不轮询 upload_status
   let fastTimer: ReturnType<typeof setInterval> | undefined
   createEffect(() => {
-    if (upStatus()?.active) {
+    if (uploadLive()) {
       fastTimer = setInterval(() => void pollUploadStatus(), 2000)
     } else if (fastTimer) {
       clearInterval(fastTimer)
@@ -720,22 +748,6 @@ const Thumb = () => {
           <Text fontSize="$sm" color="$neutral9">
             网盘 {st()?.cloud_files || 0} · 本地 {st()?.local_files || 0}
           </Text>
-        </Box>
-        <Box
-          p="$3"
-          rounded="$lg"
-          border="1px solid $neutral7"
-          background={useColorModeValue("$neutral1", "$neutral2")()}
-        >
-          队列 {queued()} 个
-        </Box>
-        <Box
-          p="$3"
-          rounded="$lg"
-          border="1px solid $neutral7"
-          background={useColorModeValue("$neutral1", "$neutral2")()}
-        >
-          失败 {st()?.fail_markers || 0} 个
         </Box>
         <Box
           p="$3"
@@ -913,8 +925,19 @@ const Thumb = () => {
           </Tag>
           <Text fontSize="$sm" color="$neutral9">
             {genActive() > 0 ? `正在生成 ${genActive()} 个 · ` : ""}队列剩余 {queued()} 个 · 本次已生成{" "}
-            {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个
+            {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个 · 失败{" "}
+            {st()?.fail_markers || 0} 个
           </Text>
+          <Show when={(st()?.fail_markers || 0) > 0}>
+            <Button
+              size="xs"
+              variant="outline"
+              colorScheme="danger"
+              onClick={() => openFailLog()}
+            >
+              查看失败日志
+            </Button>
+          </Show>
         </HStack>
         <Show when={(st()?.active_tasks || []).length > 0}>
           <Box mt="$2" rounded="$md" border="1px solid $neutral6" p="$1">
@@ -1175,6 +1198,14 @@ const Thumb = () => {
                     <Tag colorScheme="danger" size="sm" title={failedMap()[q] || "生成失败"}>
                       失败
                     </Tag>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      colorScheme="danger"
+                      onClick={() => openFailLog(q)}
+                    >
+                      日志
+                    </Button>
                   </Show>
                   <Show when={!checked()[q]}>
                     <Tag colorScheme="warning" size="sm">
@@ -1222,6 +1253,53 @@ const Thumb = () => {
         </VStack>
       </Show>
 
+      <Modal
+        opened={logOpen()}
+        onClose={() => setLogOpen(false)}
+        size={{ "@initial": "xs", "@md": "lg" }}
+      >
+        <ModalOverlay />
+        <ModalContent>
+          <ModalHeader>失败日志（{logItems().length}）</ModalHeader>
+          <ModalBody css={{ maxH: "60vh", overflow: "auto" }}>
+            <Show when={logItems().length} fallback={<Text color="$neutral9">暂无失败记录</Text>}>
+              <VStack spacing="$2" direction="column" w="$full">
+                <For each={logItems()}>
+                  {(it) => (
+                    <Box
+                      p="$2"
+                      rounded="$md"
+                      border="1px solid $neutral6"
+                      w="$full"
+                      background={useColorModeValue("$neutral1", "$neutral2")()}
+                    >
+                      <Text fontWeight="$medium" css={{ "word-break": "break-all" }}>
+                        {it.path.split("/").pop()}
+                      </Text>
+                      <Text fontSize="$xs" color="$neutral9" css={{ "word-break": "break-all" }}>
+                        {it.path}
+                      </Text>
+                      <Text fontSize="$sm" color="$danger9" css={{ "word-break": "break-all" }}>
+                        原因：{it.msg}
+                      </Text>
+                      <Show when={it.at}>
+                        <Text fontSize="$xs" color="$neutral9">
+                          时间：{it.at}
+                        </Text>
+                      </Show>
+                    </Box>
+                  )}
+                </For>
+              </VStack>
+            </Show>
+          </ModalBody>
+          <ModalFooter display="flex" gap="$2" justifyContent="flex-end">
+            <Button colorScheme="neutral" onClick={() => setLogOpen(false)}>
+              关闭
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
       <Modal opened={!!viewPath()} onClose={closeView} size={{ "@initial": "sm", "@md": "md" }}>
         <ModalOverlay />
         <ModalContent>
