@@ -12,7 +12,6 @@ import (
 	"image"
 	"image/color"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -56,11 +55,9 @@ const (
 	thumbChunkSize = 3 * 1024 * 1024
 	thumbWidth     = 288
 
-	// 长视频内容缩略图：超过阈值时从中间带取样多帧拼成网格
-	thumbMosaicLongSec  = 90
-	thumbMosaicFrames   = 9
-	thumbProbeMinSize   = 10 * 1024 * 1024       // 小于该大小的文件不做时长探测
-	thumbMosaicSkipSize = 2 * 1024 * 1024 * 1024 // 超过该大小的文件跳过远程网格（深偏移 Range 在 115 CDN 不可靠）
+	// 长视频内容缩略图：超过阈值时取"中间单帧"
+	thumbMosaicLongSec = 90
+	thumbProbeMinSize  = 10 * 1024 * 1024 // 小于该大小的文件不做时长探测
 )
 
 var (
@@ -442,7 +439,7 @@ func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss
 		}
 	}
 	hb.WriteString("\r\n")
-	kwargs := ffmpeg.KwArgs{"noaccurate_seek": "", "timeout": "90000000"}
+	kwargs := ffmpeg.KwArgs{"noaccurate_seek": "", "timeout": "20000000"}
 	if ss != "" {
 		kwargs["ss"] = ss
 	}
@@ -470,84 +467,18 @@ func extractVideoFrameRemote(ctx context.Context, url string, header http.Header
 	return encodeThumb(data)
 }
 
-// extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点；帧间小间隔降频，防网盘限流）
-func extractVideoFramesAtTimes(ctx context.Context, url string, header http.Header, times []float64) ([]image.Image, error) {
-	var frames []image.Image
-	for _, t := range times {
-		if len(frames) >= thumbMosaicFrames {
-			break
-		}
-		data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", t))
-		if err != nil {
-			continue
-		}
-		img, err := imaging.Decode(bytes.NewReader(data))
-		if err != nil {
-			continue
-		}
-		frames = append(frames, img)
+// generateVideoMiddleFrame 长视频取中间（50%）单帧缩略图（1x1）。
+// 只做 1 次远程 seek，比多帧网格更快、更可靠：115 对深偏移 Range 常返回 403/partial
+// （实测 3 部 >1h 电影的 2x2 深 seek 全部失败），单帧中间抽帧更稳。
+func generateVideoMiddleFrame(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
+	if duration <= 0 {
+		return nil, errors.New("invalid duration")
 	}
-	if len(frames) == 0 {
-		return nil, errors.New("no video frames extracted")
-	}
-	return frames, nil
-}
-
-// generateVideoMosaic 长视频内容缩略图：按时长自适应帧数与"中间带"采样区间，
-// 又快又落在视频中间（90s~30min:9帧@20-80%、30min~1h:6帧@35-65%、>1h:4帧@40-60%）
-func generateVideoMosaic(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
-	if duration <= thumbMosaicLongSec {
-		return nil, errors.New("short video, skip mosaic")
-	}
-	n := thumbMosaicFrames
-	start, end := 0.2, 0.8
-	switch {
-	case duration > 3600:
-		n, start, end = 4, 0.40, 0.60
-	case duration > 1800:
-		n, start, end = 6, 0.35, 0.65
-	}
-	var times []float64
-	for i := 0; i < n; i++ {
-		if n == 1 {
-			times = append(times, duration*0.5)
-		} else {
-			times = append(times, duration*(start+(end-start)*float64(i)/float64(n-1)))
-		}
-	}
-	frames, err := extractVideoFramesAtTimes(ctx, url, header, times)
+	data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", duration*0.5))
 	if err != nil {
 		return nil, err
 	}
-	return buildVideoMosaic(frames)
-}
-
-// buildVideoMosaic 将多帧合成方形网格并缩放到缩略图宽度（支持非 3×3：按帧数自适应行列）
-func buildVideoMosaic(frames []image.Image) ([]byte, error) {
-	n := len(frames)
-	if n == 0 {
-		return nil, errors.New("no frames to mosaic")
-	}
-	cols := int(math.Ceil(math.Sqrt(float64(n))))
-	rows := int(math.Ceil(float64(n) / float64(cols)))
-	width := setting.GetInt(conf.ThumbWidth, thumbWidth)
-	if width < 64 {
-		width = 64
-	}
-	cell := width / cols
-	mosaic := imaging.New(cell*cols, cell*rows, color.White)
-	for i, fr := range frames {
-		if i >= cols*rows {
-			break
-		}
-		thumb := imaging.Fit(fr, cell, cell, imaging.Lanczos)
-		imaging.Paste(mosaic, thumb, image.Pt((i%cols)*cell, (i/cols)*cell))
-	}
-	var buf bytes.Buffer
-	if err := imaging.Encode(&buf, mosaic, imaging.PNG); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return encodeThumb(data)
 }
 
 // extractAudioCover 从本地音频文件提取内嵌封面（无封面时返回 errThumbNoCover）
@@ -908,12 +839,12 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	}
 	remoteURL := apiURL + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
 
-	// moov 在文件尾部时本地片段必然无法解析；长视频仍探测时长后走"中间带"网格（远程抽帧），
-	// 短视频直接远程抽 3s 单帧；超大文件跳过远程网格（深偏移不可靠）
+	// moov 在文件尾部时本地片段必然无法解析；长视频探测时长后取"中间单帧"（1x1），
+	// 短视频直接远程抽 3s 单帧
 	if moovAtTail(ctx, link, size, rawPath) {
-		if size > thumbProbeMinSize && size <= thumbMosaicSkipSize {
+		if size > thumbProbeMinSize {
 			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-				if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
+				if data, err := generateVideoMiddleFrame(ctx, remoteURL, link.Header, dur); err == nil {
 					return data, nil
 				}
 			}
@@ -921,14 +852,13 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		return extractVideoFrameRemote(ctx, remoteURL, link.Header)
 	}
 
-	// 长视频：探测时长后从内容中间带抽帧合成网格缩略图（任一帧失败自动降级单帧）。
-	// 超大文件（>2GB）深偏移 Range 在 115 CDN 上不可靠（partial file），跳过网格直接本地抽帧
-	if size > thumbProbeMinSize && size <= thumbMosaicSkipSize {
+	// 长视频：探测时长后取"中间单帧"（1x1，中间内容）；失败降级本地头部抽帧
+	if size > thumbProbeMinSize {
 		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-			if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
+			if data, err := generateVideoMiddleFrame(ctx, remoteURL, link.Header, dur); err == nil {
 				return data, nil
 			}
-			log.Debugf("mosaic thumb failed for %s, fallback to single frame", rawPath)
+			log.Debugf("middle frame failed for %s, fallback to head chunk", rawPath)
 		}
 	}
 
