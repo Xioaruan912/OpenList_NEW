@@ -18,7 +18,7 @@ import {
   VStack,
   useColorModeValue,
 } from "@hope-ui/solid"
-import { createSignal, For, Show, onCleanup } from "solid-js"
+import { createSignal, createEffect, For, Show, onCleanup } from "solid-js"
 import { useManageTitle } from "~/hooks"
 import { handleResp, notify, r } from "~/utils"
 import { SelectOptions } from "~/components"
@@ -125,7 +125,8 @@ const Thumb = () => {
     queued: number
     done: number
     failed: number
-    skipped: number
+    exists: number
+    fails: number
     total: number
   }>()
   let wasUpActive = false
@@ -331,16 +332,34 @@ const Thumb = () => {
         queued: number
         done: number
         failed: number
-        skipped: number
+        exists: number
+        fails: number
         total: number
       }
       setUpStatus(s)
       if (wasUpActive && !s.active && s.total > 0) {
-        notify.success(`上传完成：成功 ${s.done}，跳过(已存在) ${s.skipped}，失败 ${s.failed}`)
+        notify.success(
+          `上传完成：成功 ${s.done}，已存在(网盘已有) ${s.exists}，失败 ${s.failed}${s.fails > 0 ? "（可重试）" : ""}`,
+        )
         loadTree()
       }
       wasUpActive = !!s.active
     })
+  }
+
+  // 重试上传失败清单（超过自动重试次数的）
+  const uploadRetry = async () => {
+    setBusy("upload-retry")
+    try {
+      const resp = await r.post("/admin/thumb/upload_retry", {})
+      handleResp(resp, (d) => {
+        const data = d as { retried?: number }
+        notify.success(`已重新入队 ${data.retried || 0} 个上传失败`)
+        void pollUploadStatus()
+      })
+    } finally {
+      setBusy("")
+    }
   }
 
   const viewThumb = async (pp: string) => {
@@ -673,7 +692,20 @@ const Thumb = () => {
     load()
     void pollUploadStatus()
   }, 10000)
-  onCleanup(() => clearInterval(timer))
+  // 上传运行时 2s 快轮询，进度条实时跳动；空闲时回落到 10s 计时器
+  let fastTimer: ReturnType<typeof setInterval> | undefined
+  createEffect(() => {
+    if (upStatus()?.active) {
+      fastTimer = setInterval(() => void pollUploadStatus(), 2000)
+    } else if (fastTimer) {
+      clearInterval(fastTimer)
+      fastTimer = undefined
+    }
+  })
+  onCleanup(() => {
+    clearInterval(timer)
+    if (fastTimer) clearInterval(fastTimer)
+  })
 
   return (
     <VStack spacing="$3" alignItems="start" w="$full">
@@ -913,6 +945,83 @@ const Thumb = () => {
         </Progress>
       </Box>
 
+      <Show
+        when={
+          upStatus() &&
+          (upStatus()!.active ||
+            upStatus()!.queued > 0 ||
+            upStatus()!.done + upStatus()!.exists + upStatus()!.failed > 0)
+        }
+      >
+        <Box
+          w="$full"
+          p="$3"
+          rounded="$lg"
+          border="1px solid $neutral7"
+          background={useColorModeValue("$neutral1", "$neutral2")()}
+        >
+          <HStack spacing="$2" alignItems="center" wrap="wrap">
+            <Tag
+              colorScheme={
+                st()?.blocked
+                  ? "danger"
+                  : upStatus()!.active
+                    ? "success"
+                    : upStatus()!.queued > 0
+                      ? "warning"
+                      : "neutral"
+              }
+            >
+              {st()?.blocked
+                ? "115 风控中，上传变慢"
+                : upStatus()!.active
+                  ? "正在上传"
+                  : upStatus()!.queued > 0
+                    ? "已入队，等待上传"
+                    : "上传完成"}
+            </Tag>
+            <Text fontSize="$sm" color="$neutral9">
+              剩余 {upStatus()!.queued} 个 · 成功 {upStatus()!.done} · 已存在(网盘已有){" "}
+              {upStatus()!.exists} · 失败 {upStatus()!.failed}
+            </Text>
+            <Show when={upStatus()!.fails > 0}>
+              <Button
+                size="xs"
+                colorScheme="warning"
+                loading={busy() === "upload-retry"}
+                onClick={uploadRetry}
+              >
+                重试上传失败
+              </Button>
+            </Show>
+          </HStack>
+          <Progress
+            mt="$2"
+            value={
+              upStatus()!.total > 0
+                ? Math.max(
+                    0,
+                    Math.min(
+                      100,
+                      Math.round(
+                        ((upStatus()!.done + upStatus()!.exists) / upStatus()!.total) * 100,
+                      ),
+                    ),
+                  )
+                : 0
+            }
+            max={100}
+            indeterminate={
+              upStatus()!.active &&
+              upStatus()!.done + upStatus()!.exists + upStatus()!.failed === 0
+            }
+            size="sm"
+          >
+            <ProgressIndicator color="$success6" />
+          </Progress>
+        </Box>
+      </Show>
+
       <HStack spacing="$2" alignItems="center" wrap={{ "@initial": "wrap", "@md": "unset" }}>
           <Button
             colorScheme="accent"
@@ -927,12 +1036,6 @@ const Thumb = () => {
           <Button colorScheme="danger" disabled={busy() === "全部清空"} onClick={clearAll}>
             清空全部缩略图
           </Button>
-          <Show when={upStatus()?.active || (upStatus()?.queued ?? 0) > 0}>
-            <Text fontSize="$sm" color="$info9">
-              上传中：剩余 {upStatus()?.queued ?? 0} · 成功 {upStatus()?.done ?? 0} · 跳过{" "}
-              {upStatus()?.skipped ?? 0} · 失败 {upStatus()?.failed ?? 0}
-            </Text>
-          </Show>
         <Text fontSize="$sm" color="$neutral10">
           点击目录查看已有缩略图，可勾选排除不需要缩略图的视频
         </Text>
