@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -55,9 +56,8 @@ const (
 	thumbChunkSize = 3 * 1024 * 1024
 	thumbWidth     = 288
 
-	// 长视频内容缩略图：超过阈值时从视频中均匀取样多帧拼成 3x3 网格
+	// 长视频内容缩略图：超过阈值时从中间带取样多帧拼成网格
 	thumbMosaicLongSec = 90
-	thumbMosaicGrid    = 3
 	thumbMosaicFrames  = 9
 	thumbProbeMinSize  = 10 * 1024 * 1024 // 小于该大小的文件不做时长探测
 )
@@ -384,7 +384,7 @@ func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset
 }
 
 // extractVideoFrame 从本地视频文件抽帧（-ss 3 失败回退 0s）
-func extractVideoFrame(localPath string) ([]byte, error) {
+func extractVideoFrame(ctx context.Context, localPath string) ([]byte, error) {
 	extract := func(ss string) ([]byte, error) {
 		srcBuf := bytes.NewBuffer(nil)
 		kwargs := ffmpeg.KwArgs{"noaccurate_seek": ""}
@@ -395,6 +395,7 @@ func extractVideoFrame(localPath string) ([]byte, error) {
 			Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
 			GlobalArgs("-loglevel", "error").Silent(true).
 			WithOutput(srcBuf, os.Stdout)
+		setStreamContext(stream, ctx)
 		if err := stream.Run(); err != nil {
 			return nil, err
 		}
@@ -414,8 +415,20 @@ func extractVideoFrame(localPath string) ([]byte, error) {
 	return nil, err
 }
 
+// setStreamContext 让 ffmpeg-go stream 使用可取消的 context（保留 Stdout/Stderr 值），
+// 队列暂停/清空时可杀进程
+func setStreamContext(stream *ffmpeg.Stream, ctx context.Context) {
+	if v, ok := stream.Context.Value("Stdout").(io.Writer); ok {
+		ctx = context.WithValue(ctx, "Stdout", v)
+	}
+	if v, ok := stream.Context.Value("Stderr").(io.Writer); ok {
+		ctx = context.WithValue(ctx, "Stderr", v)
+	}
+	stream.Context = ctx
+}
+
 // extractVideoFrameAt 通过 ffmpeg HTTP Range 从远程 URL 指定时间点抽一帧（原始 mjpeg 字节）
-func extractVideoFrameAt(url string, header http.Header, ss string) ([]byte, error) {
+func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss string) ([]byte, error) {
 	srcBuf := bytes.NewBuffer(nil)
 	var hb strings.Builder
 	for k, vs := range header {
@@ -435,6 +448,7 @@ func extractVideoFrameAt(url string, header http.Header, ss string) ([]byte, err
 		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
 		GlobalArgs("-headers", hb.String(), "-loglevel", "error").Silent(true).
 		WithOutput(srcBuf, os.Stdout)
+	setStreamContext(stream, ctx)
 	if err := stream.Run(); err != nil {
 		return nil, err
 	}
@@ -446,8 +460,8 @@ func extractVideoFrameAt(url string, header http.Header, ss string) ([]byte, err
 
 // extractVideoFrameRemote 通过 ffmpeg HTTP Range 直接远程抽帧（3s 处单帧缩略图），
 // 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）
-func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
-	data, err := extractVideoFrameAt(url, header, "3")
+func extractVideoFrameRemote(ctx context.Context, url string, header http.Header) ([]byte, error) {
+	data, err := extractVideoFrameAt(ctx, url, header, "3")
 	if err != nil {
 		return nil, err
 	}
@@ -455,13 +469,13 @@ func extractVideoFrameRemote(url string, header http.Header) ([]byte, error) {
 }
 
 // extractVideoFramesAtTimes 从远程 URL 多个时间点抽帧（跳过失败的时间点；帧间小间隔降频，防网盘限流）
-func extractVideoFramesAtTimes(url string, header http.Header, times []float64) ([]image.Image, error) {
+func extractVideoFramesAtTimes(ctx context.Context, url string, header http.Header, times []float64) ([]image.Image, error) {
 	var frames []image.Image
 	for _, t := range times {
 		if len(frames) >= thumbMosaicFrames {
 			break
 		}
-		data, err := extractVideoFrameAt(url, header, fmt.Sprintf("%.2f", t))
+		data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", t))
 		if err != nil {
 			continue
 		}
@@ -477,31 +491,43 @@ func extractVideoFramesAtTimes(url string, header http.Header, times []float64) 
 	return frames, nil
 }
 
-// generateVideoMosaic 长视频内容缩略图：10%~90% 均匀取 9 帧合成 3x3 网格
-func generateVideoMosaic(url string, header http.Header, duration float64) ([]byte, error) {
+// generateVideoMosaic 长视频内容缩略图：按时长自适应帧数与"中间带"采样区间，
+// 又快又落在视频中间（90s~30min:9帧@20-80%、30min~1h:6帧@35-65%、>1h:4帧@40-60%）
+func generateVideoMosaic(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
 	if duration <= thumbMosaicLongSec {
 		return nil, errors.New("short video, skip mosaic")
 	}
 	n := thumbMosaicFrames
+	start, end := 0.2, 0.8
+	switch {
+	case duration > 3600:
+		n, start, end = 4, 0.40, 0.60
+	case duration > 1800:
+		n, start, end = 6, 0.35, 0.65
+	}
 	var times []float64
 	for i := 0; i < n; i++ {
 		if n == 1 {
 			times = append(times, duration*0.5)
 		} else {
-			times = append(times, duration*(0.1+0.8*float64(i)/float64(n-1)))
+			times = append(times, duration*(start+(end-start)*float64(i)/float64(n-1)))
 		}
 	}
-	frames, err := extractVideoFramesAtTimes(url, header, times)
+	frames, err := extractVideoFramesAtTimes(ctx, url, header, times)
 	if err != nil {
 		return nil, err
 	}
 	return buildVideoMosaic(frames)
 }
 
-// buildVideoMosaic 将多帧合成方形网格并缩放到缩略图宽度
+// buildVideoMosaic 将多帧合成方形网格并缩放到缩略图宽度（支持非 3×3：按帧数自适应行列）
 func buildVideoMosaic(frames []image.Image) ([]byte, error) {
-	cols := thumbMosaicGrid
-	rows := thumbMosaicGrid
+	n := len(frames)
+	if n == 0 {
+		return nil, errors.New("no frames to mosaic")
+	}
+	cols := int(math.Ceil(math.Sqrt(float64(n))))
+	rows := int(math.Ceil(float64(n) / float64(cols)))
 	width := setting.GetInt(conf.ThumbWidth, thumbWidth)
 	if width < 64 {
 		width = 64
@@ -523,12 +549,13 @@ func buildVideoMosaic(frames []image.Image) ([]byte, error) {
 }
 
 // extractAudioCover 从本地音频文件提取内嵌封面（无封面时返回 errThumbNoCover）
-func extractAudioCover(localPath string) ([]byte, error) {
+func extractAudioCover(ctx context.Context, localPath string) ([]byte, error) {
 	srcBuf := bytes.NewBuffer(nil)
 	stream := ffmpeg.Input(localPath).
 		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
 		GlobalArgs("-map", "0:v:0", "-an", "-loglevel", "error").Silent(true).
 		WithOutput(srcBuf, os.Stdout)
+	setStreamContext(stream, ctx)
 	if err := stream.Run(); err != nil {
 		return nil, errThumbNoCover
 	}
@@ -878,15 +905,23 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	}
 	remoteURL := apiURL + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
 
-	// moov 在文件尾部时本地片段必然无法解析，直接远程抽帧，避免无谓的下载与失败尝试
+	// moov 在文件尾部时本地片段必然无法解析；长视频仍探测时长后走"中间带"网格（远程抽帧），
+	// 短视频直接远程抽 3s 单帧
 	if moovAtTail(ctx, link, size, rawPath) {
-		return extractVideoFrameRemote(remoteURL, link.Header)
+		if size > thumbProbeMinSize {
+			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
+				if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
+					return data, nil
+				}
+			}
+		}
+		return extractVideoFrameRemote(ctx, remoteURL, link.Header)
 	}
 
-	// 长视频：探测时长后从内容中均匀抽帧合成 3x3 网格缩略图（任一帧失败自动降级单帧）
+	// 长视频：探测时长后从内容中间带抽帧合成网格缩略图（任一帧失败自动降级单帧）
 	if size > thumbProbeMinSize {
 		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-			if data, err := generateVideoMosaic(remoteURL, link.Header, dur); err == nil {
+			if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
 				return data, nil
 			}
 			log.Debugf("mosaic thumb failed for %s, fallback to single frame", rawPath)
@@ -900,26 +935,26 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); err != nil {
 			return nil, err
 		}
-		return extractVideoFrame(tmpFile)
+		return extractVideoFrame(ctx, tmpFile)
 	}
 	// 下载开头片段（moov 在头部时常见情况）
 	if _, err := downloadRange(ctx, link, tmpFile, 0, thumbChunkSize, proxy, proxyNode); err != nil {
 		return nil, err
 	}
-	if data, err := extractVideoFrame(tmpFile); err == nil {
+	if data, err := extractVideoFrame(ctx, tmpFile); err == nil {
 		return data, nil
 	}
 	// moov 位于文件尾部（探测失败或非标准容器）：ffmpeg 直接 HTTP Range 远程抽帧。
 	// 走自身 /d 代理接口（服务端已注入驱动 Cookie，不依赖 ffmpeg -headers 传 Cookie，
 	// 后者对 115 直链不可靠）；302 直链场景下 -headers 仍保留 Cookie 作兜底。
-	if data, err := extractVideoFrameRemote(remoteURL, link.Header); err == nil {
+	if data, err := extractVideoFrameRemote(ctx, remoteURL, link.Header); err == nil {
 		return data, nil
 	}
 	// 最后兜底：下载末尾片段（moov 在尾部且本地可解析时有效）
 	if _, err := downloadRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy, proxyNode); err != nil {
 		return nil, err
 	}
-	return extractVideoFrame(tmpFile)
+	return extractVideoFrame(ctx, tmpFile)
 }
 
 // thumbGenPower 返回生成强度参数。当前不做任何节流约束：以最大速度生成
@@ -970,8 +1005,10 @@ var thumbActiveWorkers int32
 
 // thumbActiveTasks 进行中（worker 正在处理）的缩略图任务，供前端展示"正在生成 N 个/哪些文件"
 var (
-	thumbActiveMu    sync.Mutex
-	thumbActiveTasks = map[string]time.Time{} // rawPath -> startedAt
+	thumbActiveMu     sync.Mutex
+	thumbActiveTasks  = map[string]time.Time{}             // rawPath -> startedAt
+	thumbActiveCancel = map[string]context.CancelFunc{}    // rawPath -> cancel
+	thumbGenEpoch     int64                                 // 生成代际：暂停/清空时递增，用于丢弃旧代任务
 )
 
 func thumbActiveTrack(rawPath string, active bool) {
@@ -984,6 +1021,18 @@ func thumbActiveTrack(rawPath string, active bool) {
 	thumbActiveMu.Unlock()
 }
 
+func thumbActiveCancelAdd(rawPath string, cancel context.CancelFunc) {
+	thumbActiveMu.Lock()
+	thumbActiveCancel[rawPath] = cancel
+	thumbActiveMu.Unlock()
+}
+
+func thumbActiveCancelDel(rawPath string) {
+	thumbActiveMu.Lock()
+	delete(thumbActiveCancel, rawPath)
+	thumbActiveMu.Unlock()
+}
+
 func thumbActiveTasksSnapshot() []gin.H {
 	thumbActiveMu.Lock()
 	defer thumbActiveMu.Unlock()
@@ -992,6 +1041,27 @@ func thumbActiveTasksSnapshot() []gin.H {
 		out = append(out, gin.H{"path": path, "since": at.Unix()})
 	}
 	return out
+}
+
+// cancelActiveGeneration 取消所有进行中的生成任务（杀 ffmpeg 进程），并清空进行中列表。
+// 同时递增代际，防止竞态下后登记的任务结果被误存。
+func cancelActiveGeneration() {
+	atomic.AddInt64(&thumbGenEpoch, 1)
+	thumbActiveMu.Lock()
+	for _, cancel := range thumbActiveCancel {
+		cancel()
+	}
+	thumbActiveCancel = map[string]context.CancelFunc{}
+	thumbActiveTasks = map[string]time.Time{}
+	thumbActiveMu.Unlock()
+}
+
+// thumbTaskCancelled 判断任务是否被暂停/清空取消（用于丢弃结果、不重试）
+func thumbTaskCancelled(genCtx context.Context, epoch int64) bool {
+	if genCtx != nil && genCtx.Err() != nil {
+		return true
+	}
+	return atomic.LoadInt64(&thumbGenEpoch) != epoch
 }
 
 func processTask(task thumbPrewarmTask) {
@@ -1020,14 +1090,20 @@ func processTask(task thumbPrewarmTask) {
 	atomic.AddInt32(&thumbActiveWorkers, 1)
 	defer atomic.AddInt32(&thumbActiveWorkers, -1)
 	defer thumbRelease()
+	epoch := atomic.LoadInt64(&thumbGenEpoch)
+	genCtx, cancel := context.WithCancel(context.Background())
 	thumbActiveTrack(task.rawPath, true)
-	defer thumbActiveTrack(task.rawPath, false)
+	thumbActiveCancelAdd(task.rawPath, cancel)
+	defer func() {
+		thumbActiveTrack(task.rawPath, false)
+		thumbActiveCancelDel(task.rawPath)
+	}()
 	// 生成任务硬限时 90s（115 驱动内部请求无超时，网盘风控黑洞时会永久挂起，
 	// 必须用 goroutine+select 强制放弃任务，保证 worker 永不卡死）
 	done := make(chan []byte, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		png, err := generateVideoThumb(context.Background(), task.rawPath, task.apiURL)
+		png, err := generateVideoThumb(genCtx, task.rawPath, task.apiURL)
 		if err != nil {
 			errCh <- err
 			return
@@ -1041,6 +1117,11 @@ func processTask(task thumbPrewarmTask) {
 	case err = <-errCh:
 	case <-time.After(90 * time.Second):
 		err = fmt.Errorf("thumb generation timeout (90s)")
+	}
+	// 暂停/清空队列导致的取消：丢弃结果、不缓存、不重试（可重新生成）
+	if thumbTaskCancelled(genCtx, epoch) {
+		prewarmDone.Delete(task.rawPath)
+		return
 	}
 	if err != nil {
 		// 生成失败不写 fail 标记（可能为网盘风控等临时问题），
@@ -1547,7 +1628,7 @@ func AudioThumb(c *gin.Context) {
 		if _, err := downloadRange(c.Request.Context(), link, tmpFile, 0, size, proxy, proxyNode); err != nil {
 			return nil, err
 		}
-		return extractAudioCover(tmpFile)
+		return extractAudioCover(c.Request.Context(), tmpFile)
 	})
 }
 

@@ -195,6 +195,8 @@ func ThumbStatus(c *gin.Context) {
 // 暂停缩略图生成队列：worker 停止取任务，已入队任务保留等待恢复。
 func ThumbQueuePause(c *gin.Context) {
 	thumbQueuePaused.Store(true)
+	// 取消进行中的生成（杀 ffmpeg），让"正在生成"立即停下并与顶部队列状态一致
+	cancelActiveGeneration()
 	common.SuccessResp(c, gin.H{"paused": true})
 }
 
@@ -210,9 +212,12 @@ func ThumbQueueResume(c *gin.Context) {
 // 之后重新点生成可再次入队。返回丢弃的任务数。
 func ThumbQueueClear(c *gin.Context) {
 	if prewarmCh == nil {
+		cancelActiveGeneration()
 		common.SuccessResp(c, gin.H{"dropped": 0})
 		return
 	}
+	// 先取消进行中的生成，再清空待处理队列
+	cancelActiveGeneration()
 	dropped := 0
 	for {
 		select {
