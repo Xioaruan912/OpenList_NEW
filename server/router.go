@@ -38,6 +38,7 @@ func Init(e *gin.Engine) {
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
 	go handles.StartThumbProxyAssign()
 	go handles.StartProxyHealthCheck()
+	go handles.StartGlobalProxyAssign()
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
 		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
@@ -196,6 +197,8 @@ func admin(g *gin.RouterGroup) {
 	proxy.POST("/delete", handles.DeleteProxyNode)
 	proxy.GET("/traffic", handles.ProxyTraffic)
 	proxy.GET("/install", handles.ProxyInstall)
+	proxy.GET("/policy", handles.GlobalProxyConfig)
+	proxy.POST("/policy", handles.GlobalProxySet)
 	proxy.POST("/enable", handles.ProxyEnable)
 
 	driver := g.Group("/driver")

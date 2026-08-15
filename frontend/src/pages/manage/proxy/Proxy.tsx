@@ -85,6 +85,14 @@ const emptyForm = () => ({
   remark: "",
 })
 
+type ProxyPolicy = {
+  mode: string
+  node_id: number
+  nodes?: ProxyNode[]
+  global_proxy_address: string
+  current: string
+}
+
 const Proxy = () => {
   useManageTitle("代理管理")
   const [nodes, setNodes] = createSignal<ProxyNode[]>([])
@@ -96,6 +104,8 @@ const Proxy = () => {
   const [installNode, setInstallNode] = createSignal<ProxyNode | null>(null)
   const [installCmd, setInstallCmd] = createSignal("")
   const [installLoading, setInstallLoading] = createSignal(false)
+  const [policy, setPolicy] = createSignal<ProxyPolicy>()
+  const [policyLoading, setPolicyLoading] = createSignal(false)
 
   const load = async () => {
     setLoading(true)
@@ -104,6 +114,24 @@ const Proxy = () => {
       handleResp(resp, (d) => setNodes((d as ProxyNode[]) || []))
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadPolicy = async () => {
+    const resp = await r.get("/admin/proxy/policy")
+    handleResp(resp, (d) => setPolicy(d as ProxyPolicy))
+  }
+
+  const savePolicy = async (mode: string, nodeID: number) => {
+    setPolicyLoading(true)
+    try {
+      const resp = await r.post("/admin/proxy/policy", { mode, node_id: nodeID })
+      handleResp(resp, (d) => {
+        setPolicy(d as ProxyPolicy)
+        notify.success(mode === "off" ? "已关闭全局代理" : "已保存全局代理策略")
+      })
+    } finally {
+      setPolicyLoading(false)
     }
   }
 
@@ -195,7 +223,11 @@ const Proxy = () => {
   }
 
   load()
-  const timer = setInterval(() => load(), 10000)
+  loadPolicy()
+  const timer = setInterval(() => {
+    load()
+    loadPolicy()
+  }, 10000)
   onCleanup(() => clearInterval(timer))
 
   const nodeAddress = (n: ProxyNode) =>
@@ -212,6 +244,76 @@ const Proxy = () => {
           节点用于 115 缩略图下载分散出口 IP；支持 http 与 ss（按 http 方式连接）代理
         </Text>
       </HStack>
+
+      {/* 全局代理策略 */}
+      <Box mt="$1" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
+        <HStack spacing="$2" alignItems="center" wrap="wrap">
+          <Text fontWeight="$medium">全局代理策略</Text>
+          <Tag colorScheme={!policy() || policy().mode === "off" ? "neutral" : policy().mode === "manual" ? "info" : "success"}>
+            {!policy() || policy().mode === "off"
+              ? "未启用（直连）"
+              : policy().mode === "manual"
+                ? "手动指定"
+                : "自动（仅风控时走代理）"}
+          </Tag>
+          <Show when={policy()?.current}>
+            <Tag colorScheme="success">当前生效：{policy()!.current}</Tag>
+          </Show>
+          <Show when={policy() && policy().mode !== "off" && !policy()!.current}>
+            <Tag colorScheme="warning">当前直连（无生效节点）</Tag>
+          </Show>
+        </HStack>
+        <HStack spacing="$2" alignItems="center" wrap="wrap" mt="$2">
+          <Button
+            size="xs"
+            colorScheme={policy()?.mode === "off" ? "accent" : "neutral"}
+            loading={policyLoading() && policy()?.mode !== "off"}
+            onClick={() => savePolicy("off", 0)}
+          >
+            关闭（直连）
+          </Button>
+          <Button
+            size="xs"
+            colorScheme={policy()?.mode === "auto" ? "accent" : "neutral"}
+            loading={policyLoading() && policy()?.mode !== "auto"}
+            onClick={() => savePolicy("auto", policy()?.node_id || 0)}
+          >
+            自动（仅风控时走代理）
+          </Button>
+          <Button
+            size="xs"
+            colorScheme={policy()?.mode === "manual" ? "accent" : "neutral"}
+            loading={policyLoading() && policy()?.mode !== "manual"}
+            onClick={() => savePolicy("manual", policy()?.node_id || 0)}
+          >
+            手动指定
+          </Button>
+          <Show when={policy()?.mode === "manual"}>
+            <Text fontSize="$sm" ml="$2">
+              节点
+            </Text>
+            <Box w="$full" maxW="280px">
+              <Select
+                value={String(policy()?.node_id || "")}
+                onChange={(v) => savePolicy("manual", parseInt(v))}
+              >
+                <SelectOptions
+                  options={(policy()?.nodes || [])
+                    .filter((n) => n.status !== "disabled")
+                    .map((n) => ({
+                      key: String(n.id),
+                      label: `${n.name}（${n.host}:${n.port}）`,
+                    }))}
+                />
+              </Select>
+            </Box>
+          </Show>
+          <Text fontSize="$xs" color="$neutral9">
+            控制 115 访问侧（列表/搜索/上传）出站代理；auto 模式检测到 115 风控时自动走健康节点，正常时直连。下载/播放仍走直连 CDN。
+          </Text>
+        </HStack>
+      </Box>
+
       <VStack spacing="$2" w="$full" direction="column">
         <For each={nodes()}>
           {(n) => (

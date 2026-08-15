@@ -18,9 +18,9 @@ type Addition struct {
 }
 
 // GetProxy 返回 115 驱动客户端（API 与上传）使用的代理：
-// 优先取缩略图模块维护的"上传代理"，未配置时回退到全局 proxy_address
+// 优先取"全局出站代理"（/@manage/proxy 全局代理策略），未配置时回退到全局 proxy_address
 func (a *Addition) GetProxy() string {
-	if px := op.GetThumbUploadProxy(); px != "" {
+	if px := op.GetGlobalProxy(); px != "" {
 		return px
 	}
 	return conf.Conf.ProxyAddress

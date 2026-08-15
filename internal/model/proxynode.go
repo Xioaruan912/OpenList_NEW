@@ -50,7 +50,7 @@ func (n *ProxyNode) IsUsable() bool {
 func (n *ProxyNode) Address() string {
 	scheme := "http"
 	host := n.Host
-	if n.Type == "socks5" {
+	if n.Type == "socks5" || n.Type == "ss" {
 		scheme = "socks5"
 	}
 	port := n.Port

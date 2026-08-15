@@ -202,6 +202,8 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ThumbChunkSize, Value: "3145728", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `video segment size (bytes) downloaded for thumbnail extraction, default 3MB`},
 		{Key: conf.ThumbWidth, Value: "288", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail width in pixels, default 288`},
 		{Key: conf.ThumbFailTTL, Value: "604800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `negative cache duration in seconds for failed cover/folder detection, default 7 days`},
+		{Key: conf.GlobalProxyMode, Value: "off", Type: conf.TypeSelect, Options: "off,auto,manual", Group: model.PREVIEW, Flag: model.PRIVATE, Help: `global outbound proxy mode: off (direct) / auto (use proxy only when 115 risk-control) / manual (always use selected node)`},
+		{Key: conf.GlobalProxyNode, Value: "0", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `global proxy node id for manual mode`},
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},

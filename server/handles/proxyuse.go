@@ -122,13 +122,11 @@ func pickLeastUsedNodes(nodes []model.ProxyNode) []model.ProxyNode {
 	return out
 }
 
-// refreshThumbProxyAssign 按当前模式重新指派"下载节点"与"上传节点"，
-// 并同步应用到 115 驱动客户端（上传侧）与 op 共享变量。
-// auto：下载=最不常用节点，上传=次不常用节点；
-// manual：下载=上传=指定节点；off：清空指派（走全局代理/直连）。
+// refreshThumbProxyAssign 按当前模式重新指派缩略图"下载节点"。
+// auto：下载=最不常用节点；manual：下载=指定节点；off：清空指派（走全局代理/直连）。
+// 注：115 驱动（API/上传）的出站代理由全局代理策略（/admin/proxy/policy）管理。
 func refreshThumbProxyAssign() {
 	mode := thumbProxyMode()
-	uploadAddr := ""
 	switch mode {
 	case thumbProxyModeManual:
 		id := thumbProxyNodeID()
@@ -140,7 +138,6 @@ func refreshThumbProxyAssign() {
 					thumbDownloadAddr = nodes[i].Address()
 					thumbDownloadID = nodes[i].ID
 					thumbAssignMu.Unlock()
-					uploadAddr = nodes[i].Address()
 					break
 				}
 			}
@@ -157,27 +154,11 @@ func refreshThumbProxyAssign() {
 			thumbDownloadAddr = ordered[0].Address()
 			thumbDownloadID = ordered[0].ID
 			thumbAssignMu.Unlock()
-			if len(ordered) >= 2 {
-				uploadAddr = ordered[1].Address()
-			} else {
-				uploadAddr = ordered[0].Address()
-			}
 		}
 	default: // off
 		thumbAssignMu.Lock()
 		thumbDownloadAddr, thumbDownloadID = "", 0
 		thumbAssignMu.Unlock()
-	}
-	op.SetThumbUploadProxy(uploadAddr)
-	applyUploadProxyToDrivers(uploadAddr)
-}
-
-// applyUploadProxyToDrivers 将上传代理应用到已加载的 115 驱动客户端
-func applyUploadProxyToDrivers(addr string) {
-	for _, drv := range op.GetAllStorages() {
-		if s, ok := drv.(interface{ SetUploadProxy(string) }); ok {
-			s.SetUploadProxy(addr)
-		}
 	}
 }
 
