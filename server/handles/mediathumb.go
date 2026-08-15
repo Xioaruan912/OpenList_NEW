@@ -698,6 +698,16 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		return
 	}
 
+	// 本地未命中：若网盘 _thumbnails 已有上传副本（如"上传→清空本地"场景），先恢复避免重复生成
+	if kind == thumbKindVideo {
+		if data, ok := tryRestoreRemoteThumb(c.Request.Context(), rawPath); ok {
+			_ = os.WriteFile(cachePath, data, 0o666)
+			thumbRecord(rawPath)
+			serveThumbPNG(c, data)
+			return
+		}
+	}
+
 	png, err := generate()
 	if err != nil {
 		if errors.Is(err, errThumbNoCover) {
@@ -1423,6 +1433,44 @@ func remoteThumbPath(addition interface {
 	ThumbFolderName() string
 }, rawPath string) string {
 	return stdpath.Dir(rawPath) + "/" + addition.ThumbFolderName() + "/" + remoteThumbName(rawPath)
+}
+
+// folderNameOnly 适配器：只需目录名的场景复用 loadRemoteThumbListing（无需 remote 模式）
+type folderNameOnly struct{ folder string }
+
+func (f folderNameOnly) ThumbFolderName() string { return f.folder }
+
+// tryRestoreRemoteThumb 本地模式视频缩略图未命中时，尝试从网盘 _thumbnails 恢复上传副本，
+// 避免"上传→清空本地→重新获取"时重复下载+ffmpeg 生成。恢复成功返回图片字节。
+func tryRestoreRemoteThumb(ctx context.Context, rawPath string) ([]byte, bool) {
+	if rawPath == "" {
+		return nil, false
+	}
+	dirPath := stdpath.Dir(rawPath)
+	folder := thumbFolderNameForPath(rawPath)
+	if folder == "" {
+		return nil, false
+	}
+	names := loadRemoteThumbListing(ctx, dirPath, folderNameOnly{folder})
+	if len(names) == 0 || !names[remoteThumbName(rawPath)] {
+		return nil, false
+	}
+	remotePath := stdpath.Join(dirPath, folder, remoteThumbName(rawPath))
+	obj, err := fs.Get(ctx, remotePath, &fs.GetArgs{NoLog: true})
+	if err != nil {
+		return nil, false
+	}
+	link, _, err := fs.Link(ctx, remotePath, model.LinkArgs{Header: thumbLinkHeader()})
+	if err != nil {
+		return nil, false
+	}
+	defer link.Close()
+	proxy, proxyNode := thumbProxyForPath(rawPath)
+	data, err := downloadRangeBytes(ctx, link, 0, obj.GetSize(), proxy, proxyNode)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 func remoteThumbCacheGet(rawPath string) ([]byte, bool) {
