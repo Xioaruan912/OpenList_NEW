@@ -44,14 +44,15 @@ except Exception:  # pragma: no cover
 
 
 class Stats(object):
-    def __init__(self, dev, window):
+    def __init__(self, dev, window, watch_port=0):
         self.dev = dev
         self.window = window
+        self.watch_port = watch_port
         self.uptime_start = time.time()
         self.history = []
         self._lock = threading.Lock()
         self._last = None
-        self._snap = {"rx": 0, "tx": 0, "conns": 0}
+        self._snap = {"rx": 0, "tx": 0, "conns": 0, "proxy_conns": 0}
 
     def _dev_bytes(self):
         """返回 (总接收字节, 总发送字节)；dev=None 时统计所有网卡总和"""
@@ -74,8 +75,9 @@ class Stats(object):
             pass
         return rx, tx
 
-    def _conns(self):
+    def _conns(self, watch_port=0):
         n = 0
+        pn = 0
         for p in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
                 with open(p, "r") as f:
@@ -84,13 +86,20 @@ class Stats(object):
                         cols = line.split()
                         if len(cols) > 3 and cols[3] == "01":
                             n += 1
+                            if watch_port:
+                                try:
+                                    local = int(cols[1].split(":")[1], 16)
+                                    if local == watch_port:
+                                        pn += 1
+                                except (ValueError, IndexError):
+                                    pass
             except Exception:
                 pass
-        return n
+        return n, pn
 
     def sample(self):
         rx, tx = self._dev_bytes()
-        conns = self._conns()
+        conns, proxy_conns = self._conns(self.watch_port)
         with self._lock:
             now = time.time()
             rate_rx = rate_tx = 0
@@ -107,6 +116,7 @@ class Stats(object):
                 "rx_rate": rate_rx,
                 "tx_rate": rate_tx,
                 "conns": conns,
+                "proxy_conns": proxy_conns,
                 "time": now,
             }
 
@@ -121,11 +131,12 @@ def main():
     ap.add_argument("--token", default="")
     ap.add_argument("--dev", default="")
     ap.add_argument("--window", type=int, default=60)
+    ap.add_argument("--watch-port", type=int, default=0)
     ap.add_argument("--admin-ip", default="127.0.0.0/8")
     args = ap.parse_args()
 
     token = args.token or rand_hex(16)
-    stats = Stats(args.dev or None, args.window)
+    stats = Stats(args.dev or None, args.window, args.watch_port)
     allowed = ipaddress.ip_network(args.admin_ip, strict=False)
     stats.sample()
 
@@ -181,6 +192,7 @@ def main():
                 "rx_rate": s["rx_rate"],
                 "tx_rate": s["tx_rate"],
                 "conns": s["conns"],
+                "proxy_conns": s["proxy_conns"],
             })
 
     def sampler():

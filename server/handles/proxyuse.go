@@ -204,11 +204,11 @@ func nodeRateSnapshot(nodeID uint) (rx, tx int64, rxRate, txRate, conns int64) {
 
 // ThumbProxyConfigResp GET /admin/thumb/proxy
 type ThumbProxyConfigResp struct {
-	Mode             string               `json:"mode"`
-	NodeID           uint                 `json:"node_id"`
-	Effective        *ProxyNodeEffective  `json:"effective,omitempty"`
-	Nodes            []ProxyNodeTrafficEx `json:"nodes"`
-	GlobalProxy      string               `json:"global_proxy_address"`
+	Mode        string               `json:"mode"`
+	NodeID      uint                 `json:"node_id"`
+	Effective   *ProxyNodeEffective  `json:"effective,omitempty"`
+	Nodes       []ProxyNodeTrafficEx `json:"nodes"`
+	GlobalProxy string               `json:"global_proxy_address"`
 }
 
 // ProxyNodeEffective 当前生效的代理节点
@@ -222,12 +222,13 @@ type ProxyNodeEffective struct {
 // ProxyNodeTrafficEx 节点 + 实时流量/风控状态
 type ProxyNodeTrafficEx struct {
 	model.ProxyNode
-	IsRisk  bool  `json:"is_risk"`
-	RXRate  int64 `json:"rx_rate"` // B/s
-	TXRate  int64 `json:"tx_rate"`
-	Conns   int64 `json:"conns"`
-	WindowRX int64 `json:"window_rx"`
-	WindowTX int64 `json:"window_tx"`
+	IsRisk   bool            `json:"is_risk"`
+	RXRate   int64           `json:"rx_rate"` // B/s
+	TXRate   int64           `json:"tx_rate"`
+	Conns    int64           `json:"conns"`
+	WindowRX int64           `json:"window_rx"`
+	WindowTX int64           `json:"window_tx"`
+	Agent    *ProxyNodeAgent `json:"agent,omitempty"` // 节点探针（trafficd）上报
 }
 
 func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
@@ -236,7 +237,8 @@ func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
 		return nil
 	}
 	out := make([]ProxyNodeTrafficEx, 0, len(nodes))
-	for _, n := range nodes {
+	for i := range nodes {
+		n := nodes[i]
 		item := ProxyNodeTrafficEx{ProxyNode: n}
 		wrx, wtx, rxRate, txRate, conns := nodeRateSnapshot(n.ID)
 		item.WindowRX = wrx
@@ -247,6 +249,20 @@ func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
 		item.IsRisk = n.IsRisk()
 		out = append(out, item)
 	}
+	// 并行拉取各节点探针（trafficd）；每个 goroutine 只写自己的下标，无竞争
+	var wg sync.WaitGroup
+	for i := range out {
+		n := out[i]
+		if n.TrafficPort <= 0 || n.Token == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			out[idx].Agent = fetchNodeAgent(n.ID, n.Host, n.TrafficPort, n.Token)
+		}(i)
+	}
+	wg.Wait()
 	return out
 }
 
@@ -291,11 +307,7 @@ func ThumbProxySet(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	if req.Mode == thumbProxyModeManual {
-		if req.NodeID == 0 {
-			common.ErrorStrResp(c, "manual mode requires node_id", 400)
-			return
-		}
+	if req.Mode == thumbProxyModeManual && req.NodeID != 0 {
 		if _, err := db.GetProxyNodeById(req.NodeID); err != nil {
 			common.ErrorStrResp(c, "proxy node not found", 400)
 			return

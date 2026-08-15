@@ -121,6 +121,9 @@ func Init(e *gin.Engine) {
 	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
 	public.Any("/archive_extensions", handles.ArchiveExtensions)
 
+	// 代理节点一键部署脚本（供节点 VPS curl | bash 使用，无需登录）
+	api.GET("/proxy/install.sh", handles.ProxyInstallScript)
+
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
@@ -184,6 +187,7 @@ func admin(g *gin.RouterGroup) {
 	proxy.POST("/update", handles.UpdateProxyNode)
 	proxy.POST("/delete", handles.DeleteProxyNode)
 	proxy.GET("/traffic", handles.ProxyTraffic)
+	proxy.GET("/install", handles.ProxyInstall)
 	proxy.POST("/recover", handles.ProxyRecover)
 	proxy.POST("/enable", handles.ProxyEnable)
 

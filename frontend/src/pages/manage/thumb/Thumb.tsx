@@ -405,6 +405,18 @@ const Thumb = () => {
     }
   }
 
+  // 切换到手动指定：无有效节点时自动选第一个可用节点，没有节点则提示先去代理管理页添加
+  const selectManual = () => {
+    const usable = (pxCfg()?.nodes || []).filter((n) => n.status !== "disabled")
+    if (!usable.length) {
+      notify.warning("暂无可用代理节点，请先在「代理管理」页添加节点")
+      return
+    }
+    const cur = pxCfg()?.node_id || 0
+    const pick = usable.some((n) => n.id === cur) ? cur : usable[0].id
+    saveProxy("manual", pick)
+  }
+
   const recoverNode = async (id: number) => {
     const resp = await r.post("/admin/proxy/recover", { id })
     handleResp(resp, () => {
@@ -506,8 +518,6 @@ const Thumb = () => {
   }, 10000)
   onCleanup(() => clearInterval(timer))
 
-  const proxyCfg = pxCfg()
-
   return (
     <VStack spacing="$3" alignItems="start" w="$full">
       <HStack spacing="$2" gap="$2" w="$full" wrap={{ "@initial": "wrap", "@md": "unset" }}>
@@ -551,21 +561,21 @@ const Thumb = () => {
           <Text fontWeight="$medium">缩略图代理</Text>
           <Tag
             colorScheme={
-              !proxyCfg || proxyCfg.mode === "off" ? "neutral" : proxyCfg.mode === "manual" ? "info" : "success"
+              !pxCfg() || pxCfg().mode === "off" ? "neutral" : pxCfg().mode === "manual" ? "info" : "success"
             }
           >
-            {!proxyCfg || proxyCfg.mode === "off"
+            {!pxCfg() || pxCfg().mode === "off"
               ? "未启用"
-              : proxyCfg.mode === "manual"
+              : pxCfg().mode === "manual"
                 ? "手动指定"
                 : "自动切换"}
           </Tag>
-          <Show when={proxyCfg?.effective}>
+          <Show when={pxCfg()?.effective}>
             <Tag colorScheme="success">
-              生效：{proxyCfg!.effective!.name}（{proxyCfg!.effective!.address}）
+              生效：{pxCfg()!.effective!.name}（{pxCfg()!.effective!.address}）
             </Tag>
           </Show>
-          <Show when={!proxyCfg?.effective && proxyCfg && proxyCfg.mode !== "off"}>
+          <Show when={!pxCfg()?.effective && pxCfg() && pxCfg().mode !== "off"}>
             <Tag colorScheme="warning">暂无可用节点</Tag>
           </Show>
         </HStack>
@@ -578,39 +588,37 @@ const Thumb = () => {
           <Text fontSize="$sm">模式</Text>
           <Button
             size="xs"
-            colorScheme={proxyCfg?.mode === "off" ? "accent" : "neutral"}
+            colorScheme={pxCfg()?.mode === "off" ? "accent" : "neutral"}
             onClick={() => saveProxy("off", 0)}
           >
             关闭（走全局代理）
           </Button>
           <Button
             size="xs"
-            colorScheme={proxyCfg?.mode === "auto" ? "accent" : "neutral"}
-            onClick={() => saveProxy("auto", proxyCfg?.node_id || 0)}
+            colorScheme={pxCfg()?.mode === "auto" ? "accent" : "neutral"}
+            onClick={() => saveProxy("auto", pxCfg()?.node_id || 0)}
           >
             自动切换
           </Button>
           <Button
             size="xs"
-            colorScheme={proxyCfg?.mode === "manual" ? "accent" : "neutral"}
-            onClick={() =>
-              saveProxy("manual", proxyCfg?.node_id || proxyCfg?.nodes?.[0]?.id || 0)
-            }
+            colorScheme={pxCfg()?.mode === "manual" ? "accent" : "neutral"}
+            onClick={selectManual}
           >
             手动指定
           </Button>
-          <Show when={proxyCfg?.mode === "manual"}>
+          <Show when={pxCfg()?.mode === "manual"}>
             <Text fontSize="$sm" ml="$2">
               节点
             </Text>
             <Box w="$full" maxW="260px">
               <Select
                 id="thumb-proxy-node"
-                value={String(proxyCfg?.node_id || "")}
+                value={String(pxCfg()?.node_id || "")}
                 onChange={(v) => saveProxy("manual", parseInt(v))}
               >
                 <SelectOptions
-                  options={(proxyCfg?.nodes || [])
+                  options={(pxCfg()?.nodes || [])
                     .filter((n) => n.status !== "disabled")
                     .map((n) => ({
                       key: String(n.id),
@@ -620,15 +628,15 @@ const Thumb = () => {
               </Select>
             </Box>
           </Show>
-          <Show when={proxyCfg?.global_proxy_address}>
+          <Show when={pxCfg()?.global_proxy_address}>
             <Text fontSize="$sm" color="$neutral9">
-              全局代理：{proxyCfg!.global_proxy_address}
+              全局代理：{pxCfg()!.global_proxy_address}
             </Text>
           </Show>
         </HStack>
-        <Show when={(proxyCfg?.nodes || []).length > 0}>
+        <Show when={(pxCfg()?.nodes || []).length > 0}>
           <Box mt="$2" maxH="260px" overflowY="auto" rounded="$md" border="1px solid $neutral6" p="$1">
-            <For each={proxyCfg!.nodes}>
+            <For each={pxCfg()!.nodes}>
               {(n) => (
                 <HStack
                   spacing="$2"

@@ -150,11 +150,19 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bas
 
 > 说明：OpenList 端仅消费 `http://` / `socks5://` 代理（Go 标准库）。如果你希望用 `ss` 协议，请用下方脚本部署，脚本会自动额外开放一个 HTTP 端口供 OpenList 使用。
 
-#### 一键部署代理脚本
+#### 一键部署代理脚本（管理后台「复制安装命令」）
 
 仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理服务部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）。
 
-**在代理 VPS 上直接执行**：
+**推荐方式：管理后台「代理管理」页**新增节点后，点节点上的「安装命令」按钮，复制生成的命令，在节点 VPS 上以 root 执行即可自动完成部署：
+
+```bash
+curl -fsSL http://<OpenList地址>/api/proxy/install.sh | bash -s -- --type http --port 1080 --password 你的密码 --traffic-port 9386 --traffic-token 你的token
+```
+
+命令由服务端根据节点配置自动生成（`/api/admin/proxy/install`），安装命令里的部署脚本也由 OpenList 服务直接下发（公开接口 `/api/proxy/install.sh`，无需登录），因此**不依赖 GitHub 可达性**。部署完成后约 10 秒，代理管理页节点会显示「探针在线」，即可在页面查看实时速率、代理连接数与累计流量。
+
+也可以从 GitHub 手动获取脚本执行：
 
 ```bash
 # http 代理（OpenList 直接使用）
@@ -163,7 +171,7 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/pr
 
 # ss 代理（自动补一个 http 端口供 OpenList 用）
 curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/proxy_deploy.sh \
-  | bash -s -- --type ss --port 8388 --password 你的密码 --http-port 1080
+  | bash -s -- --type ss --port 8388 --password 你的密码 --http-port 2080
 ```
 
 脚本自动完成：root 检查 → 检测架构下载 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 注册 systemd 服务并开机自启（无 systemd 的环境自动回退 nohup 后台运行）→ 输出部署摘要与 OpenList 填法。
@@ -194,7 +202,7 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/pr
 #### 流量统计
 
 - **OpenList 侧**：节点累计流量（rx/tx）与实时速率由 OpenList 自身统计，**只统计经该代理节点的缩略图下载流量**，并非 VPS 整机流量。管理后台「代理管理」页可查看每个节点的状态、风控、实时速率与累计流量。
-- **trafficd（可选）**：`scripts/proxy/` 内置的零依赖流量统计服务（`/proc/net/dev` 差值 + `/proc/net/tcp` 连接数，`GET /stats?token=xxx` 带网段白名单），统计的是**代理 VPS 整机网卡流量**，仅用于命令行 `./proxy_status.sh --host ... --traffic-token ...` 查看，管理后台不再依赖它。
+- **trafficd 探针（可选）**：`scripts/proxy/` 内置的零依赖流量统计服务（`/proc/net/dev` 差值 + `/proc/net/tcp` 连接数，`GET /stats?token=xxx` 带网段白名单）。安装命令默认一并部署，OpenList 会周期性拉取其**主机名、运行时长与代理端口连接数（`--watch-port`）**用于探针在线状态展示；整机网卡字节数不纳入管理后台的代理流量统计。
 
 管理后台 API：
 
@@ -204,10 +212,12 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/pr
 | `/api/admin/proxy/create` | POST | 新增节点 |
 | `/api/admin/proxy/update` | POST | 更新节点 |
 | `/api/admin/proxy/delete` | POST | 删除节点 |
-| `/api/admin/proxy/traffic` | GET | 节点列表 + OpenList 侧统计（累计 rx/tx、实时速率、连接数、风控状态） |
+| `/api/admin/proxy/install` | GET | 根据节点生成一键部署命令（自动补全 trafficd 端口/token） |
+| `/api/admin/proxy/traffic` | GET | 节点列表 + OpenList 侧统计（累计 rx/tx、实时速率、连接数、风控状态）+ 探针在线状态 |
 | `/api/admin/proxy/recover` | POST | 手动解除节点风控 |
 | `/api/admin/proxy/enable` | POST | 启用/停用节点 |
 | `/api/admin/thumb/proxy` | GET/POST | 读取/保存缩略图代理选择（mode: off/auto/manual + node_id） |
+| `/api/proxy/install.sh` | GET | 公开下发部署脚本（无需登录，供 `curl \| bash` 使用） |
 
 ## 快速部署
 

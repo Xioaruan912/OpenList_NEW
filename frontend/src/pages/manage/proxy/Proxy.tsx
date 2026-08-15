@@ -47,6 +47,13 @@ type ProxyNode = {
   conns: number
   window_rx: number
   window_tx: number
+  agent?: {
+    hostname: string
+    uptime: number
+    conns: number
+    proxy_conns: number
+    at: number
+  }
 }
 
 const fmtBytes = (n: number) => {
@@ -77,6 +84,9 @@ const Proxy = () => {
   const [editing, setEditing] = createSignal(false)
   const [form, setForm] = createSignal(emptyForm())
   const [saving, setSaving] = createSignal(false)
+  const [installNode, setInstallNode] = createSignal<ProxyNode | null>(null)
+  const [installCmd, setInstallCmd] = createSignal("")
+  const [installLoading, setInstallLoading] = createSignal(false)
 
   const load = async () => {
     setLoading(true)
@@ -156,6 +166,33 @@ const Proxy = () => {
     })
   }
 
+  const openInstall = async (n: ProxyNode) => {
+    setInstallLoading(true)
+    try {
+      const resp = await r.get(`/admin/proxy/install?id=${n.id}`)
+      handleResp(resp, (d: any) => {
+        setInstallCmd(d.command)
+        setInstallNode(n)
+      })
+    } finally {
+      setInstallLoading(false)
+    }
+  }
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      const ta = document.createElement("textarea")
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand("copy")
+      document.body.removeChild(ta)
+    }
+    notify.success("已复制到剪贴板")
+  }
+
   load()
   const timer = setInterval(() => load(), 10000)
   onCleanup(() => clearInterval(timer))
@@ -215,16 +252,27 @@ const Proxy = () => {
                   {Math.max(0, Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000))} 分钟后恢复
                 </Tag>
               </Show>
+              <Show when={n.agent}>
+                <Tag colorScheme="success">探针在线</Tag>
+              </Show>
               <Text fontSize="$xs" color="$neutral9" css={{ "text-align": "right" }}>
                 收 {fmtBytes(n.total_rx)} · 发 {fmtBytes(n.total_tx)}
                 <br />
                 速率 {fmtBytes(n.rx_rate)}/s · 连接 {n.conns}
+                <Show when={n.agent}>
+                  <br />
+                  探针 {n.agent!.hostname} · 代理连接 {n.agent!.proxy_conns} · 运行
+                  {Math.floor(n.agent!.uptime / 3600)}h
+                </Show>
               </Text>
               <Show when={n.is_risk}>
                 <Button size="xs" colorScheme="warning" onClick={() => recover(n.id)}>
                   解除风控
                 </Button>
               </Show>
+              <Button size="xs" onClick={() => openInstall(n)} loading={installLoading()}>
+                安装命令
+              </Button>
               <Button
                 size="xs"
                 onClick={() => setStatus(n, n.status === "disabled" ? "normal" : "disabled")}
@@ -322,6 +370,52 @@ const Proxy = () => {
               {editing() ? "保存" : "添加"}
             </Button>
           </ModalFooter>
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        opened={!!installNode()}
+        onClose={() => setInstallNode(null)}
+        size={{ "@initial": "xs", "@md": "md" }}
+      >
+        <ModalOverlay />
+        <ModalContent>
+          <ModalHeader>部署节点 {installNode()?.name}</ModalHeader>
+          <ModalCloseButton />
+          <ModalBody>
+            <VStack spacing="$3" alignItems="start" w="$full">
+              <Text fontSize="$sm" color="$neutral10">
+                在节点 VPS 上以 root 执行以下命令，自动安装 gost 代理与流量探针（systemd 托管）：
+              </Text>
+              <Box
+                w="$full"
+                p="$3"
+                rounded="$md"
+                border="1px solid $neutral6"
+                background={useColorModeValue("$neutral1", "$neutral2")()}
+                css={{
+                  "font-family": "monospace",
+                  "font-size": "$xs",
+                  "word-break": "break-all",
+                  "white-space": "pre-wrap",
+                  "max-height": "200px",
+                  overflow: "auto",
+                }}
+              >
+                {installCmd()}
+              </Box>
+              <Button
+                colorScheme="accent"
+                onClick={() => copyText(installCmd())}
+                disabled={!installCmd()}
+              >
+                复制命令
+              </Button>
+              <Text fontSize="$sm" color="$neutral10">
+                部署完成后，回到本页等待约 10 秒，节点状态将变为「探针在线」，即可在下方查看实时速率、连接数与累计流量；缩略图下载会自动选用健康节点。
+              </Text>
+            </VStack>
+          </ModalBody>
         </ModalContent>
       </Modal>
     </VStack>
