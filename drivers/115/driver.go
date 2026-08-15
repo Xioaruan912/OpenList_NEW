@@ -306,6 +306,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	// note that 115 add timeout for rapid-upload,
 	// and "sig invalid" err is thrown even when the hash is correct after timeout.
 	if fastInfo, err = d.rapidUpload(stream.GetSize(), stream.GetName(), dirID, preHash, fullHash, stream); err != nil {
+		MarkUploadError(d.GetStorage().MountPath, err)
 		return nil, err
 	}
 	if matched, err := fastInfo.Ok(); err != nil {
@@ -322,11 +323,13 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	// 闪传失败，上传
 	if stream.GetSize() <= 10*utils.MB { // 文件大小小于10MB，改用普通模式上传
 		if uploadResult, err = d.UploadByOSS(ctx, &fastInfo.UploadOSSParams, stream, dirID, up); err != nil {
+			MarkUploadError(d.GetStorage().MountPath, err)
 			return nil, err
 		}
 	} else {
 		// 分片上传
 		if uploadResult, err = d.UploadByMultipart(ctx, &fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID, up); err != nil {
+			MarkUploadError(d.GetStorage().MountPath, err)
 			return nil, err
 		}
 	}

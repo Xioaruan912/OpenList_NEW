@@ -78,6 +78,53 @@ func IsStorageBlocked(mount string) bool {
 	return true
 }
 
+// 上传风控连续失败检测：上传被 115 拒绝（如 990005 "非法参数错误"，115 用通用
+// 参数错误掩盖上传限流）连续出现时标记存储风控，让上传队列自动降速（20/5s），
+// 给账号冷却空间，避免继续满速打加重风控。
+var uploadRiskFails = map[string][]time.Time{} // mount -> 最近上传风控失败时间
+
+const (
+	uploadRiskWindow    = 2 * time.Minute
+	uploadRiskThreshold = 3
+)
+
+// isUploadRiskError 判断是否为上传侧风控错误
+func isUploadRiskError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "990005") || strings.Contains(msg, "非法参数错误")
+}
+
+// MarkUploadError 上传失败时调用：记录健康信息并累计上传风控失败，
+// 窗口内达到阈值则标记风控（上传队列降速、目录上传暂缓）。
+func MarkUploadError(mount string, err error) {
+	if err == nil {
+		return
+	}
+	MarkStorageError(mount, err)
+	if !isUploadRiskError(err) {
+		return
+	}
+	now := time.Now()
+	healthMu.Lock()
+	defer healthMu.Unlock()
+	list := uploadRiskFails[mount][:0]
+	for _, t := range uploadRiskFails[mount] {
+		if now.Sub(t) < uploadRiskWindow {
+			list = append(list, t)
+		}
+	}
+	list = append(list, now)
+	if len(list) >= uploadRiskThreshold {
+		blocked[mount] = now
+		uploadRiskFails[mount] = nil
+	} else {
+		uploadRiskFails[mount] = list
+	}
+}
+
 // GetStorageHealth 读取存储健康状态
 func GetStorageHealth(mount string) (HealthEntry, bool) {
 	healthMu.Lock()
