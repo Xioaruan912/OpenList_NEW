@@ -152,9 +152,9 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bas
 
 #### 一键部署代理脚本
 
-仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理与流量统计服务（trafficd）部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）。
+仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理服务部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）。
 
-**在代理 VPS 上直接执行**（与根目录 `install.sh` 同样的一键方式，脚本自带 trafficd，无需额外文件）：
+**在代理 VPS 上直接执行**：
 
 ```bash
 # http 代理（OpenList 直接使用）
@@ -166,7 +166,7 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/pr
   | bash -s -- --type ss --port 8388 --password 你的密码 --http-port 1080
 ```
 
-脚本自动完成：root 检查 → 检测架构下载 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 部署 trafficd 统计服务 → 注册 systemd 服务并开机自启（无 systemd 的环境自动回退 nohup 后台运行）→ 输出部署摘要与 OpenList 填法。
+脚本自动完成：root 检查 → 检测架构下载 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 注册 systemd 服务并开机自启（无 systemd 的环境自动回退 nohup 后台运行）→ 输出部署摘要与 OpenList 填法。
 
 可选参数：
 
@@ -176,32 +176,38 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/scripts/proxy/pr
 | `--port` | 1080 | 代理端口 |
 | `--password` | 自动生成 | 代理密码（自动生成时会在输出中打印） |
 | `--http-port` | 端口+1000 | ss 模式下供 OpenList 使用的 http 端口 |
-| `--traffic-port` | 9386 | trafficd 统计服务端口 |
+| `--traffic-port` | 9386 | （可选）trafficd 统计服务端口 |
 | `--traffic-token` | 自动生成 | 统计鉴权 token（自动生成时会在输出中打印） |
 | `--admin-ip` | 0.0.0.0/0 | 允许访问流量统计的网段（建议限定为 OpenList 服务器公网 IP） |
 | `--dev` | 空 | 只统计指定网卡（如 eth0），默认统计全部网卡 |
-| `--no-trafficd` | 关 | 不部署流量统计 |
+| `--no-trafficd` | 关 | 不部署流量统计（默认仍部署，仅供命令行查看，管理后台不再依赖） |
 | `--dry-run` | 关 | 只打印将执行的命令，不实际部署 |
 
-#### 流量查看
+#### 缩略图代理选择（管理后台）
 
-部署后有两种查看方式：
+在「缩略图管理」页可选择缩略图下载走哪个代理节点（**只作用于缩略图请求**，不影响 115 API / 列表请求）：
 
-1. **命令行**：`./proxy_status.sh --host ... --traffic-token ...` 显示累计流量、实时速率、连接数、运行时长。
-2. **管理后台**：侧边栏「代理管理与流量监控」（`/api/admin/proxy` 独立页），可新增/编辑/删除代理节点，一键刷新实时流量。
+- **关闭（走全局代理）**：缩略图走存储代理或全局 `proxy_address`（默认）。
+- **自动切换**：自动选择一个健康节点（最近最少使用），某节点连续失败 ≥3 次自动标记**风控**并切换其他节点，30 分钟后自动恢复；可在代理管理页手动「解除风控」。
+- **手动指定**：固定走指定节点；该节点不可用（风控/停用）时自动回退到任一健康节点。
+
+#### 流量统计
+
+- **OpenList 侧**：节点累计流量（rx/tx）与实时速率由 OpenList 自身统计，**只统计经该代理节点的缩略图下载流量**，并非 VPS 整机流量。管理后台「代理管理」页可查看每个节点的状态、风控、实时速率与累计流量。
+- **trafficd（可选）**：`scripts/proxy/` 内置的零依赖流量统计服务（`/proc/net/dev` 差值 + `/proc/net/tcp` 连接数，`GET /stats?token=xxx` 带网段白名单），统计的是**代理 VPS 整机网卡流量**，仅用于命令行 `./proxy_status.sh --host ... --traffic-token ...` 查看，管理后台不再依赖它。
 
 管理后台 API：
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/admin/proxy` | GET | 代理管理页（独立 HTML，不依赖前端构建产物） |
 | `/api/admin/proxy/list` | GET | 节点列表 |
 | `/api/admin/proxy/create` | POST | 新增节点 |
 | `/api/admin/proxy/update` | POST | 更新节点 |
 | `/api/admin/proxy/delete` | POST | 删除节点 |
-| `/api/admin/proxy/traffic` | GET | 批量查询各节点实时流量（rx/tx 累计与速率、连接数、运行时长） |
-
-流量统计由部署在代理 VPS 上的 **trafficd** 提供（已内置在 `proxy_deploy.sh` 中，零依赖纯 Python 标准库）：通过 `/proc/net/dev` 差值统计累计流量与实时速率、`/proc/net/tcp` 统计当前连接数；`GET /stats?token=xxx` 返回 JSON，带网段白名单与 token 鉴权。
+| `/api/admin/proxy/traffic` | GET | 节点列表 + OpenList 侧统计（累计 rx/tx、实时速率、连接数、风控状态） |
+| `/api/admin/proxy/recover` | POST | 手动解除节点风控 |
+| `/api/admin/proxy/enable` | POST | 启用/停用节点 |
+| `/api/admin/thumb/proxy` | GET/POST | 读取/保存缩略图代理选择（mode: off/auto/manual + node_id） |
 
 ## 快速部署
 

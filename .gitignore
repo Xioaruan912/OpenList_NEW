@@ -3,6 +3,11 @@
 output/
 /dist/
 
+# 前端编译产物不入库（源码见 frontend/）
+/public/dist/
+/frontend/node_modules/
+/frontend/dist/
+
 # Binaries for programs and plugins
 *.exe
 *.exe~

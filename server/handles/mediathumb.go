@@ -230,23 +230,42 @@ func thumbLinkHeader() http.Header {
 	}
 }
 
-// proxyForPath 解析指定路径所属存储的代理配置：优先存储级（Addition.GetProxy），
-// 为空则回退到全局 proxy_address，两者皆空返回空串（走系统默认网络）
-func proxyForPath(rawPath string) string {
-	if rawPath == "" {
-		return conf.Conf.ProxyAddress
-	}
-	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
-	if err != nil {
-		return conf.Conf.ProxyAddress
-	}
-	if p, ok := storage.GetAddition().(interface{ GetProxy() string }); ok {
-		if px := p.GetProxy(); px != "" {
-			return px
+// thumbProxyForPath 解析缩略图请求代理：
+//   1) 用户在缩略图页选择的代理节点（off/auto/manual，manual 节点风控时自动切健康节点）
+//   2) 存储级显式代理 / 全局 proxy_address（模式为 off 时走这里）
+// 返回 (代理地址, 代理节点ID)；nodeID=0 表示未走代理节点
+func thumbProxyForPath(rawPath string) (string, uint) {
+	if thumbProxyMode() != thumbProxyModeOff {
+		if addr, nodeID := resolveThumbProxy(); addr != "" {
+			return addr, nodeID
 		}
 	}
-	return conf.Conf.ProxyAddress
+	if rawPath != "" {
+		storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+		if err == nil {
+			if p, ok := storage.GetAddition().(interface{ GetProxy() string }); ok {
+				if px := p.GetProxy(); px != "" {
+					return px, 0
+				}
+			}
+		}
+	}
+	return conf.Conf.ProxyAddress, 0
 }
+
+// countingReadCloser 统计通过代理节点读取的字节数
+type countingReadCloser struct {
+	rc io.ReadCloser
+	n  int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error { return c.rc.Close() }
 
 // newThumbHTTPClient 构建缩略图下载用的 HTTP client，proxy 非空时走指定代理
 func newThumbHTTPClient(proxy string, timeout time.Duration) *http.Client {
@@ -263,8 +282,15 @@ func newThumbHTTPClient(proxy string, timeout time.Duration) *http.Client {
 }
 
 // downloadRange 从链接读取 [offset, offset+limit) 字节到本地：
-// 优先使用驱动提供的 RangeReader（本地/流式驱动），否则用 Range 请求下载（proxy 非空时走代理）
-func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset, limit int64, proxy string) (int64, error) {
+// 优先使用驱动提供的 RangeReader（本地/流式驱动），否则用 Range 请求下载（proxy 非空时走代理）。
+// nodeID 非 0 时统计该代理节点的接收字节（OpenList 侧"走代理的流量"），失败触发风控自动切换。
+func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset, limit int64, proxy string, nodeID uint) (int64, error) {
+	// 连接计数：仅在通过代理节点发起 HTTP 请求时
+	useNode := nodeID != 0 && link.RangeReader == nil
+	if useNode {
+		proxyConnAdd(nodeID)
+		defer proxyConnDel(nodeID)
+	}
 	var (
 		rc  io.ReadCloser
 		err error
@@ -288,20 +314,36 @@ func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset
 		client := newThumbHTTPClient(proxy, 90*time.Second)
 		resp, err := client.Do(req)
 		if err != nil {
+			recordProxyFailure(nodeID)
 			return 0, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			recordProxyFailure(nodeID)
 			return 0, fmt.Errorf("download failed: %d %s", resp.StatusCode, resp.Status)
 		}
 		rc = resp.Body
+	}
+	if useNode {
+		rc = &countingReadCloser{rc: rc}
 	}
 	f, err := os.Create(dstPath)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	return io.Copy(f, rc)
+	n, cpErr := io.Copy(f, rc)
+	if cpErr != nil {
+		recordProxyFailure(nodeID)
+		return n, cpErr
+	}
+	if useNode {
+		if c := rc.(*countingReadCloser); c.n > 0 {
+			recordProxyUse(nodeID, c.n, 0)
+			recordProxySuccess(nodeID)
+		}
+	}
+	return n, nil
 }
 
 // extractVideoFrame 从本地视频文件抽帧（-ss 3 失败回退 0s）
@@ -649,7 +691,13 @@ var thumbPlaceholderPNG = []byte{
 }
 
 // downloadRangeBytes 从链接读取 [offset, offset+limit) 字节返回
-func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int64, proxy string) ([]byte, error) {
+// nodeID 非 0 时统计该代理节点的接收字节，失败触发风控自动切换
+func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int64, proxy string, nodeID uint) ([]byte, error) {
+	useNode := nodeID != 0 && link.RangeReader == nil
+	if useNode {
+		proxyConnAdd(nodeID)
+		defer proxyConnDel(nodeID)
+	}
 	var (
 		rc  io.ReadCloser
 		err error
@@ -673,10 +721,12 @@ func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int
 		client := newThumbHTTPClient(proxy, 30*time.Second)
 		resp, err := client.Do(req)
 		if err != nil {
+			recordProxyFailure(nodeID)
 			return nil, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			recordProxyFailure(nodeID)
 			return nil, fmt.Errorf("download failed: %d %s", resp.StatusCode, resp.Status)
 		}
 		rc = resp.Body
@@ -686,7 +736,21 @@ func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int
 			_ = rc.Close()
 		}
 	}()
-	return io.ReadAll(io.LimitReader(rc, limit))
+	var cr *countingReadCloser
+	if useNode {
+		cr = &countingReadCloser{rc: rc}
+		rc = cr
+	}
+	data, rdErr := io.ReadAll(io.LimitReader(rc, limit))
+	if rdErr != nil {
+		recordProxyFailure(nodeID)
+		return nil, rdErr
+	}
+	if useNode && cr.n > 0 {
+		recordProxyUse(nodeID, cr.n, 0)
+		recordProxySuccess(nodeID)
+	}
+	return data, nil
 }
 
 // moov 探测结果缓存（moov 位置不变，24h 内复用，省一次 Range 请求）
@@ -714,7 +778,8 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath strin
 	if size < tailLen {
 		return false
 	}
-	data, err := downloadRangeBytes(ctx, link, size-tailLen, tailLen, proxyForPath(rawPath))
+	proxy, proxyNode := thumbProxyForPath(rawPath)
+	data, err := downloadRangeBytes(ctx, link, size-tailLen, tailLen, proxy, proxyNode)
 	if err != nil {
 		return false
 	}
@@ -746,7 +811,7 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 		return nil, err
 	}
 	defer link.Close()
-	proxy := proxyForPath(rawPath)
+	proxy, proxyNode := thumbProxyForPath(rawPath)
 	size := obj.GetSize()
 	if size > maxSize {
 		return nil, errThumbTooLarge
@@ -772,13 +837,13 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	tmpFile := cachePath + ".tmp.mp4"
 	defer os.Remove(tmpFile)
 	if size <= thumbChunkSize {
-		if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy); err != nil {
+		if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); err != nil {
 			return nil, err
 		}
 		return extractVideoFrame(tmpFile)
 	}
 	// 下载开头片段（moov 在头部时常见情况）
-	if _, err := downloadRange(ctx, link, tmpFile, 0, thumbChunkSize, proxy); err != nil {
+	if _, err := downloadRange(ctx, link, tmpFile, 0, thumbChunkSize, proxy, proxyNode); err != nil {
 		return nil, err
 	}
 	if data, err := extractVideoFrame(tmpFile); err == nil {
@@ -791,7 +856,7 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 		return data, nil
 	}
 	// 最后兜底：下载末尾片段（moov 在尾部且本地可解析时有效）
-	if _, err := downloadRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy); err != nil {
+	if _, err := downloadRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy, proxyNode); err != nil {
 		return nil, err
 	}
 	return extractVideoFrame(tmpFile)
@@ -1478,7 +1543,8 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 		if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 			if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
 				defer link.Close()
-				if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxyForPath(rawPath)); err == nil {
+				proxy, proxyNode := thumbProxyForPath(rawPath)
+				if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy, proxyNode); err == nil {
 					remoteThumbMissClear(rawPath)
 					remoteThumbCacheSet(rawPath, data)
 					_ = os.WriteFile(diskPath, data, 0o666)
@@ -1496,7 +1562,8 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 		if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
 			defer link.Close()
-			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxyForPath(rawPath)); err == nil {
+			proxy, proxyNode := thumbProxyForPath(rawPath)
+			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy, proxyNode); err == nil {
 				remoteThumbMissClear(rawPath)
 				remoteThumbCacheSet(rawPath, data)
 				_ = os.WriteFile(diskPath, data, 0o666)
@@ -1572,7 +1639,8 @@ func AudioThumb(c *gin.Context) {
 		}
 		tmpFile := thumbCachePath(thumbKindAudio, rawPath) + ".tmp.mp3"
 		defer os.Remove(tmpFile)
-		if _, err := downloadRange(c.Request.Context(), link, tmpFile, 0, size, proxyForPath(rawPath)); err != nil {
+		proxy, proxyNode := thumbProxyForPath(rawPath)
+		if _, err := downloadRange(c.Request.Context(), link, tmpFile, 0, size, proxy, proxyNode); err != nil {
 			return nil, err
 		}
 		return extractAudioCover(tmpFile)
@@ -1593,7 +1661,8 @@ func generateImageThumb(ctx context.Context, rawPath string) ([]byte, error) {
 	}
 	tmpFile := thumbCachePath(thumbKindImage, rawPath) + ".tmp.img"
 	defer os.Remove(tmpFile)
-	if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxyForPath(rawPath)); err != nil {
+	proxy, proxyNode := thumbProxyForPath(rawPath)
+	if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); err != nil {
 		return nil, err
 	}
 	return resizeImageFile(tmpFile)
@@ -1626,7 +1695,8 @@ func generateCoverThumb(ctx context.Context, rawPath string) ([]byte, error) {
 			continue
 		}
 		tmpFile := thumbCachePath(thumbKindCover, rawPath) + ".tmp.cover"
-		_, dlErr := downloadRange(ctx, link, tmpFile, 0, obj.GetSize(), proxyForPath(rawPath))
+		proxy, proxyNode := thumbProxyForPath(rawPath)
+		_, dlErr := downloadRange(ctx, link, tmpFile, 0, obj.GetSize(), proxy, proxyNode)
 		link.Close()
 		if dlErr != nil {
 			_ = os.Remove(tmpFile)

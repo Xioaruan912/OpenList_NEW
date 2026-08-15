@@ -1,8 +1,11 @@
 package db
 
 import (
+	"time"
+
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
 )
 
 // CreateProxyNode 创建代理节点
@@ -37,4 +40,45 @@ func GetProxyNodes() ([]model.ProxyNode, error) {
 		return nil, errors.WithStack(err)
 	}
 	return nodes, nil
+}
+
+// GetUsableProxyNodes 获取可选节点：未停用且不在风控期
+func GetUsableProxyNodes() ([]model.ProxyNode, error) {
+	var nodes []model.ProxyNode
+	now := time.Now()
+	if err := db.Where("status != ? AND (risk_until IS NULL OR risk_until <= ? OR status != ?)",
+		model.ProxyNodeStatusDisable, now, model.ProxyNodeStatusRisk).
+		Order("id asc").Find(&nodes).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return nodes, nil
+}
+
+// AddProxyNodeTraffic 原子累加节点累计流量并更新最近使用时间
+func AddProxyNodeTraffic(nodeID uint, rx, tx int64) {
+	if nodeID == 0 || (rx == 0 && tx == 0) {
+		return
+	}
+	db.Model(&model.ProxyNode{}).Where("id = ?", nodeID).Updates(map[string]interface{}{
+		"total_rx":     gorm.Expr("total_rx + ?", rx),
+		"total_tx":     gorm.Expr("total_tx + ?", tx),
+		"last_used_at": time.Now(),
+		"updated_at":   time.Now(),
+	})
+}
+
+// ClearProxyNodeRisk 手动解除节点风控状态并清零失败计数
+func ClearProxyNodeRisk(nodeID uint) error {
+	now := time.Now()
+	return errors.WithStack(db.Model(&model.ProxyNode{}).Where("id = ?", nodeID).Updates(map[string]interface{}{
+		"status":     model.ProxyNodeStatusNormal,
+		"risk_until": nil,
+		"fail_count": 0,
+		"updated_at": now,
+	}).Error)
+}
+
+// SetProxyNodeStatus 设置节点状态（normal/risk/disabled）
+func SetProxyNodeStatus(nodeID uint, status string) error {
+	return errors.WithStack(db.Model(&model.ProxyNode{}).Where("id = ?", nodeID).Update("status", status).Error)
 }

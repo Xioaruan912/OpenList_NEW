@@ -175,6 +175,10 @@ const (
 	ThumbRemoteUploadBatch    = "thumb_remote_upload_batch"
 	ThumbRemoteUploadInterval = "thumb_remote_upload_interval"
 
+	// thumb proxy selection (off / auto / manual + node id)
+	ThumbProxyMode = "thumb_proxy_mode"
+	ThumbProxyNode = "thumb_proxy_node"
+
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"
 	TaskOfflineDownloadTransferThreadsNum = "offline_download_transfer_task_threads_num"

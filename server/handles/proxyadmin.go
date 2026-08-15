@@ -1,96 +1,11 @@
 package handles
 
 import (
-	"crypto/subtle"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/url"
-	"time"
-
-	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
-	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
-
-// ProxyAdminPage GET /api/admin/proxy
-// 代理管理与流量查看页（独立静态页，不依赖前端构建产物）。
-// 未挂载 AuthAdmin 中间件，由本 handler 自行验证：
-//   - 优先取 Authorization 头，其次取 ?token= 查询参数（供管理后台 iframe 内嵌使用）
-//   - 支持管理员 token（设置中的 token）与用户 JWT，且必须是 admin 角色
-func ProxyAdminPage(c *gin.Context) {
-	token := c.GetHeader("Authorization")
-	if token == "" {
-		token = c.Query("token")
-	}
-	if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(setting.GetStr(conf.Token))) == 1 {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		_, _ = c.Writer.Write(proxyAdminHTML)
-		return
-	}
-	if token == "" {
-		common.ErrorStrResp(c, "login required", 401)
-		return
-	}
-	claims, err := common.ParseToken(token)
-	if err != nil {
-		common.ErrorStrResp(c, "invalid token", 401)
-		return
-	}
-	user, err := op.GetUserByName(claims.Username)
-	if err != nil || !user.IsAdmin() {
-		common.ErrorStrResp(c, "you are not an admin", 403)
-		return
-	}
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	_, _ = c.Writer.Write(proxyAdminHTML)
-}
-
-// ProxyTrafficResp trafficd 返回的实时流量统计
-type ProxyTrafficResp struct {
-	OK       bool   `json:"ok"`
-	Hostname string `json:"hostname"`
-	Uptime   int64  `json:"uptime"`
-	Time     string `json:"time"`
-	RXBytes  int64  `json:"rx_bytes"` // 累计接收字节（代理从外部拉取）
-	TXBytes  int64  `json:"tx_bytes"` // 累计发送字节（代理下发给客户端）
-	RXRate   int64  `json:"rx_rate"`  // 近 60s 平均接收速率 B/s
-	TXRate   int64  `json:"tx_rate"`  // 近 60s 平均发送速率 B/s
-	Conns    int    `json:"conns"`    // 当前 TCP 连接数
-}
-
-// ProxyNodeTraffic 节点 + 实时流量（含错误信息）
-type ProxyNodeTraffic struct {
-	model.ProxyNode
-	Traffic *ProxyTrafficResp `json:"traffic,omitempty"`
-	Error   string            `json:"error,omitempty"`
-}
-
-// queryTraffic 请求节点 trafficd 统计接口
-func queryTraffic(node *model.ProxyNode) (*ProxyTrafficResp, error) {
-	if node.Host == "" || node.TrafficPort <= 0 {
-		return nil, fmt.Errorf("host or traffic_port not configured")
-	}
-	u := fmt.Sprintf("http://%s:%d/stats?token=%s", node.Host, node.TrafficPort, url.QueryEscape(node.Token))
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(u)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("trafficd http %d", resp.StatusCode)
-	}
-	var t ProxyTrafficResp
-	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
 
 // ListProxyNodes GET /api/admin/proxy/list
 func ListProxyNodes(c *gin.Context) {
@@ -196,25 +111,4 @@ func DeleteProxyNode(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, nil)
-}
-
-// ProxyTraffic GET /api/admin/proxy/traffic
-// 批量查询所有代理节点的实时流量（每个节点 4s 超时）
-func ProxyTraffic(c *gin.Context) {
-	nodes, err := db.GetProxyNodes()
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	result := make([]ProxyNodeTraffic, 0, len(nodes))
-	for _, node := range nodes {
-		item := ProxyNodeTraffic{ProxyNode: node}
-		if t, err := queryTraffic(&node); err != nil {
-			item.Error = err.Error()
-		} else {
-			item.Traffic = t
-		}
-		result = append(result, item)
-	}
-	common.SuccessResp(c, result)
 }

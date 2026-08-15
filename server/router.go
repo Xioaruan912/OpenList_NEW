@@ -35,8 +35,6 @@ func Init(e *gin.Engine) {
 	g.GET("/robots.txt", handles.Robots)
 	g.GET("/manifest.json", static.ManifestJSON)
 	g.GET("/i/:link_name", handles.Plist)
-	// 代理管理页：独立静态页，自行校验 token（支持 ?token= 供管理后台 iframe 内嵌）
-	g.GET("/api/admin/proxy", handles.ProxyAdminPage)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
@@ -177,6 +175,8 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/clear_all", handles.ThumbClearAll)
 	thumb.POST("/exclude", handles.ThumbExclude)
 	thumb.POST("/migrate", handles.ThumbMigrate)
+	thumb.GET("/proxy", handles.ThumbProxyConfig)
+	thumb.POST("/proxy", handles.ThumbProxySet)
 
 	proxy := g.Group("/proxy")
 	proxy.GET("/list", handles.ListProxyNodes)
@@ -184,6 +184,8 @@ func admin(g *gin.RouterGroup) {
 	proxy.POST("/update", handles.UpdateProxyNode)
 	proxy.POST("/delete", handles.DeleteProxyNode)
 	proxy.GET("/traffic", handles.ProxyTraffic)
+	proxy.POST("/recover", handles.ProxyRecover)
+	proxy.POST("/enable", handles.ProxyEnable)
 
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)
