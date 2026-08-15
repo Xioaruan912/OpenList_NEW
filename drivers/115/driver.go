@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -147,7 +148,10 @@ func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
 		if err != nil {
 			MarkStorageError(d.GetStorage().MountPath, err)
 			log.Warnf("115 get multi root [%s] failed: %v", id, err)
-			continue
+			// 任一根获取失败：返回错误、不缓存残缺列表。
+			// 否则会缓存"少了某个根"的虚拟根 5 分钟，导致该根下目录
+			// Get 返回 not found，递归 mkdir 误去创建已存在的目录（115 报"名称已存在"）
+			return nil, errors.WithMessagef(err, "115 get multi root [%s] failed", id)
 		}
 		objs = append(objs, &model.Object{
 			ID:       f.GetID(),
@@ -203,6 +207,11 @@ func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName strin
 
 	err = driver115.CheckErr(err, &result, resp)
 	if err != nil {
+		// 目录已存在（errno 20004 "该目录名称已存在"）映射为标准 ObjectAlreadyExists，
+		// 使 fs 层幂等（如缩略图上传时 _thumbnails 已存在则直接继续）
+		if errors.Is(err, driver115.ErrExist) {
+			return nil, errs.ObjectAlreadyExists
+		}
 		return nil, err
 	}
 	f, err := d.getNewFile(result.FileID)

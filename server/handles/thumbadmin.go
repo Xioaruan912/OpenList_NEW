@@ -1292,15 +1292,25 @@ func ThumbUploadAll(c *gin.Context) {
 func ThumbUploadStatus(c *gin.Context) {
 	thumbUploadMu.Lock()
 	defer thumbUploadMu.Unlock()
+	remaining := thumbUploadTotal - thumbUploadDone - thumbUploadExists - thumbUploadFailed
+	if remaining < 0 {
+		remaining = 0
+	}
+	failItems := make([]gin.H, 0, len(thumbUploadFails))
+	for _, f := range thumbUploadFails {
+		failItems = append(failItems, gin.H{"path": f.Path, "msg": f.Msg})
+	}
 	common.SuccessResp(c, gin.H{
-		"active":  thumbUploadActive,
-		"queued":  len(thumbUploadQueue),
-		"total":   thumbUploadTotal,
-		"done":    thumbUploadDone,
-		"failed":  thumbUploadFailed,
-		"exists":  thumbUploadExists,
-		"fails":   len(thumbUploadFails),
-		"attempts": thumbUploadAttemptsTotal(),
+		"active":     thumbUploadActive,
+		"queued":     len(thumbUploadQueue),
+		"remaining":  remaining,
+		"total":      thumbUploadTotal,
+		"done":       thumbUploadDone,
+		"failed":     thumbUploadFailed,
+		"exists":     thumbUploadExists,
+		"fails":      len(thumbUploadFails),
+		"attempts":   thumbUploadAttemptsTotal(),
+		"fail_items": failItems,
 	})
 }
 
@@ -1351,13 +1361,19 @@ var (
 	thumbUploadFailed   int
 	thumbUploadExists   int
 	thumbUploadActive   bool
-	thumbUploadFails    []string // 超过自动重试次数的失败路径（供手动重试）
+	thumbUploadFails    []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
 	thumbUploadAttempts = map[string]int{}
 	thumbUploadStatus   = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
 )
 
+// thumbUploadFailItem 上传失败记录（含原因）
+type thumbUploadFailItem struct {
+	Path string `json:"path"`
+	Msg  string `json:"msg"`
+}
+
 // thumbUploadEnqueue 加入上传队列并启动后台 worker；
-// 队列空闲时视为开始新一轮上传，重置本轮计数与状态。
+// 队列空闲时视为开始新一轮上传，重置本轮计数与状态；运行中追加时按路径去重。
 func thumbUploadEnqueue(paths []string) {
 	if len(paths) == 0 {
 		return
@@ -1372,8 +1388,21 @@ func thumbUploadEnqueue(paths []string) {
 		thumbUploadAttempts = map[string]int{}
 		thumbUploadStatus = map[string]string{}
 	}
-	thumbUploadQueue = append(thumbUploadQueue, paths...)
-	thumbUploadTotal += len(paths)
+	// 去重：跳过已在队列中或已处理的路径（避免运行中重复点上传导致重复入队）
+	inQueue := map[string]bool{}
+	for _, q := range thumbUploadQueue {
+		inQueue[q] = true
+	}
+	added := 0
+	for _, p := range paths {
+		if thumbUploadStatus[p] != "" || inQueue[p] {
+			continue
+		}
+		thumbUploadQueue = append(thumbUploadQueue, p)
+		inQueue[p] = true
+		added++
+	}
+	thumbUploadTotal += added
 	needStart := !thumbUploadActive
 	thumbUploadMu.Unlock()
 	if needStart {
@@ -1428,11 +1457,11 @@ func thumbUploadBatch(batch []string) {
 			data, err := os.ReadFile(thumbCachePath(thumbKindVideo, p))
 			if err != nil {
 				// 本地文件缺失：无重试意义，直接进失败清单
-				thumbUploadFailNow(p)
+				thumbUploadFailNow(p, "本地缩略图文件缺失")
 				continue
 			}
 			if err := uploadThumbManual(ctx, p, data); err != nil {
-				thumbUploadFailRetry(p)
+				thumbUploadFailRetry(p, err.Error())
 				continue
 			}
 			// 更新目录清单缓存，后续批次/轮次去重跳过
@@ -1463,18 +1492,18 @@ func thumbUploadFinalize(p, status string) {
 }
 
 // thumbUploadFailNow 直接判定失败（不可重试）：进失败清单
-func thumbUploadFailNow(p string) {
+func thumbUploadFailNow(p, msg string) {
 	thumbUploadFinalize(p, "failed")
 	thumbUploadMu.Lock()
-	if !slices.Contains(thumbUploadFails, p) {
-		thumbUploadFails = append(thumbUploadFails, p)
+	if !slices.ContainsFunc(thumbUploadFails, func(f thumbUploadFailItem) bool { return f.Path == p }) {
+		thumbUploadFails = append(thumbUploadFails, thumbUploadFailItem{Path: p, Msg: msg})
 	}
 	thumbUploadMu.Unlock()
 }
 
 // thumbUploadFailRetry 记录一次上传失败：未超过自动重试次数则重新入队（批间隔天然退避），
 // 超过后判定为最终失败并进入失败清单。
-func thumbUploadFailRetry(p string) {
+func thumbUploadFailRetry(p, msg string) {
 	thumbUploadMu.Lock()
 	thumbUploadAttempts[p]++
 	if thumbUploadAttempts[p] < thumbUploadMaxAttempts {
@@ -1483,25 +1512,27 @@ func thumbUploadFailRetry(p string) {
 		return
 	}
 	thumbUploadMu.Unlock()
-	thumbUploadFailNow(p)
+	thumbUploadFailNow(p, msg)
 }
 
 // ThumbUploadRetry POST /api/admin/thumb/upload_retry
 // 将上传失败清单重新加入上传队列（失败超过自动重试次数后由用户手动触发）
 func ThumbUploadRetry(c *gin.Context) {
 	thumbUploadMu.Lock()
-	fails := append([]string(nil), thumbUploadFails...)
+	fails := append([]thumbUploadFailItem(nil), thumbUploadFails...)
 	thumbUploadFails = nil
 	// 回退失败计数并重置这些路径的最终状态/尝试次数，允许重新计
 	thumbUploadFailed -= len(fails)
 	if thumbUploadFailed < 0 {
 		thumbUploadFailed = 0
 	}
-	thumbUploadQueue = append(thumbUploadQueue, fails...)
+	for _, f := range fails {
+		thumbUploadQueue = append(thumbUploadQueue, f.Path)
+	}
 	thumbUploadTotal += len(fails)
-	for _, p := range fails {
-		delete(thumbUploadStatus, p)
-		delete(thumbUploadAttempts, p)
+	for _, f := range fails {
+		delete(thumbUploadStatus, f.Path)
+		delete(thumbUploadAttempts, f.Path)
 	}
 	needStart := !thumbUploadActive
 	thumbUploadMu.Unlock()

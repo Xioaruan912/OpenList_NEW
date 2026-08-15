@@ -123,15 +123,18 @@ const Thumb = () => {
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
   let firstStatusLoaded = false
   const [uploadLive, setUploadLive] = createSignal(false) // 本次会话是否有上传运行（控制轮询）
-  const [upStatus, setUpStatus] = createSignal<{
-    active: boolean
-    queued: number
-    done: number
-    failed: number
-    exists: number
-    fails: number
-    total: number
-  }>()
+  const upDefault = {
+    active: false,
+    queued: 0,
+    remaining: 0,
+    done: 0,
+    failed: 0,
+    exists: 0,
+    fails: 0,
+    total: 0,
+    fail_items: [] as { path: string; msg: string }[],
+  }
+  const [upStatus, setUpStatus] = createSignal<typeof upDefault>(upDefault)
   const [logOpen, setLogOpen] = createSignal(false)
   const [logItems, setLogItems] = createSignal<{ path: string; msg: string; at: string }[]>([])
 
@@ -152,6 +155,18 @@ const Thumb = () => {
     } else {
       setLogItems(items)
     }
+    setLogOpen(true)
+  }
+
+  // 上传失败日志
+  const openUploadLog = () => {
+    setLogItems(
+      (upStatus()?.fail_items || []).map((i) => ({
+        path: i.path,
+        msg: i.msg || "上传失败",
+        at: "",
+      })),
+    )
     setLogOpen(true)
   }
 
@@ -321,6 +336,13 @@ const Thumb = () => {
           notify.info("该目录没有可上传的本地缩略图")
         } else {
           notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
+          const n = data.queued || 0
+          setUpStatus((s) => ({
+            ...s,
+            active: true,
+            total: (s?.total || 0) + n,
+            remaining: (s?.remaining || 0) + n,
+          }))
           setUploadLive(true)
           void pollUploadStatus()
         }
@@ -340,6 +362,13 @@ const Thumb = () => {
           notify.info("没有可上传的本地缩略图")
         } else {
           notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
+          const n = data.queued || 0
+          setUpStatus((s) => ({
+            ...s,
+            active: true,
+            total: (s?.total || 0) + n,
+            remaining: (s?.remaining || 0) + n,
+          }))
           setUploadLive(true)
           void pollUploadStatus()
         }
@@ -357,14 +386,16 @@ const Thumb = () => {
       const s = d as {
         active: boolean
         queued: number
+        remaining: number
         done: number
         failed: number
         exists: number
         fails: number
         total: number
+        fail_items?: { path: string; msg: string }[]
       }
-      setUpStatus(s)
-      if (uploadLive() && !s.active && s.queued === 0 && s.total > 0) {
+      setUpStatus({ ...upDefault, ...s })
+      if (uploadLive() && !s.active && s.remaining === 0 && s.total > 0) {
         notify.success(
           `上传完成：成功 ${s.done}，已存在(网盘已有) ${s.exists}，失败 ${s.failed}${s.fails > 0 ? "（可重试）" : ""}`,
         )
@@ -383,6 +414,12 @@ const Thumb = () => {
         const data = d as { retried?: number }
         notify.success(`已重新入队 ${data.retried || 0} 个上传失败`)
         if (data.retried) {
+          setUpStatus((s) => ({
+            ...s,
+            active: true,
+            total: (s?.total || 0) + (data.retried || 0),
+            remaining: (s?.remaining || 0) + (data.retried || 0),
+          }))
           setUploadLive(true)
           void pollUploadStatus()
         }
@@ -981,82 +1018,77 @@ const Thumb = () => {
         </Progress>
       </Box>
 
-      <Show
-        when={
-          upStatus() &&
-          (upStatus()!.active ||
-            upStatus()!.queued > 0 ||
-            upStatus()!.done + upStatus()!.exists + upStatus()!.failed > 0)
-        }
-      >
-        <Box
-          w="$full"
-          p="$3"
-          rounded="$lg"
-          border="1px solid $neutral7"
-          background={useColorModeValue("$neutral1", "$neutral2")()}
-        >
-          <HStack spacing="$2" alignItems="center" wrap="wrap">
-            <Tag
-              colorScheme={
-                st()?.blocked
-                  ? "danger"
-                  : upStatus()!.active
-                    ? "success"
-                    : upStatus()!.queued > 0
-                      ? "warning"
+      {/* 上传状态与进度（常驻，与生成面板一致） */}
+      <Box mt="$2" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
+        <HStack spacing="$2" alignItems="center" wrap="wrap">
+          <Tag
+            colorScheme={
+              st()?.blocked
+                ? "danger"
+                : upStatus().active
+                  ? "success"
+                  : upStatus().remaining > 0
+                    ? "warning"
+                    : upStatus().total > 0
+                      ? "neutral"
                       : "neutral"
-              }
-            >
-              {st()?.blocked
-                ? "115 风控中，上传变慢"
-                : upStatus()!.active
-                  ? "正在上传"
-                  : upStatus()!.queued > 0
-                    ? "已入队，等待上传"
-                    : "上传完成"}
-            </Tag>
-            <Text fontSize="$sm" color="$neutral9">
-              剩余 {upStatus()!.queued} 个 · 成功 {upStatus()!.done} · 已存在(网盘已有){" "}
-              {upStatus()!.exists} · 失败 {upStatus()!.failed}
-            </Text>
-            <Show when={upStatus()!.fails > 0}>
-              <Button
-                size="xs"
-                colorScheme="warning"
-                loading={busy() === "upload-retry"}
-                onClick={uploadRetry}
-              >
-                重试上传失败
-              </Button>
-            </Show>
-          </HStack>
-          <Progress
-            mt="$2"
-            value={
-              upStatus()!.total > 0
-                ? Math.max(
-                    0,
-                    Math.min(
-                      100,
-                      Math.round(
-                        ((upStatus()!.done + upStatus()!.exists) / upStatus()!.total) * 100,
-                      ),
-                    ),
-                  )
-                : 0
             }
-            max={100}
-            indeterminate={
-              upStatus()!.active &&
-              upStatus()!.done + upStatus()!.exists + upStatus()!.failed === 0
-            }
-            size="sm"
           >
-            <ProgressIndicator color="$success6" />
-          </Progress>
-        </Box>
-      </Show>
+            {st()?.blocked
+              ? "115 风控中，上传变慢"
+              : upStatus().active
+                ? "正在上传"
+                : upStatus().remaining > 0
+                  ? "已入队，等待上传"
+                  : upStatus().total > 0
+                    ? "上传完成"
+                    : "空闲"}
+          </Tag>
+          <Text fontSize="$sm" color="$neutral9">
+            剩余 {upStatus().remaining} 个 · 成功 {upStatus().done} · 已存在(网盘已有){" "}
+            {upStatus().exists} · 失败 {upStatus().failed}
+          </Text>
+          <Show when={upStatus().fails > 0}>
+            <Button size="xs" variant="outline" colorScheme="danger" onClick={openUploadLog}>
+              查看失败日志
+            </Button>
+            <Button
+              size="xs"
+              colorScheme="warning"
+              loading={busy() === "upload-retry"}
+              onClick={uploadRetry}
+            >
+              重试上传失败
+            </Button>
+          </Show>
+        </HStack>
+        <Show when={upStatus().total === 0}>
+          <Text mt="$1" fontSize="$sm" color="$neutral9">
+            尚未上传：点击"一键上传"或目录行上的"上传"按钮开始（每批 50，间隔 5 秒，失败自动重试 3 次）
+          </Text>
+        </Show>
+        <Progress
+          mt="$2"
+          value={
+            upStatus().total > 0
+              ? Math.max(
+                  0,
+                  Math.min(
+                    100,
+                    Math.round(((upStatus().done + upStatus().exists) / upStatus().total) * 100),
+                  ),
+                )
+              : 0
+          }
+          max={100}
+          indeterminate={
+            upStatus().active && upStatus().done + upStatus().exists + upStatus().failed === 0
+          }
+          size="sm"
+        >
+          <ProgressIndicator color="$success6" />
+        </Progress>
+      </Box>
 
       <HStack spacing="$2" alignItems="center" wrap={{ "@initial": "wrap", "@md": "unset" }}>
           <Button
