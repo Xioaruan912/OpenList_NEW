@@ -140,6 +140,7 @@ func ThumbStatus(c *gin.Context) {
 	status["gen_batch_interval"] = 0
 	status["gen_enqueue_max"] = pw.EnqueueMax
 	status["active_workers"] = atomic.LoadInt32(&thumbActiveWorkers)
+	status["active_tasks"] = thumbActiveTasksSnapshot()
 	// 是否有任一挂载处于 115 风控（前端提示"生成已暂停"）
 	blockedAny := false
 	for _, m := range currentMountPaths() {
@@ -1238,4 +1239,65 @@ func ThumbView(c *gin.Context) {
 	_ = os.WriteFile(cachePath, png, 0o666)
 	thumbRecord(path)
 	serve(png)
+}
+
+// ThumbDeletePathsReq POST /api/admin/thumb/delete_paths
+type ThumbDeletePathsReq struct {
+	Paths []string `json:"paths"`
+}
+
+// ThumbDeletePaths POST /api/admin/thumb/delete_paths
+// 按精确路径列表删除缩略图：本地缓存 + 失败标记 + 索引（remote 模式同步删网盘 _thumbnails 文件）。
+func ThumbDeletePaths(c *gin.Context) {
+	var req ThumbDeletePathsReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.Paths) == 0 {
+		common.SuccessResp(c, gin.H{"removed": 0})
+		return
+	}
+	ctx := c.Request.Context()
+	target := map[string]bool{}
+	for _, p := range req.Paths {
+		if p != "" {
+			target[p] = true
+		}
+	}
+	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
+	indexed := readThumbIndex()
+	removed := 0
+	var keep []string
+	for _, p := range indexed {
+		if target[p] {
+			for _, kind := range kinds {
+				_ = os.Remove(thumbCachePath(kind, p))
+				_ = os.Remove(thumbFailPath(kind, p))
+			}
+			removed++
+			continue
+		}
+		keep = append(keep, p)
+	}
+	if removed > 0 {
+		_ = writeThumbIndex(keep)
+	}
+	// 远程 _thumbnails：逐个删除对应文件（remote 模式；风控中跳过）
+	remoteSkipped := false
+	if blocked, _ := isStorageBlocked(req.Paths[0]); !blocked {
+		for _, p := range req.Paths {
+			addition := remoteThumbStore(p)
+			if addition == nil {
+				continue
+			}
+			full := remoteThumbPath(addition, p)
+			if full != "" {
+				_ = fs.Remove(ctx, full)
+			}
+		}
+	} else {
+		remoteSkipped = true
+	}
+	common.SuccessResp(c, gin.H{"removed": removed, "remote_skipped": remoteSkipped})
 }

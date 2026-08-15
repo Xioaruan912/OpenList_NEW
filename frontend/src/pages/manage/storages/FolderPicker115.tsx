@@ -1,6 +1,7 @@
 import {
   Box,
   Button,
+  Checkbox,
   HStack,
   Modal,
   ModalBody,
@@ -8,8 +9,6 @@ import {
   ModalFooter,
   ModalHeader,
   ModalOverlay,
-  Radio,
-  RadioGroup,
   Spinner,
   Stack,
   Tag,
@@ -32,18 +31,19 @@ interface FolderCrumb {
   name: string
 }
 
-// FolderPicker115 可逐级浏览 115 网盘目录的可视化挂载文件夹选择器。
-// 用 cookie 拉取根目录/子目录，支持进入子文件夹与返回上级。
+// FolderPicker115 可逐级浏览 115 网盘目录的可视化挂载文件夹选择器（支持多选）。
+// 勾选多个文件夹，确认后一次性把全部 file_id 以逗号分隔写入 root_folder_id（驱动已支持多根）。
 export const FolderPicker115 = (props: {
   opened: Accessor<boolean>
   cookie: Accessor<string>
   onClose: () => void
-  onPick: (fileId: string, name: string) => void
+  onPick: (ids: string[], names: string[]) => void
+  current?: string // 当前 root_folder_id（逗号分隔），打开时预勾选
 }) => {
   const [loading, setLoading] = createSignal(false)
   const [folders, setFolders] = createSignal<FolderInfo[]>([])
   const [crumbs, setCrumbs] = createSignal<FolderCrumb[]>([])
-  const [selectedId, setSelectedId] = createSignal("")
+  const [selected, setSelected] = createSignal<Record<string, boolean>>({})
 
   const currentId = () =>
     crumbs().length > 0 ? crumbs()[crumbs().length - 1].file_id : ""
@@ -55,7 +55,6 @@ export const FolderPicker115 = (props: {
       return
     }
     setLoading(true)
-    setSelectedId("")
     const resp: PResp<{ content: FolderInfo[] }> = r.post(
       currentId() ? "/115/list_folders" : "/115/root_folders",
       {
@@ -72,8 +71,7 @@ export const FolderPicker115 = (props: {
     setFolders(data?.content || [])
   }
 
-  // 每次弹窗打开时重置并加载根目录（用 wasOpened 防抖，避免
-  // effect 读到 crumbs 又写入 [] 造成重渲染循环，导致"进入"子目录被反复重置）
+  // 每次弹窗打开时重置并加载根目录；按当前 root_folder_id 预勾选
   let wasOpened = false
   createEffect(() => {
     const op = props.opened()
@@ -81,6 +79,11 @@ export const FolderPicker115 = (props: {
       wasOpened = true
       setCrumbs([])
       setFolders([])
+      const pre: Record<string, boolean> = {}
+      for (const id of (props.current || "").split(",")) {
+        if (id.trim()) pre[id.trim()] = true
+      }
+      setSelected(pre)
       void loadFolders()
     } else if (!op) {
       wasOpened = false
@@ -106,35 +109,45 @@ export const FolderPicker115 = (props: {
     void loadFolders()
   }
 
-  // 选择当前所在目录（已进入的子目录）作为挂载根
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const z = { ...prev }
+      z[id] = !z[id]
+      return z
+    })
+
+  const selectedIds = () => Object.keys(selected()).filter((id) => selected()[id])
+
+  const finish = () => {
+    const ids = selectedIds()
+    if (!ids.length) {
+      notify.warning("请先勾选要挂载的文件夹")
+      return
+    }
+    const names = ids.map(
+      (id) => folders().find((f) => f.file_id === id)?.name || id,
+    )
+    props.onPick(ids, names)
+    props.onClose()
+    notify.success(`已选择挂载 ${ids.length} 个文件夹`)
+  }
+
+  // 选择当前所在目录（已进入的子目录）并追加到选中集合
   const pickCurrent = () => {
     const last = crumbs()[crumbs().length - 1]
     if (!last) {
-      notify.warning("当前已在根目录，请选择要挂载的文件夹")
+      notify.warning("当前已在根目录，请直接勾选要挂载的文件夹")
       return
     }
-    props.onPick(last.file_id, last.name)
-    props.onClose()
-    notify.success(`已选择挂载文件夹: ${last.name}`)
-  }
-
-  const confirm = () => {
-    const id = selectedId()
-    if (!id) {
-      notify.warning("请先选择要挂载的文件夹")
-      return
-    }
-    const folder = folders().find((f) => f.file_id === id)
-    props.onPick(id, folder?.name ?? id)
-    props.onClose()
-    notify.success(`已选择挂载文件夹: ${folder?.name ?? id}`)
+    setSelected((prev) => ({ ...prev, [last.file_id]: true }))
+    finish()
   }
 
   return (
     <Modal blockScrollOnMount={false} opened={props.opened()} onClose={props.onClose}>
       <ModalOverlay />
       <ModalContent>
-        <ModalHeader>选择要挂载的文件夹</ModalHeader>
+        <ModalHeader>选择要挂载的文件夹（可多选）</ModalHeader>
         <ModalBody>
           <Show when={crumbs().length > 0}>
             <HStack spacing="$1" mb="$2" flexWrap="wrap">
@@ -167,7 +180,9 @@ export const FolderPicker115 = (props: {
           </Show>
           <Show
             when={loading()}
-            fallback={<Text>选择需要挂载的文件夹，可点击进入子文件夹，将自动填入根文件夹 ID</Text>}
+            fallback={
+              <Text>勾选需要挂载的文件夹（可多个），可进入子文件夹，确认后写入根文件夹 ID（逗号分隔）</Text>
+            }
           >
             <VStack spacing="$2">
               <Spinner />
@@ -178,44 +193,51 @@ export const FolderPicker115 = (props: {
             <Text color="$danger9">未获取到文件夹列表，请确认 Cookie 是否有效</Text>
           </Show>
           <Show when={!loading() && folders().length > 0}>
-            <RadioGroup value={selectedId()} onChange={setSelectedId}>
-              <Stack direction="column" spacing="$1" maxHeight="$80" overflow="auto">
-                <For each={folders()}>
-                  {(folder) => (
-                    <HStack
-                      spacing="$2"
-                      alignItems="center"
-                      p="$1"
-                      rounded="$sm"
-                      cursor="pointer"
-                      _hover={{ bgColor: "$neutral2" }}
-                      onClick={() => setSelectedId(folder.file_id)}
+            <Stack direction="column" spacing="$1" maxHeight="$80" overflow="auto">
+              <For each={folders()}>
+                {(folder) => (
+                  <HStack
+                    spacing="$2"
+                    alignItems="center"
+                    p="$1"
+                    rounded="$sm"
+                    cursor="pointer"
+                    _hover={{ bgColor: "$neutral2" }}
+                    onClick={() => toggle(folder.file_id)}
+                  >
+                    <Checkbox
+                      checked={!!selected()[folder.file_id]}
+                      onChange={(e: any) => {
+                        e.stopPropagation()
+                        toggle(folder.file_id)
+                      }}
+                      on:click={(e: MouseEvent) => e.stopPropagation()}
                     >
-                      <Radio value={folder.file_id}>{folder.name}</Radio>
-                      <Box flex="1" />
-                      <Button
-                        size="xs"
-                        colorScheme="info"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          openFolder(folder)
-                        }}
-                      >
-                        进入
-                      </Button>
-                    </HStack>
-                  )}
-                </For>
-              </Stack>
-            </RadioGroup>
+                      {folder.name}
+                    </Checkbox>
+                    <Box flex="1" />
+                    <Button
+                      size="xs"
+                      colorScheme="info"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        openFolder(folder)
+                      }}
+                    >
+                      进入
+                    </Button>
+                  </HStack>
+                )}
+              </For>
+            </Stack>
           </Show>
         </ModalBody>
         <ModalFooter display="flex" gap="$2">
           <Button onClick={props.onClose} colorScheme="neutral">
             取消
           </Button>
-          <Button onClick={confirm} disabled={!selectedId()}>
-            确定
+          <Button onClick={finish} disabled={selectedIds().length === 0}>
+            确定（已选 {selectedIds().length} 个）
           </Button>
         </ModalFooter>
       </ModalContent>

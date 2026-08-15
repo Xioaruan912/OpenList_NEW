@@ -968,6 +968,32 @@ func prewarmWorker() {
 // thumbActiveWorkers 当前正在处理缩略图生成的 worker 数（供前端进度条显示）
 var thumbActiveWorkers int32
 
+// thumbActiveTasks 进行中（worker 正在处理）的缩略图任务，供前端展示"正在生成 N 个/哪些文件"
+var (
+	thumbActiveMu    sync.Mutex
+	thumbActiveTasks = map[string]time.Time{} // rawPath -> startedAt
+)
+
+func thumbActiveTrack(rawPath string, active bool) {
+	thumbActiveMu.Lock()
+	if active {
+		thumbActiveTasks[rawPath] = time.Now()
+	} else {
+		delete(thumbActiveTasks, rawPath)
+	}
+	thumbActiveMu.Unlock()
+}
+
+func thumbActiveTasksSnapshot() []gin.H {
+	thumbActiveMu.Lock()
+	defer thumbActiveMu.Unlock()
+	out := make([]gin.H, 0, len(thumbActiveTasks))
+	for path, at := range thumbActiveTasks {
+		out = append(out, gin.H{"path": path, "since": at.Unix()})
+	}
+	return out
+}
+
 func processTask(task thumbPrewarmTask) {
 	// 115 风控中不下载视频生成缩略图（避免加剧风控）：
 	// 放回队列尾部并短暂让位，不阻塞其他存储（如 Onedrive）的任务处理
@@ -994,6 +1020,8 @@ func processTask(task thumbPrewarmTask) {
 	atomic.AddInt32(&thumbActiveWorkers, 1)
 	defer atomic.AddInt32(&thumbActiveWorkers, -1)
 	defer thumbRelease()
+	thumbActiveTrack(task.rawPath, true)
+	defer thumbActiveTrack(task.rawPath, false)
 	// 生成任务硬限时 90s（115 驱动内部请求无超时，网盘风控黑洞时会永久挂起，
 	// 必须用 goroutine+select 强制放弃任务，保证 worker 永不卡死）
 	done := make(chan []byte, 1)

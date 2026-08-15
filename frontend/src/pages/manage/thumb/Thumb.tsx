@@ -31,6 +31,7 @@ type ThumbStatus = {
   prewarm_queued: number
   queue_paused: boolean
   active_workers: number
+  active_tasks?: { path: string; since: number }[]
   blocked: boolean
   stale_by_dir?: { dir: string; count: number }[]
   mounts?: string[]
@@ -194,6 +195,59 @@ const Thumb = () => {
     }
   }
 
+  // 只对当前目录（非递归）生成缺失缩略图
+  const genSelDir = async () => {
+    if (!sel()) {
+      notify.warning("请先选择目录")
+      return
+    }
+    setBusy("gen-" + sel())
+    try {
+      const resp = await r.post("/admin/thumb/generate", {
+        path: sel(),
+        recursive: false,
+      })
+      handleResp(resp, (d) => {
+        const data = d as { queued?: number }
+        notify.success(`已加入队列：${data.queued || 0} 个（仅当前目录）`)
+        setTotalQueued((t) => t + (data.queued || 0))
+        load()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
+  // 删除勾选的缩略图（本地缓存 + 索引，remote 模式同步删网盘文件）
+  const deleteChecked = async () => {
+    if (!sel()) {
+      notify.warning("请先选择目录")
+      return
+    }
+    const paths = selFiles().filter((p) => checked()[p])
+    if (!paths.length) {
+      notify.warning("没有勾选的缩略图可删除")
+      return
+    }
+    if (!window.confirm(`确认删除勾选的 ${paths.length} 个缩略图？（${sel()}）`)) return
+    setBusy("delpaths-" + sel())
+    try {
+      const resp = await r.post("/admin/thumb/delete_paths", { paths })
+      handleResp(resp, (d) => {
+        const data = d as { removed?: number; remote_skipped?: boolean }
+        notify.success(
+          `已删除 ${data.removed || 0} 个缩略图` +
+            (data.remote_skipped ? "（115 风控中，远程待恢复后清理）" : ""),
+        )
+        loadTree()
+        loadDir(sel())
+        load()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
   const uploadDir = async (pp: string) => {
     setBusy("up-" + pp)
     try {
@@ -327,30 +381,6 @@ const Thumb = () => {
       notify.success(`已重试：${data.retried || 0} 个`)
       load()
     })
-  }
-
-  const clearSel = async () => {
-    if (!sel()) {
-      notify.warning("请先选择目录")
-      return
-    }
-    if (!window.confirm(`确认清空该目录下所有缩略图？（${sel()}）`)) return
-    setBusy(sel() + "-c")
-    try {
-      const resp = await r.post("/admin/thumb/clear", { path: sel() })
-      handleResp(resp, (d) => {
-        const data = d as { removed?: number; remote_skipped?: boolean }
-        notify.success(
-          `已清空 ${data.removed || 0} 个缩略图` +
-            (data.remote_skipped ? "（115 风控中，远程缩略图待恢复后清理）" : ""),
-        )
-        loadTree()
-        loadDir(sel())
-        load()
-      })
-    } finally {
-      setBusy("")
-    }
   }
 
   const clearAll = async () => {
@@ -762,9 +792,21 @@ const Thumb = () => {
                     : "空闲"}
           </Tag>
           <Text fontSize="$sm" color="$neutral9">
-            队列剩余 {queued()} 个 · 本次已生成 {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个
+            {genActive() > 0 ? `正在生成 ${genActive()} 个 · ` : ""}队列剩余 {queued()} 个 · 本次已生成{" "}
+            {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个
           </Text>
         </HStack>
+        <Show when={(st()?.active_tasks || []).length > 0}>
+          <Box mt="$2" rounded="$md" border="1px solid $neutral6" p="$1">
+            <For each={st()!.active_tasks}>
+              {(t) => (
+                <Text fontSize="$xs" color="$neutral9" css={{ "word-break": "break-all" }}>
+                  ▶ {t.path.split("/").pop()}
+                </Text>
+              )}
+            </For>
+          </Box>
+        </Show>
         <Progress
           mt="$2"
           value={totalQueued() > 0 ? Math.max(0, Math.min(100, Math.round(((totalQueued() - queued()) / totalQueued()) * 100))) : 0}
@@ -827,6 +869,14 @@ const Thumb = () => {
             </Tag>
             <Button
               size="xs"
+              colorScheme="accent"
+              disabled={!sel() || busy() === "gen-" + sel()}
+              onClick={genSelDir}
+            >
+              生成
+            </Button>
+            <Button
+              size="xs"
               colorScheme="info"
               disabled={!sel() || busy() === "up-" + sel()}
               onClick={() => uploadDir(sel())}
@@ -836,8 +886,13 @@ const Thumb = () => {
             <Button size="xs" colorScheme="warning" disabled={!sel()} onClick={retrySel}>
               重试失败
             </Button>
-            <Button size="xs" colorScheme="danger" disabled={busy() === sel() + "-c"} onClick={clearSel}>
-              清空
+            <Button
+              size="xs"
+              colorScheme="danger"
+              disabled={!sel() || busy() === "delpaths-" + sel()}
+              onClick={deleteChecked}
+            >
+              删除
             </Button>
           </HStack>
           <HStack spacing="$2" alignItems="center" mt="$2" wrap="wrap">
@@ -848,7 +903,7 @@ const Thumb = () => {
               恢复已排除
             </Button>
             <Text fontSize="$xs" color="$neutral9">
-              取消勾选 = 不需要缩略图
+              勾选 = 纳入操作（生成/删除），取消勾选 = 排除
             </Text>
           </HStack>
           <Box mt="$2" maxH="420px" overflowY="auto" rounded="$md" border="1px solid $neutral6" p="$1">

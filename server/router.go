@@ -186,6 +186,7 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/proxy", handles.ThumbProxySet)
 	thumb.POST("/upload", handles.ThumbUpload)
 	thumb.POST("/delete_folder", handles.ThumbDeleteFolder)
+	thumb.POST("/delete_paths", handles.ThumbDeletePaths)
 	thumb.POST("/queue/pause", handles.ThumbQueuePause)
 	thumb.POST("/queue/resume", handles.ThumbQueueResume)
 	thumb.POST("/queue/clear", handles.ThumbQueueClear)

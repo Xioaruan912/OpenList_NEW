@@ -222,15 +222,19 @@ const AddOrEdit = () => {
           </Button>
           <Show when={addition.root_folder_id}>
             <Heading size="sm" color="$neutral9">
-              当前挂载文件夹 ID: {addition.root_folder_id}
+              当前挂载文件夹：{addition.root_folder_id.split(",").length} 个
+              {addition.root_folder_id.split(",").length === 1
+                ? `（ID ${addition.root_folder_id}）`
+                : ""}
             </Heading>
           </Show>
         </HStack>
         <FolderPicker115
           opened={pickerOpen}
           cookie={() => addition.cookie || ""}
+          current={addition.root_folder_id}
           onClose={() => setPickerOpen(false)}
-          onPick={(id) => setAddition("root_folder_id", id)}
+          onPick={(ids) => setAddition("root_folder_id", ids.join(","))}
         />
       </Show>
       <HStack
