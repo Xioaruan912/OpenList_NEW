@@ -86,7 +86,12 @@ func ThumbGenerate(c *gin.Context) {
 				if err := os.Remove(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
 					removed++
 				}
+			} else if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+				// 已有缩略图：跳过，避免重复入队与计数（仅统计真正缺失的）
+				continue
 			}
+			// 缺失缩略图的视频：清除 done 标记以便重新入队（含之前失败/中断的）
+			prewarmDone.Delete(rawPath)
 			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
 			queued++
 		}
@@ -627,6 +632,22 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			cur = child
 		}
 	}
+	// 汇总子树计数：Videos/Cached 改为含子目录的累计值，
+	// 与"点击生成（递归）"处理的数量一致，避免"缺 N"与实际入队数对不上
+	var sumSubtree func(n *thumbTreeNode) (vids, cached int)
+	sumSubtree = func(n *thumbTreeNode) (int, int) {
+		v, c := n.Videos, n.Cached
+		for _, ch := range n.Children {
+			cv, cc := sumSubtree(ch)
+			v += cv
+			c += cc
+		}
+		n.Videos, n.Cached = v, c
+		return v, c
+	}
+	for _, m := range root.Children {
+		sumSubtree(m)
+	}
 	status := "complete"
 	if scanFailed > 0 || scanCtx.Err() != nil || dirsCount == 0 {
 		status = "partial"
@@ -1058,4 +1079,56 @@ func ThumbUpload(c *gin.Context) {
 	}
 	wg.Wait()
 	common.SuccessResp(c, gin.H{"uploaded": uploaded, "failed": failed, "total": len(targets)})
+}
+
+// ThumbDeleteFolderReq POST /api/admin/thumb/delete_folder
+type ThumbDeleteFolderReq struct {
+	Path string `json:"path" binding:"required"`
+}
+
+// ThumbDeleteFolder POST /api/admin/thumb/delete_folder
+// 删除指定目录的缩略图文件夹（默认 _thumbnails，含远程网盘文件夹），
+// 同时清空该目录下本地缩略图缓存、失败标记与索引，便于重新生成。
+func ThumbDeleteFolder(c *gin.Context) {
+	var req ThumbDeleteFolderReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	dir := strings.TrimSuffix(req.Path, "/")
+	if dir == "" {
+		common.ErrorStrResp(c, "invalid path", 400)
+		return
+	}
+	ctx := c.Request.Context()
+	// 1) 删除远程缩略图文件夹
+	folder := thumbFolderNameForPath(dir)
+	full := stdpath.Join(dir, folder)
+	if _, err := fs.Get(ctx, full, &fs.GetArgs{NoLog: true}); err == nil {
+		if err := fs.Remove(ctx, full); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	// 2) 清空该目录下本地缓存、失败标记与索引
+	indexed := readThumbIndex()
+	removed := 0
+	var keep []string
+	prefix := dir + "/"
+	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
+	for _, p := range indexed {
+		if strings.HasPrefix(p, prefix) {
+			for _, kind := range kinds {
+				_ = os.Remove(thumbCachePath(kind, p))
+				_ = os.Remove(thumbFailPath(kind, p))
+			}
+			removed++
+			continue
+		}
+		keep = append(keep, p)
+	}
+	if removed > 0 {
+		_ = writeThumbIndex(keep)
+	}
+	common.SuccessResp(c, gin.H{"removed": removed, "folder": full})
 }

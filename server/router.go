@@ -182,6 +182,7 @@ func admin(g *gin.RouterGroup) {
 	thumb.GET("/proxy", handles.ThumbProxyConfig)
 	thumb.POST("/proxy", handles.ThumbProxySet)
 	thumb.POST("/upload", handles.ThumbUpload)
+	thumb.POST("/delete_folder", handles.ThumbDeleteFolder)
 
 	proxy := g.Group("/proxy")
 	proxy.GET("/list", handles.ListProxyNodes)

@@ -3,12 +3,6 @@ import {
   Button,
   HStack,
   Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  ModalOverlay,
   Progress,
   ProgressIndicator,
   ProgressLabel,
@@ -27,6 +21,7 @@ type ThumbStatus = {
   cached_files: number
   fail_markers: number
   cache_size: number
+  cache_dir: string
   prewarm_queued: number
   active_workers: number
   blocked: boolean
@@ -100,8 +95,6 @@ const Thumb = () => {
   const [checked, setChecked] = createSignal<Record<string, boolean>>({})
   const [expanded, setExp] = createSignal<Set<string>>(new Set())
   const [treeLoading, setTreeLoading] = createSignal(false)
-  const [open, setOpen] = createSignal(false)
-  const [startPath, setStart] = createSignal("/")
   const [stale, setStale] = createSignal<{ dir: string; count: number }[]>([])
   const [mounts, setMounts] = createSignal<string[]>([])
   const [oldP, setOldP] = createSignal("")
@@ -171,8 +164,7 @@ const Thumb = () => {
         const data = d as { queued?: number; blocked?: boolean; truncated?: boolean }
         notify.success(
           `已加入队列：${data.queued || 0} 个` +
-            (data.truncated ? "（已达单次上限，可再次点击分批生成）" : "") +
-            "，按当前生成强度分批生成",
+            (data.truncated ? "（已达单次上限，可再次点击分批生成）" : ""),
         )
         setTotalQueued((t) => t + (data.queued || 0))
         load()
@@ -212,31 +204,26 @@ const Thumb = () => {
     })
   }
 
-  const runAll = async () => {
-    setBusy("一键")
+  const deleteDir = async (pp: string) => {
+    if (!window.confirm(`确认删除该目录的缩略图文件夹及本地缓存？（${pp}）`)) return
+    setBusy("del-" + pp)
     try {
-      const resp = await r.post("/admin/thumb/generate", {
-        path: startPath(),
-        recursive: true,
-      })
+      const resp = await r.post("/admin/thumb/delete_folder", { path: pp })
       handleResp(resp, (d) => {
-        const data = d as { queued?: number; blocked?: boolean }
-        notify.success(`已加入队列：${data.queued || 0} 个`)
-        setTotalQueued((t) => t + (data.queued || 0))
-        setOpen(false)
+        const data = d as { removed?: number; folder?: string }
+        notify.success(`已删除缩略图文件夹（${data.folder || ""}），清除 ${data.removed || 0} 个本地缩略图`)
+        loadTree()
+        if (sel() === pp) {
+          setSelFiles([])
+          setSelCount(0)
+          setSelExcluded([])
+          setChecked({})
+        }
         load()
       })
     } finally {
       setBusy("")
     }
-  }
-
-  const genSel = (force: boolean) => {
-    if (!sel()) {
-      notify.warning("请先选择目录")
-      return
-    }
-    queueGen(sel(), force)
   }
 
   const retrySel = async () => {
@@ -400,6 +387,19 @@ const Thumb = () => {
     loadDir(pp)
   }
 
+  const findNode = (ns: TreeNode[], p: string): TreeNode | undefined => {
+    for (const n of ns || []) {
+      if (n.path === p) return n
+      if (n.children?.length) {
+        const f = findNode(n.children, p)
+        if (f) return f
+      }
+    }
+    return undefined
+  }
+
+  const selNode = () => findNode(tree(), sel())
+
   const TN = (nn: TreeNode, depth: number) => (
     <>
       <HStack
@@ -416,16 +416,18 @@ const Thumb = () => {
         style={{ "padding-left": `${10 + depth * 10}px`, cursor: "pointer" }}
         onClick={() => selectDir(nn.path)}
       >
-        <Button
-          size="xs"
-          variant="subtle"
-          onClick={(e) => {
-            e.stopPropagation()
-            toggle(nn.path)
-          }}
-        >
-          {expanded().has(nn.path) ? "▾" : "▸"}
-        </Button>
+        <Show when={(nn.children || []).length > 0} fallback={<Box w="$7" />}>
+          <Button
+            size="xs"
+            variant="subtle"
+            onClick={(e) => {
+              e.stopPropagation()
+              toggle(nn.path)
+            }}
+          >
+            {expanded().has(nn.path) ? "▾" : "▸"}
+          </Button>
+        </Show>
         <Box mr="$1">📁</Box>
         <Box css={{ flex: "1 1 auto", "word-break": "break-all", "font-size": "$sm" }}>
           {nn.name}
@@ -455,29 +457,23 @@ const Thumb = () => {
         >
           上传
         </Button>
+        <Button
+          size="xs"
+          colorScheme="danger"
+          disabled={busy() === "del-" + nn.path}
+          onClick={(e) => {
+            e.stopPropagation()
+            deleteDir(nn.path)
+          }}
+        >
+          删除
+        </Button>
       </HStack>
       <Show when={expanded().has(nn.path) && (nn.children || []).length > 0}>
         <For each={nn.children}>{(q) => TN(q, depth + 1)}</For>
       </Show>
     </>
   )
-
-  const flat = () => {
-    const out: { path: string; name: string; cached: number; depth: number }[] = []
-    const walk = (ns: TreeNode[], d: number) => {
-      for (const k of ns || []) {
-        out.push({ path: k.path, name: k.name, cached: k.cached, depth: d })
-        if (k.children && k.children.length) walk(k.children, d + 1)
-      }
-    }
-    walk(tree(), 0)
-    return out
-  }
-
-  const allDirs = () =>
-    [
-      { path: "/", name: "/", cached: st()?.cached_files || 0, depth: 0 },
-    ].concat(flat())
 
   load()
   loadTree()
@@ -522,6 +518,16 @@ const Thumb = () => {
         >
           占用 {((st()?.cache_size || 0) / 1048576).toFixed(1)} MB
         </Box>
+        <Show when={st()?.cache_dir}>
+          <Box
+            p="$3"
+            rounded="$lg"
+            border="1px solid $neutral7"
+            background={useColorModeValue("$neutral1", "$neutral2")()}
+          >
+            缓存目录 {st()!.cache_dir}
+          </Box>
+        </Show>
       </HStack>
 
       {/* 代理节点选择 */}
@@ -665,18 +671,9 @@ const Thumb = () => {
         >
           <ProgressIndicator color="$info6" />
         </Progress>
-        <HStack spacing="$2" alignItems="center" mt="$2" wrap={{ "@initial": "wrap", "@md": "unset" }}>
-          <Text fontWeight="$medium">生成控制</Text>
-          <Text fontSize="$sm" color="$neutral10">
-            生成已解锁为最大速度（8 worker、不节流、不限速）
-          </Text>
-        </HStack>
       </Box>
 
       <HStack spacing="$2" alignItems="center" wrap={{ "@initial": "wrap", "@md": "unset" }}>
-        <Button colorScheme="accent" loading={busy() === "一键"} onClick={() => setOpen(true)}>
-          一键缩略图
-        </Button>
         <Button colorScheme="warning" onClick={retryAll}>
           重试全部失败
         </Button>
@@ -684,7 +681,7 @@ const Thumb = () => {
           清空全部缩略图
         </Button>
         <Text fontSize="$sm" color="$neutral10">
-          点击目录查看已有缩略图，可勾选排除不需要缩略图的视频；生成已解锁为最大速度（8 worker 并发、不节流）
+          点击目录查看已有缩略图，可勾选排除不需要缩略图的视频
         </Text>
       </HStack>
 
@@ -717,13 +714,11 @@ const Thumb = () => {
             {sel() || "未选择目录"}
           </Text>
           <HStack spacing="$1" mt="$2" wrap="wrap">
+            <Tag colorScheme="neutral">共有 {selNode()?.videos || 0} 个媒体</Tag>
             <Tag colorScheme="info">已有缩略图 {selCount()} 个</Tag>
             <Tag colorScheme={selExcluded().length ? "warning" : "neutral"}>
               已排除 {selExcluded().length} 个
             </Tag>
-            <Button size="xs" disabled={!sel()} onClick={() => genSel(false)}>
-              生成缺失
-            </Button>
             <Button
               size="xs"
               colorScheme="info"
@@ -731,9 +726,6 @@ const Thumb = () => {
               onClick={() => uploadDir(sel())}
             >
               上传
-            </Button>
-            <Button size="xs" colorScheme="accent" disabled={!sel()} onClick={() => genSel(true)}>
-              重建优化
             </Button>
             <Button size="xs" colorScheme="warning" disabled={!sel()} onClick={retrySel}>
               重试失败
@@ -825,51 +817,6 @@ const Thumb = () => {
           </HStack>
         </VStack>
       </Show>
-
-      <Modal opened={open()} onClose={() => setOpen(false)} size={{ "@initial": "xs", "@md": "md" }}>
-        <ModalOverlay />
-        <ModalContent>
-          <ModalHeader>一键缩略图</ModalHeader>
-          <ModalBody>
-            <Text fontSize="$sm" color="$neutral10">
-              选择起始目录，递归扫描并生成该目录下缺失的视频缩略图（跳过已有缓存与已排除视频，按 5 个一批提交）
-            </Text>
-            <Box mt="$2" maxH="300px" overflowY="auto" rounded="$md" border="1px solid $neutral6" p="$1">
-              <For each={allDirs()}>
-                {(q) => (
-                  <Box
-                    p="$2"
-                    rounded="$sm"
-                    _hover={{ bgColor: useColorModeValue("$neutral2", "$neutral3")() }}
-                    background={
-                      startPath() === q.path
-                        ? useColorModeValue("$info2", "$info3")()
-                        : useColorModeValue("$neutral1", "$neutral2")()
-                    }
-                    cursor="pointer"
-                    onClick={() => setStart(q.path)}
-                  >
-                    <Box css={{ flex: "1 1 auto", "word-break": "break-all", "font-size": "$sm" }}>
-                      {q.path === "/" ? "根目录 /（所有挂载）" : "📁 " + q.path}
-                    </Box>
-                    <Tag colorScheme="neutral" ml="$2">
-                      {q.cached}
-                    </Tag>
-                  </Box>
-                )}
-              </For>
-            </Box>
-          </ModalBody>
-          <ModalFooter display="flex" gap="$2" mt="$3" justifyContent="flex-end">
-            <Button colorScheme="neutral" onClick={() => setOpen(false)}>
-              取消
-            </Button>
-            <Button colorScheme="accent" loading={busy() === "一键"} onClick={runAll}>
-              开始生成
-            </Button>
-          </ModalFooter>
-        </ModalContent>
-      </Modal>
     </VStack>
   )
 }
