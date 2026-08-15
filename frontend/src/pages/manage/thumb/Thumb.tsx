@@ -95,6 +95,7 @@ const Thumb = () => {
   const [genActive, setGenActive] = createSignal(0)
   const [genBlocked, setGenBlocked] = createSignal(false)
   const [totalQueued, setTotalQueued] = createSignal(0)
+  const [baseCached, setBaseCached] = createSignal<number | null>(null)
   const [busy, setBusy] = createSignal("")
   const [sel, setSel] = createSignal("")
   const [selFiles, setSelFiles] = createSignal<string[]>([])
@@ -119,6 +120,7 @@ const Thumb = () => {
       const data = d as ThumbStatus
       setSt(data)
       setQueued(data.prewarm_queued || 0)
+      if (baseCached() === null) setBaseCached(data.cached_files || 0)
       setStale(data.stale_by_dir || [])
       setMounts(data.mounts || [])
       setOldP((data.stale_by_dir || [])[0]?.dir.split("/").slice(0, 2).join("/") || "")
@@ -650,12 +652,12 @@ const Thumb = () => {
                   : "空闲"}
           </Tag>
           <Text fontSize="$sm" color="$neutral9">
-            队列剩余 {queued()} 个 · 本次已生成 {Math.min(totalQueued() - queued(), totalQueued())} 个
+            队列剩余 {queued()} 个 · 本次已生成 {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个
           </Text>
         </HStack>
         <Progress
           mt="$2"
-          value={totalQueued() > 0 ? Math.min(100, Math.round(((totalQueued() - queued()) / totalQueued()) * 100)) : 0}
+          value={totalQueued() > 0 ? Math.max(0, Math.min(100, Math.round(((totalQueued() - queued()) / totalQueued()) * 100))) : 0}
           max={100}
           indeterminate={genActive() > 0 && totalQueued() === 0}
           size="sm"
