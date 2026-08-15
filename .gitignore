@@ -32,3 +32,8 @@ output/
 
 .VSCodeCounter
 *.syso
+
+# local build & logs
+/openlist
+/server.log
+__pycache__/

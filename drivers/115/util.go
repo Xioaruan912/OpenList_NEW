@@ -37,6 +37,9 @@ func (d *Pan115) login() error {
 			c.Client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify})
 		},
 	}
+	if px := d.GetProxy(); px != "" {
+		opts = append(opts, driver115.WithProxy(px))
+	}
 	d.client = driver115.New(opts...)
 	// 115 请求必须设超时：网盘风控黑洞连接时 resty 默认永久挂起，
 	// 会导致缩略图预热等后台任务无限卡死

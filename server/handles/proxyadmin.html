@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代理管理与流量监控</title>
+<style>
+:root{--bg:#0f1720;--card:#161f2b;--border:#26313f;--txt:#dbe4f0;--mut:#7d8ea3;--acc:#3b82f6;--ok:#22c55e;--err:#ef4444;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;padding:24px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--mut);margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--txt)}
+.btn.danger{background:transparent;border:1px solid var(--err);color:var(--err)}
+.btn.sm{padding:4px 10px;font-size:12px}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px}
+.mut{color:var(--mut)}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.badge.http{background:rgba(59,130,246,.18);color:#7fb0ff}
+.badge.ss{background:rgba(34,197,94,.16);color:#4ade80}
+.traffic{background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.traffic .k{color:var(--mut);font-size:12px}
+.traffic .v{font-size:16px;font-weight:600}
+.traffic .v.ok{color:var(--ok)}
+.traffic .v.err{color:var(--err)}
+form{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:12px}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)}
+label.full{grid-column:1/-1}
+input,select{background:var(--bg);border:1px solid var(--border);color:var(--txt);border-radius:6px;padding:7px 9px;font-size:13px}
+.actions{margin-top:12px;display:flex;gap:8px}
+code{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:2px 6px;font-size:12px;color:#93c5fd}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;line-height:1.7}
+.hidden{display:none}
+.toast{position:fixed;bottom:20px;right:20px;background:#1e293b;border:1px solid var(--border);border-radius:8px;padding:10px 16px;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+</style>
+</head>
+<body>
+<h1>代理管理与流量监控</h1>
+<div class="sub">在 OpenList 中为 115 缩略图配置多出口代理，降低网盘风控触发概率。部署脚本见 <code>scripts/proxy/proxy_deploy.sh</code></div>
+
+<div class="card">
+  <div class="row">
+    <button class="btn" onclick="showForm()">新增节点</button>
+    <button class="btn ghost" onclick="refreshTraffic()">刷新流量</button>
+    <button class="btn ghost" onclick="toggleHelp()">部署帮助</button>
+  </div>
+  <div id="help" class="hidden" style="margin-top:12px">
+    <pre id="helpText"></pre>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row"><b>节点列表</b><span class="mut" id="count"></span></div>
+  <table>
+    <thead><tr><th>ID</th><th>名称</th><th>类型</th><th>地址</th><th>端口</th><th>统计端口</th><th>备注</th><th>实时流量</th><th>操作</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<div id="formCard" class="card hidden">
+  <div class="row"><b id="formTitle">新增节点</b></div>
+  <form id="form">
+    <input type="hidden" id="f_id">
+    <label>名称<input id="f_name" placeholder="如 vps-hk"></label>
+    <label>类型<select id="f_type"><option value="http">http</option><option value="ss">ss</option></select></label>
+    <label>服务器地址（IP/域名）<input id="f_host" placeholder="1.2.3.4"></label>
+    <label>代理端口<input id="f_port" type="number" placeholder="1080"></label>
+    <label>代理密码<input id="f_password" placeholder="留空表示不修改"></label>
+    <label>统计服务端口（trafficd）<input id="f_traffic_port" type="number" placeholder="如 9386"></label>
+    <label>统计 Token<input id="f_token" placeholder="留空表示不修改"></label>
+    <label class="full">备注<input id="f_remark" placeholder="可选"></label>
+  </form>
+  <div class="actions">
+    <button class="btn" onclick="save()">保存</button>
+    <button class="btn ghost" onclick="hideForm()">取消</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script>
+let nodes = [];
+
+function fmtBytes(n){
+  if (n == null) return '-';
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while(n>=1024 && i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i>1?1:0)+' '+u[i];
+}
+
+function toast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.classList.remove('hidden');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.add('hidden'),2500);
+}
+
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+  const j = await r.json();
+  if (j.code !== 200) throw new Error(j.message||'request failed');
+  return j.data;
+}
+
+async function load(){
+  try{
+    nodes = await api('/api/admin/proxy/list');
+    document.getElementById('count').textContent = nodes.length + ' 个节点';
+    const tb=document.getElementById('tbody'); tb.innerHTML='';
+    nodes.forEach(n=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${n.id}</td><td>${esc(n.name)}</td>
+        <td><span class="badge ${n.type}">${n.type}</span></td>
+        <td>${esc(n.host)}</td><td>${n.port}</td><td>${n.traffic_port||'-'}</td>
+        <td class="mut">${esc(n.remark||'')}</td>
+        <td><div class="mut" id="tf_${n.id}">-</div></td>
+        <td>
+          <button class="btn sm ghost" onclick="edit(${n.id})">编辑</button>
+          <button class="btn sm danger" onclick="del(${n.id})">删除</button>
+        </td>`;
+      tb.appendChild(tr);
+    });
+  }catch(e){ toast('加载失败: '+e.message); }
+}
+
+function esc(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function refreshTraffic(){
+  toast('查询各节点实时流量…');
+  try{
+    const list = await api('/api/admin/proxy/traffic');
+    list.forEach(item=>{
+      const el=document.getElementById('tf_'+item.id);
+      if(!el) return;
+      if(item.error){ el.innerHTML='<span class="v err">'+esc(item.error)+'</span>'; return; }
+      const t=item.traffic;
+      el.innerHTML = `<div class="traffic">
+        <div><div class="k">累计接收 ↓</div><div class="v">${fmtBytes(t.rx_bytes)}</div></div>
+        <div><div class="k">累计发送 ↑</div><div class="v">${fmtBytes(t.tx_bytes)}</div></div>
+        <div><div class="k">接收速率 ↓</div><div class="v">${fmtBytes(t.rx_rate)}/s</div></div>
+        <div><div class="k">发送速率 ↑</div><div class="v">${fmtBytes(t.tx_rate)}/s</div></div>
+        <div><div class="k">连接数</div><div class="v">${t.conns}</div></div>
+        <div><div class="k">运行时长</div><div class="v">${fmtUptime(t.uptime)}</div></div>
+      </div>`;
+    });
+  }catch(e){ toast('流量查询失败: '+e.message); }
+}
+
+function fmtUptime(s){
+  if(s==null) return '-';
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return (d>0?d+'天':'')+h+'时'+m+'分';
+}
+
+function showForm(n){
+  document.getElementById('formTitle').textContent = n?'编辑节点':'新增节点';
+  document.getElementById('f_id').value = n?n.id:'';
+  document.getElementById('f_name').value = n?n.name:'';
+  document.getElementById('f_type').value = n?n.type:'http';
+  document.getElementById('f_host').value = n?n.host:'';
+  document.getElementById('f_port').value = n?n.port:'';
+  document.getElementById('f_password').value = '';
+  document.getElementById('f_traffic_port').value = n?(n.traffic_port||''):'';
+  document.getElementById('f_token').value = '';
+  document.getElementById('f_remark').value = n?(n.remark||''):'';
+  document.getElementById('formCard').classList.remove('hidden');
+}
+function hideForm(){ document.getElementById('formCard').classList.add('hidden'); }
+function edit(id){ showForm(nodes.find(n=>n.id===id)); }
+
+async function save(){
+  const body={
+    id: Number(document.getElementById('f_id').value)||0,
+    name: document.getElementById('f_name').value.trim(),
+    type: document.getElementById('f_type').value,
+    host: document.getElementById('f_host').value.trim(),
+    port: Number(document.getElementById('f_port').value)||0,
+    password: document.getElementById('f_password').value.trim(),
+    traffic_port: Number(document.getElementById('f_traffic_port').value)||0,
+    token: document.getElementById('f_token').value.trim(),
+    remark: document.getElementById('f_remark').value.trim(),
+  };
+  if(!body.name||!body.host||!body.port){ toast('名称/地址/端口必填'); return; }
+  try{
+    await api('/api/admin/proxy/'+(body.id?'update':'create'), {method:'POST', body:JSON.stringify(body)});
+    hideForm(); await load(); toast('已保存');
+  }catch(e){ toast('保存失败: '+e.message); }
+}
+
+async function del(id){
+  if(!confirm('确认删除节点 '+id+' ?')) return;
+  try{
+    await api('/api/admin/proxy/delete', {method:'POST', body:JSON.stringify({id})});
+    await load(); toast('已删除');
+  }catch(e){ toast('删除失败: '+e.message); }
+}
+
+function toggleHelp(){
+  const h=document.getElementById('help');
+  if(h.classList.contains('hidden')){
+    document.getElementById('helpText').textContent =
+`# 一键部署代理（在你的其他 VPS 上执行/或在本地 SSH 部署）
+# 仓库 scripts/proxy/ 下的 proxy_deploy.sh
+
+# 1) http 代理（gost）
+./proxy_deploy.sh --host <VPS地址> --type http --port 1080 --password YOUR_PASS \\
+    --traffic-port 9386 --traffic-token YOUR_TOKEN
+
+# 2) ss 代理（go-shadowsocks2）
+./proxy_deploy.sh --host <VPS地址> --type ss --port 8388 --password YOUR_PASS \\
+    --traffic-port 9386 --traffic-token YOUR_TOKEN
+
+# 查看实时流量
+./proxy_status.sh --host <VPS地址> --traffic-port 9386 --traffic-token YOUR_TOKEN
+
+# 部署完成后，把节点的 地址/端口/密码/统计端口/Token 填到上方表单即可随时查看流量。`;
+    h.classList.remove('hidden');
+  } else h.classList.add('hidden');
+}
+
+load();
+</script>
+</body>
+</html>

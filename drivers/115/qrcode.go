@@ -35,12 +35,16 @@ type FolderInfo struct {
 }
 
 func newQRCodeClient() *driver115.Pan115Client {
-	return driver115.New(
+	opts := []driver115.Option{
 		driver115.UA(getQRCodeUA()),
 		func(c *driver115.Pan115Client) {
 			c.Client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify})
 		},
-	)
+	}
+	if px := conf.Conf.ProxyAddress; px != "" {
+		opts = append(opts, driver115.WithProxy(px))
+	}
+	return driver115.New(opts...)
 }
 
 func getQRCodeUA() string {

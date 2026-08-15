@@ -3,6 +3,7 @@ package _115
 import (
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
@@ -13,7 +14,16 @@ type Addition struct {
 	LimitRate   float64 `json:"limit_rate" type:"float" default:"2" help:"限制所有 115 接口请求速率（[limit] 次/秒），建议保持默认以规避风控"`
 	ThumbStore  string  `json:"thumb_store" type:"select" options:"local,remote" default:"local" help:"local：缩略图缓存在服务器磁盘；remote：缩略图上传到视频同级的 _thumbnails 文件夹（不占服务器磁盘）"`
 	ThumbFolder string  `json:"thumb_folder" type:"text" default:"_thumbnails" help:"thumb_store 为 remote 时，存储缩略图的文件夹名"`
+	Proxy       string  `json:"proxy" type:"text" help:"115 请求代理（http://host:port、socks5://host:port 或带账号 http://user:pass@host:port），115 API 与缩略图下载均走该代理以分散出口 IP 降低风控；留空则使用全局 proxy_address"`
 	driver.RootID
+}
+
+// GetProxy 返回存储级代理配置，未配置时回退到全局 proxy_address
+func (a *Addition) GetProxy() string {
+	if a.Proxy != "" {
+		return a.Proxy
+	}
+	return conf.Conf.ProxyAddress
 }
 
 // ThumbStoreRemote 缩略图是否存到视频所在网盘目录

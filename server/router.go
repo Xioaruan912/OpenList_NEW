@@ -176,6 +176,14 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/exclude", handles.ThumbExclude)
 	thumb.POST("/migrate", handles.ThumbMigrate)
 
+	proxy := g.Group("/proxy")
+	proxy.GET("", handles.ProxyAdminPage) // 独立管理页（不依赖前端构建产物）
+	proxy.GET("/list", handles.ListProxyNodes)
+	proxy.POST("/create", handles.CreateProxyNode)
+	proxy.POST("/update", handles.UpdateProxyNode)
+	proxy.POST("/delete", handles.DeleteProxyNode)
+	proxy.GET("/traffic", handles.ProxyTraffic)
+
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)
 	driver.GET("/names", handles.ListDriverNames)

@@ -123,6 +123,83 @@ curl -fsSL https://github.com/Xioaruan912/OpenList_NEW/raw/main/install.sh | bas
 
 可选环境变量：`INSTALL_DIR`（安装目录）、`OPENLIST_PORT`（端口）、`INSTALL_BRANCH`（分支）。
 
+### 4. 115 缩略图防风控（多出口代理）
+
+#### 背景
+
+- 图片缩略图：115 列表接口对图片返回官方缩略图地址（`thumb.115.com`），本程序直接透出，**不触发任何下载**，无风控风险。
+- 视频缩略图：115 列表接口对视频**不返回**缩略图（`u` 字段恒为空），只能由服务器下载视频片段本地 ffmpeg 抽帧生成。高频下载会触发 115 风控（`115 风控` / 接口拒绝）。
+
+#### 缓解手段（三层）
+
+1. **官方透出**：图片直接使用 115 官方缩略图，不占服务器流量。
+2. **多出口代理**：视频片段下载与 115 API 请求可走用户自建的代理节点，**分散出口 IP**，降低单 IP 触发概率。
+3. **后台节流 + 风控熔断**：缩略图生成按 5 个一批、批间 20s 提交；检测到存储处于 115 风控时自动跳过生成，风控解除后继续。
+
+#### 115 存储的代理配置
+
+在 115 存储的「代理」字段填入代理地址（留空则使用全局配置 `proxy_address`）：
+
+| 格式 | 说明 |
+|---|---|
+| `http://host:port` | HTTP 代理 |
+| `http://user:pass@host:port` | HTTP 代理（带认证） |
+| `socks5://host:port` | SOCKS5 代理 |
+
+该代理作用于 **115 API 请求**（登录、扫码、列目录）与 **缩略图相关下载**（视频片段抽帧、图片/音频/远程缩略图读取）。
+
+> 说明：OpenList 端仅消费 `http://` / `socks5://` 代理（Go 标准库）。如果你希望用 `ss` 协议，请用下方脚本部署，脚本会自动额外开放一个 HTTP 端口供 OpenList 使用。
+
+#### 一键部署代理脚本
+
+仓库 `scripts/proxy/` 提供**一键部署脚本**，可把代理与流量统计服务（trafficd）部署到你的任意 VPS（Debian/Ubuntu/CentOS/Alpine，x86_64/arm64）：
+
+```bash
+cd scripts/proxy
+
+# http 代理（OpenList 直接使用）
+./proxy_deploy.sh --host <VPS地址> --type http --port 1080 --password 你的密码 \
+    --traffic-port 9386 --traffic-token 统计token
+
+# ss 代理（自动补一个 http 端口供 OpenList 用）
+./proxy_deploy.sh --host <VPS地址> --type ss --port 8388 --password 你的密码 \
+    --http-port 1080 --traffic-port 9386 --traffic-token 统计token
+
+# 查看实时流量
+./proxy_status.sh --host <VPS地址> --traffic-port 9386 --traffic-token 统计token
+```
+
+脚本自动完成：SSH 连接检测 → 下载/上传 gost 静态二进制（或使用 `scripts/proxy/bin/` 下预置的 `gost-linux-<arch>` 离线包）→ 部署 trafficd 统计服务 → 注册 systemd 服务并开机自启 → 输出部署摘要与 OpenList 填法。
+
+可选参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--ssh-user` | root | SSH 用户 |
+| `--ssh-port` | 22 | SSH 端口 |
+| `--admin-ip` | 0.0.0.0/0 | 允许访问流量统计的网段（建议限定为 OpenList 服务器公网 IP） |
+| `--dev` | 空 | 只统计指定网卡（如 eth0），默认统计全部网卡 |
+
+#### 流量查看
+
+部署后有两种查看方式：
+
+1. **命令行**：`./proxy_status.sh --host ... --traffic-token ...` 显示累计流量、实时速率、连接数、运行时长。
+2. **管理后台**：侧边栏「代理管理与流量监控」（`/api/admin/proxy` 独立页），可新增/编辑/删除代理节点，一键刷新实时流量。
+
+管理后台 API：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/admin/proxy` | GET | 代理管理页（独立 HTML，不依赖前端构建产物） |
+| `/api/admin/proxy/list` | GET | 节点列表 |
+| `/api/admin/proxy/create` | POST | 新增节点 |
+| `/api/admin/proxy/update` | POST | 更新节点 |
+| `/api/admin/proxy/delete` | POST | 删除节点 |
+| `/api/admin/proxy/traffic` | GET | 批量查询各节点实时流量（rx/tx 累计与速率、连接数、运行时长） |
+
+流量统计由部署在代理 VPS 上的 **trafficd**（`scripts/proxy/trafficd.py`，零依赖纯 Python 标准库）提供：通过 `/proc/net/dev` 差值统计累计流量与实时速率、`/proc/net/tcp` 统计当前连接数；`GET /stats?token=xxx` 返回 JSON，带网段白名单与 token 鉴权。
+
 ## 快速部署
 
 ### 方式一：一键脚本（推荐）
