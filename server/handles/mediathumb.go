@@ -75,6 +75,21 @@ var (
 	errThumbBlank    = errors.New("blank thumbnail")
 )
 
+// isPermanentThumbError 判断生成失败是否属于"永久性"（重试无意义）：
+// 115 文件级拦截（403/pmt）、下载被拒等。这类错误写失败标记、不重试，避免长时间空转。
+func isPermanentThumbError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{"403", "405", "pmt", "forbidden", "access denied", "proxy authentication", "unable to extract any video frame"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // isBlankThumb 判断生成的缩略图是否为近纯色/空白图（抽帧失败时 ffmpeg 常输出纯白图）。
 // 采用网格采样：99% 以上像素与左上角基准色相差 <=10 视为空白。
 func isBlankThumb(png []byte) bool {
@@ -1083,6 +1098,13 @@ func processTask(task thumbPrewarmTask) {
 		return
 	}
 	if err != nil {
+		// 永久性失败（文件被 115 拦截/结构损坏等）：写失败标记、不重试，让用户可见
+		if isPermanentThumbError(err) {
+			log.Warnf("thumb prewarm permanent fail [%s] %s: %v", task.kind, task.rawPath, err)
+			markThumbFailed(task.kind, task.rawPath)
+			prewarmDone.Store(task.rawPath, struct{}{})
+			return
+		}
 		// 生成失败不写 fail 标记（可能为网盘风控等临时问题），
 		// 长间隔退避重试（风控冻结通常 10-30 分钟，短间隔只会加重风控）
 		if task.retry < 3 && !errors.Is(err, errThumbNoCover) && !errors.Is(err, errThumbTooLarge) {
