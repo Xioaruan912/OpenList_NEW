@@ -35,6 +35,8 @@ func Init(e *gin.Engine) {
 	g.GET("/robots.txt", handles.Robots)
 	g.GET("/manifest.json", static.ManifestJSON)
 	g.GET("/i/:link_name", handles.Plist)
+	// 代理管理页：独立静态页，自行校验 token（支持 ?token= 供管理后台 iframe 内嵌）
+	g.GET("/api/admin/proxy", handles.ProxyAdminPage)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
@@ -177,7 +179,6 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/migrate", handles.ThumbMigrate)
 
 	proxy := g.Group("/proxy")
-	proxy.GET("", handles.ProxyAdminPage) // 独立管理页（不依赖前端构建产物）
 	proxy.GET("/list", handles.ListProxyNodes)
 	proxy.POST("/create", handles.CreateProxyNode)
 	proxy.POST("/update", handles.UpdateProxyNode)

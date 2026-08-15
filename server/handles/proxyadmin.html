@@ -86,6 +86,12 @@ pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;paddin
 <script>
 let nodes = [];
 
+function getToken(){
+  const q = new URLSearchParams(location.search).get("token");
+  if (q) return q;
+  try { return localStorage.getItem("token") || ""; } catch(e) { return ""; }
+}
+
 function fmtBytes(n){
   if (n == null) return '-';
   const u=['B','KB','MB','GB','TB']; let i=0;
@@ -100,7 +106,9 @@ function toast(msg){
 }
 
 async function api(path, opts){
-  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+  const t = getToken();
+  const headers = Object.assign({'Content-Type':'application/json'}, t ? {'Authorization': t} : {});
+  const r = await fetch(path, Object.assign({headers}, opts||{}));
   const j = await r.json();
   if (j.code !== 200) throw new Error(j.message||'request failed');
   return j.data;

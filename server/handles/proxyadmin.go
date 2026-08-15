@@ -1,21 +1,51 @@
 package handles
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
 
-// ProxyAdminPage GET /admin/proxy
-// 代理管理与流量查看页（独立静态页，不依赖前端构建产物）
+// ProxyAdminPage GET /api/admin/proxy
+// 代理管理与流量查看页（独立静态页，不依赖前端构建产物）。
+// 未挂载 AuthAdmin 中间件，由本 handler 自行验证：
+//   - 优先取 Authorization 头，其次取 ?token= 查询参数（供管理后台 iframe 内嵌使用）
+//   - 支持管理员 token（设置中的 token）与用户 JWT，且必须是 admin 角色
 func ProxyAdminPage(c *gin.Context) {
+	token := c.GetHeader("Authorization")
+	if token == "" {
+		token = c.Query("token")
+	}
+	if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(setting.GetStr(conf.Token))) == 1 {
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		_, _ = c.Writer.Write(proxyAdminHTML)
+		return
+	}
+	if token == "" {
+		common.ErrorStrResp(c, "login required", 401)
+		return
+	}
+	claims, err := common.ParseToken(token)
+	if err != nil {
+		common.ErrorStrResp(c, "invalid token", 401)
+		return
+	}
+	user, err := op.GetUserByName(claims.Username)
+	if err != nil || !user.IsAdmin() {
+		common.ErrorStrResp(c, "you are not an admin", 403)
+		return
+	}
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	_, _ = c.Writer.Write(proxyAdminHTML)
 }
