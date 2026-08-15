@@ -372,7 +372,7 @@ func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
 		item.TXRate = txRate
 		item.Conns = conns
 		item.IsRisk = n.IsRisk()
-		item.Health = nodeHealthSnapshot(n.ID)
+		item.Health = nodeHealthSnapshot(n.ID, n.Address())
 		out = append(out, item)
 	}
 	// 并行拉取各节点探针（trafficd）；每个 goroutine 只写自己的下标，无竞争

@@ -1,9 +1,12 @@
 package handles
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +35,7 @@ type ProxyHealth struct {
 	LatencyMS   int64  `json:"latency_ms"`
 	Error       string `json:"error,omitempty"`
 	CheckedUnix int64  `json:"checked_at"`
+	Config      string `json:"config,omitempty"` // 检查时的节点地址指纹
 }
 
 var (
@@ -40,18 +44,27 @@ var (
 	proxyHealthBusy  = map[uint]bool{}
 )
 
-// nodeHealthBlocked 节点是否有近期失败的健康记录（用于从代理选择中排除）
-func nodeHealthBlocked(id uint) bool {
+// clearProxyHealth 使某节点的健康缓存失效（配置变更后避免展示旧结果）
+func clearProxyHealth(id uint) {
+	proxyHealthMu.Lock()
+	delete(proxyHealthItems, id)
+	proxyHealthMu.Unlock()
+}
+
+// nodeHealthBlocked 节点是否有近期失败的健康记录（用于从代理选择中排除）。
+// 缓存结果与当前节点配置不符时视为无记录。
+func nodeHealthBlocked(id uint, cfg string) bool {
 	proxyHealthMu.Lock()
 	defer proxyHealthMu.Unlock()
 	e, ok := proxyHealthItems[id]
-	return ok && !e.OK && time.Since(time.Unix(e.CheckedUnix, 0)) < proxyHealthBlockTTL
+	return ok && e.Config == cfg && !e.OK && time.Since(time.Unix(e.CheckedUnix, 0)) < proxyHealthBlockTTL
 }
 
-func nodeHealthSnapshot(id uint) *ProxyHealth {
+// nodeHealthSnapshot 返回节点的健康检查结果；缓存过期或配置不匹配时返回 nil。
+func nodeHealthSnapshot(id uint, cfg string) *ProxyHealth {
 	proxyHealthMu.Lock()
 	defer proxyHealthMu.Unlock()
-	if e, ok := proxyHealthItems[id]; ok && time.Since(time.Unix(e.CheckedUnix, 0)) < proxyHealthFreshTTL {
+	if e, ok := proxyHealthItems[id]; ok && e.Config == cfg && time.Since(time.Unix(e.CheckedUnix, 0)) < proxyHealthFreshTTL {
 		return e
 	}
 	return nil
@@ -65,12 +78,35 @@ func usableProxyNodes() []model.ProxyNode {
 	}
 	out := nodes[:0]
 	for _, n := range nodes {
-		if nodeHealthBlocked(n.ID) {
+		if nodeHealthBlocked(n.ID, n.Address()) {
 			continue
 		}
 		out = append(out, n)
 	}
 	return out
+}
+
+// proxyHealthFriendlyError 把底层错误映射成面向用户的简短中文提示
+func proxyHealthFriendlyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "Client.Timeout"):
+		return "连接超时（节点不可达或网速过慢）"
+	case strings.Contains(msg, "connection refused"):
+		return "连接被拒绝（节点代理未启动）"
+	case strings.Contains(msg, "Proxy Authentication") || strings.Contains(msg, "407"):
+		return "代理认证失败（账号密码错误）"
+	case strings.Contains(msg, "no such host") || strings.Contains(msg, "lookup"):
+		return "域名解析失败"
+	case strings.Contains(msg, "EOF"):
+		return "连接被中断"
+	default:
+		return "连接失败：" + msg
+	}
 }
 
 // checkNodeHealth 对单个节点执行真实流量检查（访问目标站/下载/上传）。
@@ -89,7 +125,7 @@ func checkNodeHealth(n model.ProxyNode) {
 		proxyHealthMu.Unlock()
 	}()
 
-	e := &ProxyHealth{CheckedUnix: time.Now().Unix()}
+	e := &ProxyHealth{CheckedUnix: time.Now().Unix(), Config: n.Address()}
 	cli := resty.New()
 	cli.SetTimeout(12 * time.Second)
 	cli.SetProxy(n.Address())
@@ -121,7 +157,7 @@ func checkNodeHealth(n model.ProxyNode) {
 		break
 	}
 	if lastErr != nil {
-		e.Error = lastErr.Error()
+		e.Error = proxyHealthFriendlyError(lastErr)
 	} else {
 		e.LatencyMS = time.Since(start).Milliseconds()
 	}

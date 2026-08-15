@@ -243,10 +243,22 @@ const Proxy = () => {
               </Box>
               <Tag
                 colorScheme={
-                  n.is_risk ? "danger" : n.status === "disabled" ? "neutral" : "success"
+                  n.is_risk
+                    ? "danger"
+                    : n.status === "disabled"
+                      ? "neutral"
+                      : n.health && !n.health.ok
+                        ? "danger"
+                        : "success"
                 }
               >
-                {n.is_risk ? "风控中" : n.status === "disabled" ? "已停用" : "正常"}
+                {n.is_risk
+                  ? "风控中"
+                  : n.status === "disabled"
+                    ? "已停用"
+                    : n.health && !n.health.ok
+                      ? "不可用"
+                      : "正常"}
               </Tag>
               <Show when={n.is_risk && n.risk_until}>
                 <Tag colorScheme="warning">
@@ -266,6 +278,9 @@ const Proxy = () => {
                   连通正常 {n.health!.latency_ms}ms
                   {!n.health!.upload_ok ? "（上传未验证）" : ""}
                 </Tag>
+              </Show>
+              <Show when={!n.health && n.status !== "disabled"}>
+                <Tag colorScheme="warning">连通检测中…</Tag>
               </Show>
               <Text fontSize="$xs" color="$neutral9" css={{ "text-align": "right" }}>
                 收 {fmtBytes(n.total_rx)} · 发 {fmtBytes(n.total_tx)}

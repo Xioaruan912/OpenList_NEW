@@ -60,6 +60,7 @@ func CreateProxyNode(c *gin.Context) {
 		return
 	}
 	refreshThumbProxyAssign()
+	clearProxyHealth(node.ID)
 	go checkNodeHealth(*node)
 	common.SuccessResp(c, node)
 }
@@ -97,6 +98,7 @@ func UpdateProxyNode(c *gin.Context) {
 		return
 	}
 	refreshThumbProxyAssign()
+	clearProxyHealth(req.ID)
 	go checkNodeHealth(*old)
 	common.SuccessResp(c, old)
 }
