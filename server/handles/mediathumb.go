@@ -57,9 +57,10 @@ const (
 	thumbWidth     = 288
 
 	// 长视频内容缩略图：超过阈值时从中间带取样多帧拼成网格
-	thumbMosaicLongSec = 90
-	thumbMosaicFrames  = 9
-	thumbProbeMinSize  = 10 * 1024 * 1024 // 小于该大小的文件不做时长探测
+	thumbMosaicLongSec  = 90
+	thumbMosaicFrames   = 9
+	thumbProbeMinSize   = 10 * 1024 * 1024       // 小于该大小的文件不做时长探测
+	thumbMosaicSkipSize = 2 * 1024 * 1024 * 1024 // 超过该大小的文件跳过远程网格（深偏移 Range 在 115 CDN 不可靠）
 )
 
 var (
@@ -268,8 +269,9 @@ func thumbLinkHeader() http.Header {
 }
 
 // thumbProxyForPath 解析缩略图请求代理：
-//   1) 用户在缩略图页选择的代理节点（off/auto/manual，manual 节点风控时自动切健康节点）
-//   2) 存储级显式代理 / 全局 proxy_address（模式为 off 时走这里）
+//  1. 用户在缩略图页选择的代理节点（off/auto/manual，manual 节点风控时自动切健康节点）
+//  2. 存储级显式代理 / 全局 proxy_address（模式为 off 时走这里）
+//
 // 返回 (代理地址, 代理节点ID)；nodeID=0 表示未走代理节点
 func thumbProxyForPath(rawPath string) (string, uint) {
 	if thumbProxyMode() != thumbProxyModeOff {
@@ -889,7 +891,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	if _, err := ffmpegBin(); err != nil {
 		return nil, err
 	}
-	maxSize := int64(setting.GetInt(conf.ThumbVideoMaxSize, 2*1024*1024*1024))
+	maxSize := int64(setting.GetInt(conf.ThumbVideoMaxSize, 0))
 	link, obj, err := fs.Link(ctx, rawPath, model.LinkArgs{Header: thumbLinkHeader()})
 	if err != nil {
 		return nil, err
@@ -900,15 +902,16 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		proxy, proxyNode = "", 0
 	}
 	size := obj.GetSize()
-	if size > maxSize {
+	// 0 = 不限大小（缩略图只下载开头/末尾 3MB 片段或远程抽帧，不下载整文件，大文件也安全）
+	if maxSize > 0 && size > maxSize {
 		return nil, errThumbTooLarge
 	}
 	remoteURL := apiURL + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
 
 	// moov 在文件尾部时本地片段必然无法解析；长视频仍探测时长后走"中间带"网格（远程抽帧），
-	// 短视频直接远程抽 3s 单帧
+	// 短视频直接远程抽 3s 单帧；超大文件跳过远程网格（深偏移不可靠）
 	if moovAtTail(ctx, link, size, rawPath) {
-		if size > thumbProbeMinSize {
+		if size > thumbProbeMinSize && size <= thumbMosaicSkipSize {
 			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
 				if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
 					return data, nil
@@ -918,8 +921,9 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		return extractVideoFrameRemote(ctx, remoteURL, link.Header)
 	}
 
-	// 长视频：探测时长后从内容中间带抽帧合成网格缩略图（任一帧失败自动降级单帧）
-	if size > thumbProbeMinSize {
+	// 长视频：探测时长后从内容中间带抽帧合成网格缩略图（任一帧失败自动降级单帧）。
+	// 超大文件（>2GB）深偏移 Range 在 115 CDN 上不可靠（partial file），跳过网格直接本地抽帧
+	if size > thumbProbeMinSize && size <= thumbMosaicSkipSize {
 		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
 			if data, err := generateVideoMosaic(ctx, remoteURL, link.Header, dur); err == nil {
 				return data, nil
@@ -937,11 +941,8 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		}
 		return extractVideoFrame(ctx, tmpFile)
 	}
-	// 下载开头片段（moov 在头部时常见情况）
-	if _, err := downloadRange(ctx, link, tmpFile, 0, thumbChunkSize, proxy, proxyNode); err != nil {
-		return nil, err
-	}
-	if data, err := extractVideoFrame(ctx, tmpFile); err == nil {
+	// 下载开头片段（moov 在头部时常见情况；片段不够（大 moov）自动加大重试）
+	if data, ok := thumbExtractRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); ok {
 		return data, nil
 	}
 	// moov 位于文件尾部（探测失败或非标准容器）：ffmpeg 直接 HTTP Range 远程抽帧。
@@ -950,11 +951,39 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	if data, err := extractVideoFrameRemote(ctx, remoteURL, link.Header); err == nil {
 		return data, nil
 	}
-	// 最后兜底：下载末尾片段（moov 在尾部且本地可解析时有效）
-	if _, err := downloadRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy, proxyNode); err != nil {
-		return nil, err
+	// 最后兜底：下载末尾片段（moov 在尾部且本地可解析时有效；同样自动加大片段）
+	if data, ok := thumbExtractRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy, proxyNode); ok {
+		return data, nil
 	}
-	return extractVideoFrame(ctx, tmpFile)
+	return nil, errors.New("unable to extract any video frame")
+}
+
+// thumbExtractRange 下载 [start, start+chunk) 片段并抽帧；抽帧失败自动加大片段。
+// 大 moov 的视频（样本表很大）需要更大的头部/尾部片段才能解析；
+// 大文件直接从更大片段开始，避免小片段反复失败。
+func thumbExtractRange(ctx context.Context, link *model.Link, tmpFile string, start, size int64, proxy string, nodeID uint) ([]byte, bool) {
+	var sizes []int64
+	if size > 512*1024*1024 {
+		sizes = []int64{16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024}
+	} else {
+		sizes = []int64{thumbChunkSize, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024}
+	}
+	for _, chunk := range sizes {
+		limit := chunk
+		if start+limit > size {
+			limit = size - start
+		}
+		if limit <= 0 {
+			break
+		}
+		if _, err := downloadRange(ctx, link, tmpFile, start, limit, proxy, nodeID); err != nil {
+			continue
+		}
+		if data, err := extractVideoFrame(ctx, tmpFile); err == nil {
+			return data, true
+		}
+	}
+	return nil, false
 }
 
 // thumbGenPower 返回生成强度参数。当前不做任何节流约束：以最大速度生成
@@ -1006,9 +1035,9 @@ var thumbActiveWorkers int32
 // thumbActiveTasks 进行中（worker 正在处理）的缩略图任务，供前端展示"正在生成 N 个/哪些文件"
 var (
 	thumbActiveMu     sync.Mutex
-	thumbActiveTasks  = map[string]time.Time{}             // rawPath -> startedAt
-	thumbActiveCancel = map[string]context.CancelFunc{}    // rawPath -> cancel
-	thumbGenEpoch     int64                                 // 生成代际：暂停/清空时递增，用于丢弃旧代任务
+	thumbActiveTasks  = map[string]time.Time{}          // rawPath -> startedAt
+	thumbActiveCancel = map[string]context.CancelFunc{} // rawPath -> cancel
+	thumbGenEpoch     int64                             // 生成代际：暂停/清空时递增，用于丢弃旧代任务
 )
 
 func thumbActiveTrack(rawPath string, active bool) {

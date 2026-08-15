@@ -128,6 +128,10 @@ const Thumb = () => {
       setNewP((data.mounts || [])[0] || "")
       setGenActive(data.active_workers || 0)
       setGenBlocked(!!data.blocked)
+      // 队列排空且无进行中任务：重置本次进度（避免跨批次累积导致进度条不准确）
+      if ((data.prewarm_queued || 0) === 0 && (data.active_workers || 0) === 0) {
+        setTotalQueued(0)
+      }
     })
   }
 
@@ -809,9 +813,16 @@ const Thumb = () => {
         </Show>
         <Progress
           mt="$2"
-          value={totalQueued() > 0 ? Math.max(0, Math.min(100, Math.round(((totalQueued() - queued()) / totalQueued()) * 100))) : 0}
+          value={
+            totalQueued() > 0
+              ? Math.max(
+                  0,
+                  Math.min(100, Math.round(((totalQueued() - queued() - genActive()) / totalQueued()) * 100)),
+                )
+              : 0
+          }
           max={100}
-          indeterminate={genActive() > 0 && totalQueued() === 0}
+          indeterminate={genActive() > 0 && queued() + genActive() >= totalQueued()}
           size="sm"
         >
           <ProgressIndicator color="$info6" />

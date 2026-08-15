@@ -190,7 +190,7 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.IgnoreSystemFiles, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `When enabled, ignores common system files during upload (.DS_Store, desktop.ini, Thumbs.db, and files starting with ._)`},
 
 		// thumbnail settings
-		{Key: conf.ThumbVideoMaxSize, Value: "2147483648", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max video file size (bytes) to generate thumbnail, default 2GB`},
+		{Key: conf.ThumbVideoMaxSize, Value: "0", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max video file size (bytes) to generate thumbnail; 0 = unlimited (thumbnail only downloads 3MB chunks or remote frames, safe for large files)`},
 		{Key: conf.ThumbAudioMaxSize, Value: "52428800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max audio file size (bytes) to extract cover art, default 50MB`},
 		{Key: conf.ThumbImageMaxSize, Value: "20971520", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `max image file size (bytes) to generate thumbnail, default 20MB`},
 		{Key: conf.ThumbCacheTTL, Value: "30", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail cache expire days, default 30`},
