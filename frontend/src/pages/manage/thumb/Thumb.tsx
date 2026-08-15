@@ -118,6 +118,15 @@ const Thumb = () => {
   const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
   let firstStatusLoaded = false
+  const [upStatus, setUpStatus] = createSignal<{
+    active: boolean
+    queued: number
+    done: number
+    failed: number
+    skipped: number
+    total: number
+  }>()
+  let wasUpActive = false
 
   const load = async () => {
     const resp = await r.get("/admin/thumb/status")
@@ -280,20 +289,56 @@ const Thumb = () => {
     try {
       const resp = await r.post("/admin/thumb/upload", { path: pp })
       handleResp(resp, (d) => {
-        const data = d as { uploaded?: number; failed?: number; total?: number }
-        if (!data.uploaded) {
+        const data = d as { queued?: number }
+        if (!data.queued) {
           notify.info("该目录没有可上传的本地缩略图")
         } else {
-          notify.success(
-            `已上传 ${data.uploaded} 个缩略图到网盘 _thumbnails` +
-              (data.failed ? `，失败 ${data.failed} 个` : ""),
-          )
+          notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
         }
-        loadTree()
+        void pollUploadStatus()
       })
     } finally {
       setBusy("")
     }
+  }
+
+  const uploadAll = async () => {
+    setBusy("upload-all")
+    try {
+      const resp = await r.post("/admin/thumb/upload_all", {})
+      handleResp(resp, (d) => {
+        const data = d as { queued?: number }
+        if (!data.queued) {
+          notify.info("没有可上传的本地缩略图")
+        } else {
+          notify.success(`已加入上传队列 ${data.queued} 个（每批 50，间隔 5 秒）`)
+        }
+        void pollUploadStatus()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
+  // 轮询上传队列状态；检测完成时提示并刷新
+  const pollUploadStatus = async () => {
+    const resp = await r.get("/admin/thumb/upload_status")
+    handleResp(resp, (d) => {
+      const s = d as {
+        active: boolean
+        queued: number
+        done: number
+        failed: number
+        skipped: number
+        total: number
+      }
+      setUpStatus(s)
+      if (wasUpActive && !s.active && s.total > 0) {
+        notify.success(`上传完成：成功 ${s.done}，跳过(已存在) ${s.skipped}，失败 ${s.failed}`)
+        loadTree()
+      }
+      wasUpActive = !!s.active
+    })
   }
 
   const viewThumb = async (pp: string) => {
@@ -624,6 +669,7 @@ const Thumb = () => {
   loadProxy()
   const timer = setInterval(() => {
     load()
+    void pollUploadStatus()
   }, 10000)
   onCleanup(() => clearInterval(timer))
 
@@ -863,12 +909,25 @@ const Thumb = () => {
       </Box>
 
       <HStack spacing="$2" alignItems="center" wrap={{ "@initial": "wrap", "@md": "unset" }}>
-        <Button colorScheme="warning" onClick={retryAll}>
-          重试全部失败
-        </Button>
-        <Button colorScheme="danger" disabled={busy() === "全部清空"} onClick={clearAll}>
-          清空全部缩略图
-        </Button>
+          <Button
+            colorScheme="accent"
+            loading={busy() === "upload-all"}
+            onClick={uploadAll}
+          >
+            一键上传
+          </Button>
+          <Button colorScheme="warning" onClick={retryAll}>
+            重试全部失败
+          </Button>
+          <Button colorScheme="danger" disabled={busy() === "全部清空"} onClick={clearAll}>
+            清空全部缩略图
+          </Button>
+          <Show when={upStatus()?.active || (upStatus()?.queued ?? 0) > 0}>
+            <Text fontSize="$sm" color="$info9">
+              上传中：剩余 {upStatus()?.queued ?? 0} · 成功 {upStatus()?.done ?? 0} · 跳过{" "}
+              {upStatus()?.skipped ?? 0} · 失败 {upStatus()?.failed ?? 0}
+            </Text>
+          </Show>
         <Text fontSize="$sm" color="$neutral10">
           点击目录查看已有缩略图，可勾选排除不需要缩略图的视频
         </Text>

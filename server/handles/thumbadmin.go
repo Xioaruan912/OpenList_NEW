@@ -1228,12 +1228,51 @@ func ThumbUpload(c *gin.Context) {
 		common.ErrorStrResp(c, "115 网盘风控中，暂时无法上传缩略图，请稍后再试", 429)
 		return
 	}
-	// 收集该目录下已有本地缩略图的视频
+	targets := collectUploadTargets(dir)
+	if len(targets) == 0 {
+		common.SuccessResp(c, gin.H{"queued": 0, "total": 0})
+		return
+	}
+	thumbUploadEnqueue(targets)
+	common.SuccessResp(c, gin.H{"queued": len(targets), "total": thumbUploadTotal})
+}
+
+// ThumbUploadAll POST /api/admin/thumb/upload_all
+// 一键上传：把所有已有本地缩略图的视频加入上传队列（批量 50 / 间隔 5s / 去重）。
+func ThumbUploadAll(c *gin.Context) {
+	targets := collectUploadTargets("")
+	if len(targets) == 0 {
+		common.SuccessResp(c, gin.H{"queued": 0, "total": 0})
+		return
+	}
+	thumbUploadEnqueue(targets)
+	common.SuccessResp(c, gin.H{"queued": len(targets), "total": thumbUploadTotal})
+}
+
+// ThumbUploadStatus GET /api/admin/thumb/upload_status
+func ThumbUploadStatus(c *gin.Context) {
+	thumbUploadMu.Lock()
+	defer thumbUploadMu.Unlock()
+	common.SuccessResp(c, gin.H{
+		"active":  thumbUploadActive,
+		"queued":  len(thumbUploadQueue),
+		"total":   thumbUploadTotal,
+		"done":    thumbUploadDone,
+		"failed":  thumbUploadFailed,
+		"skipped": thumbUploadSkipped,
+	})
+}
+
+// collectUploadTargets 收集有本地缩略图的视频路径（dir 为空表示全部）
+func collectUploadTargets(dir string) []string {
 	indexed := readThumbIndex()
 	seen := map[string]bool{}
 	var targets []string
 	for _, p := range indexed {
-		if stdpath.Dir(p) != dir || seen[p] {
+		if dir != "" && stdpath.Dir(p) != dir {
+			continue
+		}
+		if seen[p] {
 			continue
 		}
 		if _, err := os.ReadFile(thumbCachePath(thumbKindVideo, p)); err != nil {
@@ -1242,48 +1281,120 @@ func ThumbUpload(c *gin.Context) {
 		seen[p] = true
 		targets = append(targets, p)
 	}
-	if len(targets) == 0 {
-		common.SuccessResp(c, gin.H{"uploaded": 0, "failed": 0, "total": 0})
+	return targets
+}
+
+// ---- 缩略图上传队列（批量 50 / 间隔 5s / 目录清单去重）----
+
+const (
+	thumbUploadBatchSize        = 50
+	thumbUploadBlockedBatchSize = 20 // 风控时动态降低批大小，间隔不变
+	thumbUploadInterval         = 5 * time.Second
+)
+
+var (
+	thumbUploadMu      sync.Mutex
+	thumbUploadQueue   []string
+	thumbUploadTotal   int
+	thumbUploadDone    int
+	thumbUploadFailed  int
+	thumbUploadSkipped int
+	thumbUploadActive  bool
+)
+
+// thumbUploadEnqueue 加入上传队列并启动后台 worker
+func thumbUploadEnqueue(paths []string) {
+	if len(paths) == 0 {
 		return
 	}
-	utils.Log.Infof("thumb upload targets dir=%s n=%d", dir, len(targets))
-	// 并行上传（每个文件独立任务，与生成并发共享 115 上传代理）
-	const uploadConcurrency = 4
-	sem := make(chan struct{}, uploadConcurrency)
-	var (
-		mu       sync.Mutex
-		uploaded int
-		failed   int
-	)
-	var wg sync.WaitGroup
-	for _, p := range targets {
-		wg.Add(1)
-		go func(rawPath string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			data, err := os.ReadFile(thumbCachePath(thumbKindVideo, rawPath))
-			if err != nil {
-				utils.Log.Errorf("thumb upload read cache failed rawPath=%s: %+v", rawPath, err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
-				return
-			}
-			if err := uploadThumbManual(c.Request.Context(), rawPath, data); err != nil {
-				utils.Log.Errorf("thumb upload failed rawPath=%s: %+v", rawPath, err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
-				return
-			}
-			mu.Lock()
-			uploaded++
-			mu.Unlock()
-		}(p)
+	thumbUploadMu.Lock()
+	thumbUploadQueue = append(thumbUploadQueue, paths...)
+	thumbUploadTotal += len(paths)
+	needStart := !thumbUploadActive
+	thumbUploadMu.Unlock()
+	if needStart {
+		go thumbUploadWorker()
 	}
-	wg.Wait()
-	common.SuccessResp(c, gin.H{"uploaded": uploaded, "failed": failed, "total": len(targets)})
+}
+
+func thumbUploadWorker() {
+	for {
+		thumbUploadMu.Lock()
+		if len(thumbUploadQueue) == 0 {
+			thumbUploadActive = false
+			thumbUploadMu.Unlock()
+			return
+		}
+		// 风控中动态降低批大小（正常 50 / 风控 20），间隔保持不变
+		batchSize := thumbUploadBatchSize
+		if globalAnyStorageBlocked() {
+			batchSize = thumbUploadBlockedBatchSize
+		}
+		n := min(batchSize, len(thumbUploadQueue))
+		batch := append([]string(nil), thumbUploadQueue[:n]...)
+		thumbUploadQueue = thumbUploadQueue[n:]
+		thumbUploadActive = true
+		thumbUploadMu.Unlock()
+
+		thumbUploadBatch(batch)
+		time.Sleep(thumbUploadInterval)
+	}
+}
+
+func thumbUploadBatch(batch []string) {
+	ctx := context.Background()
+	byDir := map[string][]string{}
+	for _, p := range batch {
+		d := stdpath.Dir(p)
+		byDir[d] = append(byDir[d], p)
+	}
+	for d, ps := range byDir {
+		// 目录 _thumbnails 清单（去重，1 API/目录带缓存）；
+		// 风控时清单可能加载失败（空），按动态降批（20/5s）继续尝试上传
+		folder := thumbFolderNameForPath(d)
+		names := loadRemoteThumbListing(ctx, d, folderNameOnly{folder})
+		for _, p := range ps {
+			if names[remoteThumbName(p)] {
+				thumbUploadAdd("skipped", 1) // 已上传，去重跳过
+				continue
+			}
+			data, err := os.ReadFile(thumbCachePath(thumbKindVideo, p))
+			if err != nil {
+				thumbUploadAdd("failed", 1)
+				continue
+			}
+			if err := uploadThumbManual(ctx, p, data); err != nil {
+				thumbUploadAdd("failed", 1)
+				continue
+			}
+			// 更新目录清单缓存，后续批次/轮次去重跳过
+			thumbListingMarkUploaded(d, remoteThumbName(p))
+			thumbUploadAdd("done", 1)
+		}
+	}
+}
+
+func thumbUploadAdd(kind string, n int) {
+	thumbUploadMu.Lock()
+	switch kind {
+	case "done":
+		thumbUploadDone += n
+	case "failed":
+		thumbUploadFailed += n
+	case "skipped":
+		thumbUploadSkipped += n
+	}
+	thumbUploadMu.Unlock()
+}
+
+// thumbListingMarkUploaded 在目录缩略图清单缓存中标记已上传（去重）
+func thumbListingMarkUploaded(dirPath, name string) {
+	thumbListingMu.Lock()
+	if e, ok := thumbListing[dirPath]; ok {
+		e.names[name] = true
+		thumbListing[dirPath] = e
+	}
+	thumbListingMu.Unlock()
 }
 
 // ThumbDeleteFolderReq POST /api/admin/thumb/delete_folder
