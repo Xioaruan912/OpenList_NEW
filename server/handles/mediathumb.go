@@ -74,7 +74,42 @@ var (
 
 	errThumbTooLarge = errors.New("file too large for thumbnail")
 	errThumbNoCover  = errors.New("no cover art or cover file found")
+	errThumbBlank    = errors.New("blank thumbnail")
 )
+
+// isBlankThumb 判断生成的缩略图是否为近纯色/空白图（抽帧失败时 ffmpeg 常输出纯白图）。
+// 采用网格采样：99% 以上像素与左上角基准色相差 <=10 视为空白。
+func isBlankThumb(png []byte) bool {
+	img, err := imaging.Decode(bytes.NewReader(png))
+	if err != nil {
+		return false // 无法解码交给上层错误处理
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w < 8 || h < 8 {
+		return true
+	}
+	br, bg, bb, _ := color.RGBAModel.Convert(img.At(b.Min.X, b.Min.Y)).RGBA()
+	baseR, baseG, baseB := uint8(br>>8), uint8(bg>>8), uint8(bb>>8)
+	diff := func(a, c uint8) int {
+		d := int(a) - int(c)
+		if d < 0 {
+			d = -d
+		}
+		return d
+	}
+	same, total := 0, 0
+	for x := b.Min.X; x < b.Max.X; x += 4 {
+		for y := b.Min.Y; y < b.Max.Y; y += 4 {
+			r, g, bl, _ := color.RGBAModel.Convert(img.At(x, y)).RGBA()
+			if diff(uint8(r>>8), baseR) <= 10 && diff(uint8(g>>8), baseG) <= 10 && diff(uint8(bl>>8), baseB) <= 10 {
+				same++
+			}
+			total++
+		}
+	}
+	return total > 0 && float64(same)/float64(total) >= 0.99
+}
 
 // thumbSemMu 动态并发信号量：容量来自设置 thumb_concurrency
 var (
@@ -671,6 +706,12 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		serveThumbPlaceholder(c)
 		return
 	}
+	if isBlankThumb(png) {
+		markThumbFailed(kind, rawPath)
+		log.Warnf("thumb blank [%s] %s", kind, rawPath)
+		serveThumbPlaceholder(c)
+		return
+	}
 	_ = os.WriteFile(cachePath, png, 0o666)
 	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
@@ -799,8 +840,22 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath strin
 	return atTail
 }
 
-// generateVideoThumb 生成视频缩略图（直接请求与预热共用）
+// generateVideoThumb 生成视频缩略图（直接请求与预热共用）。
+// 若经代理下载/抽帧得到空白图（代理中继损坏视频字节的典型表现），
+// 自动回退直连重新生成一次。
 func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]byte, error) {
+	png, err := generateVideoThumbInner(ctx, rawPath, apiURL, true)
+	if err == nil && isBlankThumb(png) {
+		log.Warnf("thumb blank via proxy, retry direct: %s", rawPath)
+		if png2, err2 := generateVideoThumbInner(ctx, rawPath, apiURL, false); err2 == nil {
+			return png2, nil
+		}
+	}
+	return png, err
+}
+
+// generateVideoThumbInner 生成视频缩略图。useProxy=false 时跳过代理直连下载。
+func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string, useProxy bool) ([]byte, error) {
 	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
 		rawPath = "/" + rawPath
 	}
@@ -814,6 +869,9 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	}
 	defer link.Close()
 	proxy, proxyNode := thumbProxyForPath(rawPath)
+	if !useProxy {
+		proxy, proxyNode = "", 0
+	}
 	size := obj.GetSize()
 	if size > maxSize {
 		return nil, errThumbTooLarge
@@ -968,6 +1026,13 @@ func processTask(task thumbPrewarmTask) {
 			return
 		}
 		log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
+		prewarmDone.Store(task.rawPath, struct{}{})
+		return
+	}
+	// 空白/纯色缩略图：视为生成失败（写失败标记、不缓存），避免占着"已有缩略图"名额
+	if isBlankThumb(png) {
+		log.Warnf("thumb prewarm blank [%s] %s", task.kind, task.rawPath)
+		markThumbFailed(task.kind, task.rawPath)
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
@@ -1408,6 +1473,12 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 		// 所有生成失败写负缓存，避免反复下载+抽帧（浪费带宽并刺激网盘风控）
 		remoteThumbMissMark(rawPath)
 		log.Warnf("thumb generate failed [video] %s: %v", rawPath, err)
+		serveThumbPlaceholder(c)
+		return
+	}
+	if isBlankThumb(png) {
+		remoteThumbMissMark(rawPath)
+		log.Warnf("thumb generate blank [video] %s", rawPath)
 		serveThumbPlaceholder(c)
 		return
 	}
