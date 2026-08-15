@@ -54,6 +54,15 @@ type ProxyNode = {
     proxy_conns: number
     at: number
   }
+  health?: {
+    ok: boolean
+    access_ok: boolean
+    download_ok: boolean
+    upload_ok: boolean
+    latency_ms: number
+    error?: string
+    checked_at: number
+  }
 }
 
 const fmtBytes = (n: number) => {
@@ -246,6 +255,17 @@ const Proxy = () => {
               </Show>
               <Show when={n.agent}>
                 <Tag colorScheme="success">探针在线</Tag>
+              </Show>
+              <Show when={n.health && !n.health.ok}>
+                <Tag colorScheme="danger" title={n.health!.error}>
+                  连通失败{n.health!.error ? "：" + n.health!.error : ""}
+                </Tag>
+              </Show>
+              <Show when={n.health && n.health.ok}>
+                <Tag colorScheme="success">
+                  连通正常 {n.health!.latency_ms}ms
+                  {!n.health!.upload_ok ? "（上传未验证）" : ""}
+                </Tag>
               </Show>
               <Text fontSize="$xs" color="$neutral9" css={{ "text-align": "right" }}>
                 收 {fmtBytes(n.total_rx)} · 发 {fmtBytes(n.total_tx)}

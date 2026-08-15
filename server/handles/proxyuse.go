@@ -49,8 +49,8 @@ func resolveThumbProxy() (string, uint) {
 	if mode == thumbProxyModeOff {
 		return "", 0
 	}
-	nodes, err := db.GetUsableProxyNodes()
-	if err != nil || len(nodes) == 0 {
+	nodes := usableProxyNodes()
+	if len(nodes) == 0 {
 		return "", 0
 	}
 	if mode == thumbProxyModeManual {
@@ -146,8 +146,8 @@ func refreshThumbProxyAssign() {
 			}
 		}
 	case thumbProxyModeAuto:
-		nodes, err := db.GetUsableProxyNodes()
-		if err != nil || len(nodes) == 0 {
+		nodes := usableProxyNodes()
+		if len(nodes) == 0 {
 			thumbAssignMu.Lock()
 			thumbDownloadAddr, thumbDownloadID = "", 0
 			thumbAssignMu.Unlock()
@@ -353,6 +353,7 @@ type ProxyNodeTrafficEx struct {
 	WindowRX int64           `json:"window_rx"`
 	WindowTX int64           `json:"window_tx"`
 	Agent    *ProxyNodeAgent `json:"agent,omitempty"` // 节点探针（trafficd）上报
+	Health   *ProxyHealth    `json:"health,omitempty"` // 真实连通性检查结果
 }
 
 func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
@@ -371,6 +372,7 @@ func proxyNodesWithTraffic() []ProxyNodeTrafficEx {
 		item.TXRate = txRate
 		item.Conns = conns
 		item.IsRisk = n.IsRisk()
+		item.Health = nodeHealthSnapshot(n.ID)
 		out = append(out, item)
 	}
 	// 并行拉取各节点探针（trafficd）；每个 goroutine 只写自己的下标，无竞争
@@ -448,6 +450,16 @@ func ThumbProxySet(c *gin.Context) {
 		return
 	}
 	refreshThumbProxyAssign()
+	// 立即触发一次健康检查，让前端尽快看到所选节点的真实连通状态
+	go func() {
+		if req.NodeID != 0 {
+			if n, err := db.GetProxyNodeById(req.NodeID); err == nil {
+				checkNodeHealth(*n)
+			}
+		} else {
+			runProxyHealthChecks()
+		}
+	}()
 	common.SuccessResp(c, thumbProxyConfigData())
 }
 

@@ -37,6 +37,7 @@ func Init(e *gin.Engine) {
 	g.GET("/i/:link_name", handles.Plist)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
 	go handles.StartThumbProxyAssign()
+	go handles.StartProxyHealthCheck()
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
 		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
