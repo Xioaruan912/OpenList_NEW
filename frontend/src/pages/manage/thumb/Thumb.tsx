@@ -23,6 +23,7 @@ type ThumbStatus = {
   cache_size: number
   cache_dir: string
   prewarm_queued: number
+  queue_paused: boolean
   active_workers: number
   blocked: boolean
   stale_by_dir?: { dir: string; count: number }[]
@@ -202,6 +203,48 @@ const Thumb = () => {
       notify.success(`已重试：${data.retried || 0} 个`)
       load()
     })
+  }
+
+  const pauseQueue = async () => {
+    setBusy("queue-pause")
+    try {
+      const resp = await r.post("/admin/thumb/queue/pause", {})
+      handleResp(resp, () => {
+        notify.success("生成队列已暂停")
+        load()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
+  const resumeQueue = async () => {
+    setBusy("queue-resume")
+    try {
+      const resp = await r.post("/admin/thumb/queue/resume", {})
+      handleResp(resp, () => {
+        notify.success("生成队列已恢复")
+        load()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
+  const clearQueue = async () => {
+    if (!window.confirm("确认清空当前生成队列？（已入队的任务将被丢弃，可重新点生成）")) return
+    setBusy("queue-clear")
+    try {
+      const resp = await r.post("/admin/thumb/queue/clear", {})
+      handleResp(resp, (d) => {
+        const data = d as { dropped?: number }
+        notify.success(`已清空队列，丢弃 ${data.dropped || 0} 个任务`)
+        setTotalQueued(0)
+        load()
+      })
+    } finally {
+      setBusy("")
+    }
   }
 
   const deleteDir = async (pp: string) => {
@@ -528,6 +571,24 @@ const Thumb = () => {
             缓存目录 {st()!.cache_dir}
           </Box>
         </Show>
+        <HStack spacing="$2" alignItems="center">
+          <Button
+            size="xs"
+            colorScheme={st()?.queue_paused ? "success" : "warning"}
+            disabled={busy() === "queue-pause" || busy() === "queue-resume"}
+            onClick={() => (st()?.queue_paused ? resumeQueue() : pauseQueue())}
+          >
+            {st()?.queue_paused ? "恢复队列" : "暂停队列"}
+          </Button>
+          <Button
+            size="xs"
+            colorScheme="danger"
+            disabled={busy() === "queue-clear" || !queued()}
+            onClick={clearQueue}
+          >
+            删除队列
+          </Button>
+        </HStack>
       </HStack>
 
       {/* 代理节点选择 */}
@@ -647,16 +708,24 @@ const Thumb = () => {
         <HStack spacing="$2" alignItems="center" wrap="wrap">
           <Tag
             colorScheme={
-              genBlocked() ? "danger" : genActive() > 0 ? "success" : queued() > 0 ? "warning" : "neutral"
+              genBlocked() || st()?.queue_paused
+                ? "danger"
+                : genActive() > 0
+                  ? "success"
+                  : queued() > 0
+                    ? "warning"
+                    : "neutral"
             }
           >
             {genBlocked()
               ? "115 风控中，生成已暂停"
-              : genActive() > 0
-                ? "正在生成中"
-                : queued() > 0
-                  ? "已入队，等待生成"
-                  : "空闲"}
+              : st()?.queue_paused
+                ? "队列已暂停"
+                : genActive() > 0
+                  ? "正在生成中"
+                  : queued() > 0
+                    ? "已入队，等待生成"
+                    : "空闲"}
           </Tag>
           <Text fontSize="$sm" color="$neutral9">
             队列剩余 {queued()} 个 · 本次已生成 {Math.max(0, (st()?.cached_files || 0) - (baseCached() ?? 0))} 个

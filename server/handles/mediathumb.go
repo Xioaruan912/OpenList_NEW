@@ -124,6 +124,8 @@ var (
 	prewarmCh     chan thumbPrewarmTask
 	prewarmDone   sync.Map // path -> done
 	prewarmDirDeb sync.Map // dir -> last prewarm time, 防抖
+	// 队列暂停标记：暂停时 worker 不再取任务，已入队任务保留等待恢复
+	thumbQueuePaused atomic.Bool
 )
 
 const prewarmDebounce = 10 * time.Minute
@@ -893,6 +895,10 @@ func prewarmStart() {
 // prewarmWorker 取到一个任务立即处理，不做批内/批间节流
 func prewarmWorker() {
 	for {
+		// 暂停时阻塞等待恢复
+		for thumbQueuePaused.Load() {
+			time.Sleep(500 * time.Millisecond)
+		}
 		task, ok := <-prewarmCh
 		if !ok {
 			return

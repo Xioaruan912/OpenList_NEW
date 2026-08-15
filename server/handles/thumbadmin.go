@@ -127,6 +127,7 @@ func ThumbStatus(c *gin.Context) {
 		"fail_markers":    failCount,
 		"cache_size":      totalSize,
 		"prewarm_enabled": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
+		"queue_paused":    thumbQueuePaused.Load(),
 	}
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
@@ -187,6 +188,41 @@ func ThumbStatus(c *gin.Context) {
 	status["stale_by_dir"] = thumbStaleByDir(indexed)
 	status["mounts"] = currentMountPaths()
 	common.SuccessResp(c, status)
+}
+
+// ThumbQueuePause POST /api/admin/thumb/queue/pause
+// 暂停缩略图生成队列：worker 停止取任务，已入队任务保留等待恢复。
+func ThumbQueuePause(c *gin.Context) {
+	thumbQueuePaused.Store(true)
+	common.SuccessResp(c, gin.H{"paused": true})
+}
+
+// ThumbQueueResume POST /api/admin/thumb/queue/resume
+// 恢复缩略图生成队列。
+func ThumbQueueResume(c *gin.Context) {
+	thumbQueuePaused.Store(false)
+	common.SuccessResp(c, gin.H{"paused": false})
+}
+
+// ThumbQueueClear POST /api/admin/thumb/queue/clear
+// 清空当前队列：丢弃所有待处理任务，并清除其去重标记，
+// 之后重新点生成可再次入队。返回丢弃的任务数。
+func ThumbQueueClear(c *gin.Context) {
+	if prewarmCh == nil {
+		common.SuccessResp(c, gin.H{"dropped": 0})
+		return
+	}
+	dropped := 0
+	for {
+		select {
+		case task := <-prewarmCh:
+			prewarmDone.Delete(task.rawPath)
+			dropped++
+		default:
+			common.SuccessResp(c, gin.H{"dropped": dropped})
+			return
+		}
+	}
 }
 
 // currentMountPaths 返回当前所有存储的挂载路径列表
