@@ -1,5 +1,7 @@
 # Agent Instructions
 
+> 开始开发前，请先阅读 [`DEVELOPMENT.md`](DEVELOPMENT.md)：里面包含本仓库的架构速览、构建/部署/验证流程、前端设计规范、后端开发规范，以及 115 与代理系统的关键事实。**不要重复造已存在的功能。**
+
 ## Issues
 
 Before creating an issue, review the available issue templates in the `.github` directory.

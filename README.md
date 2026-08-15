@@ -18,8 +18,10 @@
 |---|---|
 | **115 扫码登录** | 添加存储页扫码登录 115，免手动抓 Cookie，支持多设备/多根挂载/可视化选文件夹 |
 | **视频缩略图** | ffmpeg 自动为视频生成缩略图；长视频生成 3×3 内容拼图；音频取专辑封面；图片/目录缩略图 |
-| **缩略图管理后台** | 目录树、批量生成/重建/排除/清空、挂载迁移、失败重试，全部可视化 |
-| **多出口防风控代理** | 缩略图下载可走自建代理节点分散出口 IP；节点一键部署、实时监控、自动风控切换 |
+| **缩略图管理后台** | 目录树、批量生成/排除/清空、失败重试、**上传到网盘 `_thumbnails`**、**点击文件名查看缩略图**、**暂停/恢复/清空生成队列**，全部可视化 |
+| **多出口防风控代理** | 缩略图下载可走自建代理节点分散出口 IP；节点一键部署、**真实连通性健康检查**、自动风控切换 |
+| **全局代理策略** | 在「代理管理」页控制 115 访问侧出站代理（off/手动/auto）：**auto 检测到 115 风控时自动走健康节点，正常时直连** |
+| **代理节点健康检查** | 通过节点实测 访问目标站/下载/上传，失败节点标记【不可用】并从选择中排除 |
 | **一键安装** | 根目录 `install.sh` 全新 VPS 一条命令部署（自动编译前后端 + systemd 托管） |
 
 ---
@@ -140,22 +142,27 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 
 ### 3. 多出口防风控代理
 
-115 网盘对单个出口 IP 的请求频率敏感，本功能让缩略图下载分散到多个自建代理节点，降低风控触发概率。
+115 网盘对单个出口 IP 的请求频率敏感，本功能让缩略图下载与 115 访问分散到多个自建代理节点，降低风控触发概率。
 
 **部署链路：节点配置 → 复制安装命令 → VPS 一键部署 → OpenList 监控 + 使用**
 
-1. 「代理管理」页**新增节点**（名称/协议 http 或 ss/地址/端口/密码）
+1. 「代理管理」页**新增节点**（名称/协议 http 或 ss/地址/端口/密码；`ss` 节点按 SOCKS5 连接）
 2. 点节点上的「**安装命令**」按钮，复制生成的命令
 3. 在节点 VPS 上以 root 执行该命令，自动部署 `gost` 代理 + `trafficd` 流量探针（systemd 托管，重启自启）：
    ```bash
    curl -fsSL http://<OpenList地址>/api/proxy/install.sh | bash -s -- --type http --port 1080 --password 你的密码
    ```
    > 安装脚本由 OpenList 服务直接下发（`/api/proxy/install.sh`，免登录），不依赖 GitHub 可达性。
-4. 约 10 秒后节点显示「**探针在线**」，可查看实时速率、代理连接数、累计流量与运行时长
-5. 「缩略图」页选择代理模式：
+4. 约 10 秒后节点显示「**探针在线**」，同时 OpenList 会**通过节点实测 访问目标站/下载/上传**做真实连通性检查：失败节点标红【不可用】并从自动选择中排除，连通恢复正常自动解除
+5. 「缩略图」页选择代理模式（控制**缩略图下载/抽帧**）：
    - **关闭**：走存储代理 / 全局 `proxy_address`（默认）
    - **自动切换**：自动选择最近最少使用的健康节点；节点连续失败 ≥3 次自动标记**风控**并切换，30 分钟后自动恢复
    - **手动指定**：固定走指定节点，不可用时自动回退健康节点
+6. 「代理管理」页顶部的**全局代理策略**（控制 **115 访问侧**——列表/搜索/上传等驱动请求）：
+   - **关闭**：直连（默认）
+   - **自动（仅风控时走代理）**：检测到任一 115 挂载风控时自动切到健康节点，正常时直连（反应式，30s 轮询）
+   - **手动指定**：始终走指定节点
+   - `/d` 下载与在线播放保持 302 直连 CDN（快，不经过代理节点）
 
 > 流量统计口径：管理后台显示的累计/速率**只统计经该节点的缩略图下载流量**（OpenList 侧计数），非 VPS 整机流量。
 
@@ -182,8 +189,12 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 | `/vt/*path` `/at/*path` `/it/*path` `/ct/*path` | GET | 视频 / 音频 / 图片 / 目录封面 |
 | `/api/admin/thumb/status` | GET | 缩略图统计 |
 | `/api/admin/thumb/tree` | GET | 目录树 |
-| `/api/admin/thumb/dir` | GET | 指定目录缩略图清单 |
-| `/api/admin/thumb/generate` | POST | 批量生成（path/recursive/force） |
+| `/api/admin/thumb/dir` | GET | 指定目录所有媒体文件清单（含 has_thumb 标记） |
+| `/api/admin/thumb/view` | GET | 返回指定视频缩略图 PNG（读缓存/生成） |
+| `/api/admin/thumb/generate` | POST | 批量生成（只统计真正缺失的，递归） |
+| `/api/admin/thumb/upload` | POST | 将本地缩略图上传到网盘 `_thumbnails/` |
+| `/api/admin/thumb/delete_folder` | POST | 删除目录的 `_thumbnails` 文件夹并清本地缓存 |
+| `/api/admin/thumb/queue/pause` `/resume` `/clear` | POST | 暂停 / 恢复 / 清空生成队列 |
 | `/api/admin/thumb/retry_fails` | POST | 重试失败项 |
 | `/api/admin/thumb/clear` | POST | 清空目录缩略图 |
 | `/api/admin/thumb/exclude` | POST | 排除/恢复视频 |
@@ -197,7 +208,8 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 | `/api/admin/proxy/list` | GET | 节点列表 |
 | `/api/admin/proxy/create` `/update` `/delete` | POST | 节点增删改 |
 | `/api/admin/proxy/install` | GET | 生成一键安装命令 |
-| `/api/admin/proxy/traffic` | GET | 节点 + 流量统计 + 探针状态 |
+| `/api/admin/proxy/traffic` | GET | 节点 + 流量统计 + 探针状态 + 连通性健康 |
+| `/api/admin/proxy/policy` | GET/POST | 全局代理策略（off/auto/manual + 节点） |
 | `/api/admin/proxy/recover` | POST | 解除风控 |
 | `/api/admin/proxy/enable` | POST | 启用/停用 |
 | `/api/admin/thumb/proxy` | GET/POST | 缩略图代理模式（off/auto/manual） |
@@ -241,22 +253,32 @@ systemctl start openlist
 
 <details>
 <summary><b>视频缩略图加载很慢？</b></summary>
-首次访问需下载视频片段 + ffmpeg 抽帧（数秒~十几秒），之后秒开。可在「缩略图」页对目标目录点「生成」或用「一键缩略图」批量预生成。超过 `thumb_video_max_size`（默认 2GB）的视频不生成。
+首次访问需下载视频片段 + ffmpeg 抽帧（数秒~十几秒），之后秒开。可在「缩略图」页对目标目录点「生成」批量预生成。超过 `thumb_video_max_size`（默认 2GB）的视频不生成。
 </details>
 
 <details>
 <summary><b>长视频只显示开头画面？</b></summary>
-超过 90 秒的视频会自动生成 3×3 内容拼图；对已有缩略图的长视频，在「缩略图」页对目录点「重建优化」即可重新生成。
+超过 90 秒的视频会自动生成 3×3 内容拼图，无需手动处理。
+</details>
+
+<details>
+<summary><b>想释放服务器磁盘（缩略图存网盘）？</b></summary>
+存储配置里把 `thumb_store` 设为 `remote`，生成后缩略图会上传到视频同级的 `_thumbnails/` 文件夹；也可在「缩略图」页对目录点「上传」把已生成的本地缩略图推送到网盘。
 </details>
 
 <details>
 <summary><b>如何清理缩略图缓存？</b></summary>
-「缩略图」页选中目录点「清空」删除该目录缩略图；系统会按 `thumb_cache_ttl`（默认 30 天）与 `thumb_cache_max_size`（默认 2GB）自动清理。
+「缩略图」页选中目录点「清空」删除该目录缩略图；或点目录行的「删除」直接删掉网盘 `_thumbnails` 文件夹。系统会按 `thumb_cache_ttl`（默认 30 天）与 `thumb_cache_max_size`（默认 2GB）自动清理。
 </details>
 
 <details>
-<summary><b>代理节点显示风控中？</b></summary>
-连续失败 ≥3 次会自动标记风控并切换健康节点，30 分钟后自动恢复；可在「代理管理」页手动「解除风控」。
+<summary><b>代理节点显示风控中 / 不可用？</b></summary>
+连续失败 ≥3 次会自动标记风控并切换健康节点，30 分钟后自动恢复；「不可用」表示节点真实连通性检查失败（如 gost 认证失败、超时），请检查节点密码与网络，连通恢复正常后自动解除。
+</details>
+
+<details>
+<summary><b>115 提示风控（405/WAF 拦截）？</b></summary>
+这是 115 对当前出口 IP 的风控。可在「代理管理」页开启「全局代理策略」为 auto，检测到风控后自动切换到代理节点访问，正常时恢复直连。
 </details>
 
 <details>
