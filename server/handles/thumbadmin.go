@@ -23,6 +23,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 )
 
 // ThumbGenerateReq POST /api/admin/thumb/generate
@@ -623,6 +624,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	root := &thumbTreeNode{}
 	dirsCount := 0
 	scanFailed := 0
+	realDirs := map[string]bool{}
 	var scan func(dir string, cur *thumbTreeNode)
 	scan = func(dir string, cur *thumbTreeNode) {
 		if scanCtx.Err() != nil {
@@ -632,6 +634,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			return
 		}
 		dirsCount++
+		realDirs[dir] = true
 		objs, err := fs.List(scanCtx, dir, &fs.ListArgs{})
 		if err != nil {
 			scanFailed++
@@ -654,9 +657,38 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	mounts := currentMountPaths()
 	if len(mounts) > 0 {
 		for _, m := range mounts {
+			realDirs[m] = true
 			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m]}
 			root.Children = append(root.Children, child)
 			scan(m, child)
+		}
+	}
+	status := "complete"
+	if scanFailed > 0 || scanCtx.Err() != nil || dirsCount == 0 {
+		status = "partial"
+	}
+	// 完整扫描后：自动迁移失效的缩略图索引（文件夹移动/挂载根变更时缩略图跟随）
+	if status == "complete" {
+		if autoMigrateThumbIndex(realDirs) > 0 {
+			// 索引已迁移，重建缓存计数并刷新树节点
+			indexed = readThumbIndex()
+			cachedByDir = map[string]int{}
+			for _, p := range indexed {
+				dir := stdpath.Dir(p)
+				if dir != "" && dir != "." {
+					cachedByDir[dir]++
+				}
+			}
+			var refreshCached func(ns []*thumbTreeNode)
+			refreshCached = func(ns []*thumbTreeNode) {
+				for _, n := range ns {
+					n.Cached = cachedByDir[n.Path]
+					if len(n.Children) > 0 {
+						refreshCached(n.Children)
+					}
+				}
+			}
+			refreshCached(root.Children)
 		}
 	}
 	// 索引兜底：115 风控导致扫描不到时，把索引目录补入树
@@ -698,10 +730,6 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	}
 	for _, m := range root.Children {
 		sumSubtree(m)
-	}
-	status := "complete"
-	if scanFailed > 0 || scanCtx.Err() != nil || dirsCount == 0 {
-		status = "partial"
 	}
 	return root.Children, status
 }
@@ -1060,6 +1088,89 @@ func writeThumbIndex(paths []string) error {
 		sb.WriteString(`{"path":` + strconv.Quote(p) + `,"at":""}` + "\n")
 	}
 	return os.WriteFile(thumbIndexPath(), []byte(sb.String()), 0o666)
+}
+
+// thumbIndexMigrateMu 保护缩略图索引/缓存文件的迁移类操作（自动迁移与手动迁移）
+var thumbIndexMigrateMu sync.Mutex
+
+// autoMigrateThumbIndex 缩略图索引自动跟随目录移动（根治"文件夹移动后缩略图路径失效"）：
+// 若索引里的路径目录不在当前真实目录结构（文件夹被移动/挂载根变更），
+// 按"目录名唯一匹配"找到新位置，把缓存文件与失败标记 rename 到新路径并重写索引。
+// 无法唯一匹配（如重名或目录被删除）则跳过，交由手动"挂载迁移"处理。
+// realDirs 为扫描得到的真实目录集合。返回迁移的条目数。
+func autoMigrateThumbIndex(realDirs map[string]bool) int {
+	if len(realDirs) == 0 {
+		return 0
+	}
+	thumbIndexMigrateMu.Lock()
+	defer thumbIndexMigrateMu.Unlock()
+	paths := readThumbIndex()
+	if len(paths) == 0 {
+		return 0
+	}
+	// oldDir -> newDir（空串表示不可迁移/已跳过）
+	dirMap := map[string]string{}
+	migrated := 0
+	changed := false
+	var newPaths []string
+	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
+	for _, p := range paths {
+		oldDir := stdpath.Dir(p)
+		if oldDir == "" || oldDir == "." || realDirs[oldDir] {
+			newPaths = append(newPaths, p)
+			continue
+		}
+		newDir, ok := dirMap[oldDir]
+		if !ok {
+			name := stdpath.Base(oldDir)
+			var cands []string
+			for d := range realDirs {
+				if stdpath.Base(d) == name {
+					cands = append(cands, d)
+				}
+			}
+			if len(cands) == 1 {
+				newDir = cands[0]
+			}
+			dirMap[oldDir] = newDir
+		}
+		if newDir == "" {
+			newPaths = append(newPaths, p)
+			continue
+		}
+		newPath := newDir + strings.TrimPrefix(p, oldDir)
+		moved := false
+		for _, kind := range kinds {
+			oldC := thumbCachePath(kind, p)
+			newC := thumbCachePath(kind, newPath)
+			if _, err := os.Stat(oldC); err == nil {
+				if _, err := os.Stat(newC); err != nil {
+					if os.Rename(oldC, newC) == nil {
+						migrated++
+						moved = true
+					}
+				} else {
+					_ = os.Remove(oldC)
+				}
+			}
+			oldF := thumbFailPath(kind, p)
+			newF := thumbFailPath(kind, newPath)
+			if _, err := os.Stat(oldF); err == nil {
+				if _, err := os.Stat(newF); err != nil {
+					_ = os.Rename(oldF, newF)
+				} else {
+					_ = os.Remove(oldF)
+				}
+			}
+		}
+		newPaths = append(newPaths, newPath)
+		changed = changed || moved
+	}
+	if changed {
+		_ = writeThumbIndex(newPaths)
+		log.Infof("[thumb] auto-migrated %d thumbnail index entries", migrated)
+	}
+	return migrated
 }
 
 // thumbFolderNameForPath 返回指定视频所在存储的缩略图文件夹名（默认 _thumbnails）
