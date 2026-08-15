@@ -892,177 +892,12 @@ func prewarmStart() {
 		for i := 0; i < n; i++ {
 			go prewarmWorker()
 		}
-		// 远程缩略图凌晨批量补传 worker
-		go thumbRemoteUploadLoop()
 	})
 }
 
 const (
 	prewarmBatchSize = 5 // 每批最多提交任务数（防风控）
 )
-
-// ---------- 远程缩略图延迟补传（规避风控）----------
-// 生成成功的缩略图本地始终有缓存；上传到网盘 _thumbnails 失败（如 115 风控）时
-// 记入待上传队列，在中国凌晨时段（API 低谷）批量补传，避免风控时段反复尝试。
-const (
-	thumbPendingUploadFile = "pending_upload.jsonl"
-	thumbUploadWindowStart = 3 // 中国时区（UTC+8）凌晨开始小时
-	thumbUploadWindowEnd   = 6 // 结束小时（不含）
-	thumbUploadBatchMax    = 5 // 每批上传数
-	thumbUploadBatchSleep  = 30 * time.Second
-)
-
-var thumbPendingMu sync.Mutex
-
-func thumbPendingUploadPath() string {
-	return filepath.Join(thumbDir(), thumbPendingUploadFile)
-}
-
-// thumbPendingUploadAdd 记录待上传缩略图的视频路径（去重）
-func thumbPendingUploadAdd(rawPath string) {
-	if rawPath == "" {
-		return
-	}
-	thumbPendingMu.Lock()
-	defer thumbPendingMu.Unlock()
-	cur := readThumbPendingUploadsLocked()
-	if cur[rawPath] {
-		return
-	}
-	f, err := os.OpenFile(thumbPendingUploadPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
-	if err != nil {
-		return
-	}
-	_, _ = f.WriteString(rawPath + "\n")
-	_ = f.Close()
-}
-
-func readThumbPendingUploadsLocked() map[string]bool {
-	m := map[string]bool{}
-	data, err := os.ReadFile(thumbPendingUploadPath())
-	if err != nil {
-		return m
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			m[line] = true
-		}
-	}
-	return m
-}
-
-// thumbPendingUploadList 待上传路径列表（有缓存文件存在的）
-func thumbPendingUploadList() []string {
-	thumbPendingMu.Lock()
-	defer thumbPendingMu.Unlock()
-	m := readThumbPendingUploadsLocked()
-	var list []string
-	for p := range m {
-		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
-			list = append(list, p)
-		}
-	}
-	sort.Strings(list)
-	return list
-}
-
-// thumbPendingUploadRemove 上传成功后移除
-func thumbPendingUploadRemove(rawPath string) {
-	thumbPendingMu.Lock()
-	defer thumbPendingMu.Unlock()
-	m := readThumbPendingUploadsLocked()
-	if _, ok := m[rawPath]; !ok {
-		return
-	}
-	delete(m, rawPath)
-	var sb strings.Builder
-	for p := range m {
-		sb.WriteString(p)
-		sb.WriteString("\n")
-	}
-	_ = os.WriteFile(thumbPendingUploadPath(), []byte(sb.String()), 0o666)
-}
-
-// thumbInUploadWindow 是否在中国时区（UTC+8）上传窗口内（由设置 thumb_remote_upload_start/end 控制）
-func thumbInUploadWindow() bool {
-	if setting.GetStr(conf.ThumbRemoteUploadEnabled, "true") != "true" {
-		return false
-	}
-	start := setting.GetInt(conf.ThumbRemoteUploadStart, thumbUploadWindowStart)
-	end := setting.GetInt(conf.ThumbRemoteUploadEnd, thumbUploadWindowEnd)
-	loc := time.FixedZone("CST", 8*3600)
-	h := time.Now().In(loc).Hour()
-	if end <= start {
-		// 跨天窗口（如 22-6）
-		return h >= start || h < end
-	}
-	return h >= start && h < end
-}
-
-// thumbRemoteUploadLoop 每 30 分钟检查一次，上传窗口内批量补传待上传缩略图
-func thumbRemoteUploadLoop() {
-	for {
-		if thumbInUploadWindow() {
-			thumbFlushPendingUploads()
-		}
-		time.Sleep(30 * time.Minute)
-	}
-}
-
-// thumbFlushPendingUploads 上传窗口内批量补传：每批最多 batch 个，批间间隔 interval 秒；
-// 上传前检查风控，风控中暂停等待下一轮
-func thumbFlushPendingUploads() {
-	list := thumbPendingUploadList()
-	if len(list) == 0 {
-		return
-	}
-	batchMax := setting.GetInt(conf.ThumbRemoteUploadBatch, thumbUploadBatchMax)
-	if batchMax < 1 {
-		batchMax = 1
-	}
-	sleepSec := setting.GetInt(conf.ThumbRemoteUploadInterval, int(thumbUploadBatchSleep/time.Second))
-	if sleepSec < 1 {
-		sleepSec = 1
-	}
-	batch := 0
-	fails := 0
-	const flushFailMax = 10 // 单轮连续失败上限：超过则停止本轮，下个窗口再试（避免反复请求加剧风控）
-	for _, rawPath := range list {
-		if !thumbInUploadWindow() {
-			return
-		}
-		if blocked, _ := isStorageBlocked(rawPath); blocked {
-			time.Sleep(10 * time.Minute)
-			return
-		}
-		addition := remoteThumbStore(rawPath)
-		if addition == nil {
-			thumbPendingUploadRemove(rawPath)
-			continue
-		}
-		png, err := os.ReadFile(thumbCachePath(thumbKindVideo, rawPath))
-		if err != nil {
-			thumbPendingUploadRemove(rawPath)
-			continue
-		}
-		if err := uploadThumbRemote(context.Background(), rawPath, addition, png); err != nil {
-			fails++
-			if fails >= flushFailMax {
-				// 连续失败过多：停止本轮，等待下个上传窗口
-				return
-			}
-			continue // 失败保留队列，下一轮再试
-		}
-		thumbPendingUploadRemove(rawPath)
-		fails = 0
-		batch++
-		if batch >= batchMax {
-			time.Sleep(time.Duration(sleepSec) * time.Second)
-			batch = 0
-		}
-	}
-}
 
 // ---------- 预热 worker ----------
 
@@ -1168,7 +1003,6 @@ func processTask(task thumbPrewarmTask) {
 	if addition := remoteThumbStore(task.rawPath); addition != nil {
 		if err := uploadThumbRemote(context.Background(), task.rawPath, addition, png); err != nil {
 			log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
-			thumbPendingUploadAdd(task.rawPath)
 		}
 		remoteThumbCacheSet(task.rawPath, png)
 		_ = os.WriteFile(cachePath, png, 0o666)
@@ -1608,7 +1442,6 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	go func() {
 		if err := uploadThumbRemote(context.WithoutCancel(c.Request.Context()), rawPath, addition, png); err != nil {
 			log.Warnf("thumb upload remote failed %s: %v", rawPath, err)
-			thumbPendingUploadAdd(rawPath)
 		}
 	}()
 	remoteThumbMissClear(rawPath)

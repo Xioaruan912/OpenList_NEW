@@ -28,16 +28,10 @@ type ThumbStatus = {
   fail_markers: number
   cache_size: number
   prewarm_queued: number
-  pending_upload: number
   worker_concurrency: number
   gen_power: string
   active_workers: number
   blocked: boolean
-  remote_upload_enabled: boolean
-  remote_upload_start: number
-  remote_upload_end: number
-  remote_upload_batch: number
-  remote_upload_interval: number
   stale_by_dir?: { dir: string; count: number }[]
   mounts?: string[]
 }
@@ -96,14 +90,8 @@ const Thumb = () => {
   const [st, setSt] = createSignal<ThumbStatus>()
   const [tree, setTree] = createSignal<TreeNode[]>([])
   const [queued, setQueued] = createSignal(0)
-  const [ruEnabled, setRuEnabled] = createSignal(true)
-  const [ruStart, setRuStart] = createSignal(3)
-  const [ruEnd, setRuEnd] = createSignal(6)
-  const [ruBatch, setRuBatch] = createSignal(5)
-  const [ruInterval, setRuInterval] = createSignal(30)
   const [ruWorker, setRuWorker] = createSignal(3)
   const [genPower, setGenPower] = createSignal("medium")
-  const [pendingUp, setPendingUp] = createSignal(0)
   const [genActive, setGenActive] = createSignal(0)
   const [genBlocked, setGenBlocked] = createSignal(false)
   const [totalQueued, setTotalQueued] = createSignal(0)
@@ -135,14 +123,8 @@ const Thumb = () => {
       setMounts(data.mounts || [])
       setOldP((data.stale_by_dir || [])[0]?.dir.split("/").slice(0, 2).join("/") || "")
       setNewP((data.mounts || [])[0] || "")
-      setRuEnabled(data.remote_upload_enabled !== false)
-      setRuStart(data.remote_upload_start || 3)
-      setRuEnd(data.remote_upload_end || 6)
-      setRuBatch(data.remote_upload_batch || 5)
-      setRuInterval(data.remote_upload_interval || 30)
       setRuWorker(data.worker_concurrency || 3)
       setGenPower(data.gen_power || "medium")
-      setPendingUp(data.pending_upload || 0)
       setGenActive(data.active_workers || 0)
       setGenBlocked(!!data.blocked)
     })
@@ -195,7 +177,6 @@ const Thumb = () => {
         const data = d as { queued?: number; blocked?: boolean; truncated?: boolean }
         notify.success(
           `已加入队列：${data.queued || 0} 个` +
-            (data.blocked ? "（115 风控中，缩略图本地生成，上传将在上传窗口自动进行）" : "") +
             (data.truncated ? "（已达单次上限，可再次点击分批生成）" : "") +
             "，按当前生成强度分批生成",
         )
@@ -228,21 +209,6 @@ const Thumb = () => {
     })
   }
 
-  const saveRu = async () => {
-    const items = [
-      { key: "thumb_remote_upload_enabled", value: ruEnabled() ? "true" : "false" },
-      { key: "thumb_remote_upload_start", value: String(ruStart()) },
-      { key: "thumb_remote_upload_end", value: String(ruEnd()) },
-      { key: "thumb_remote_upload_batch", value: String(ruBatch()) },
-      { key: "thumb_remote_upload_interval", value: String(ruInterval()) },
-    ]
-    const resp = await r.post("/admin/setting/save", items)
-    handleResp(resp, () => {
-      notify.success("已保存配置")
-      load()
-    })
-  }
-
   const runAll = async () => {
     setBusy("一键")
     try {
@@ -252,10 +218,7 @@ const Thumb = () => {
       })
       handleResp(resp, (d) => {
         const data = d as { queued?: number; blocked?: boolean }
-        notify.success(
-          `已加入队列：${data.queued || 0} 个` +
-            (data.blocked ? "（115 风控中，缩略图本地生成，上传将在上传窗口自动进行）" : ""),
-        )
+        notify.success(`已加入队列：${data.queued || 0} 个`)
         setTotalQueued((t) => t + (data.queued || 0))
         setOpen(false)
         load()
@@ -722,66 +685,6 @@ const Thumb = () => {
           />
           <Button size="xs" colorScheme="accent" onClick={saveGen}>
             保存生成配置
-          </Button>
-        </HStack>
-      </Box>
-
-      {/* 远程缩略图补传 */}
-      <Box mt="$2" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
-        <HStack spacing="$2" alignItems="center">
-          <Text fontWeight="$medium">远程缩略图补传（规避 115 风控）</Text>
-          <Tag colorScheme={pendingUp() ? "danger" : "neutral"}>待上传 {pendingUp()} 个</Tag>
-          <Button
-            size="xs"
-            colorScheme={ruEnabled() ? "success" : "neutral"}
-            onClick={() => setRuEnabled(!ruEnabled())}
-          >
-            {ruEnabled() ? "已启用" : "已停用"}
-          </Button>
-        </HStack>
-        <HStack
-          direction={{ "@initial": "column", "@md": "row" }}
-          spacing="$2"
-          alignItems="center"
-          mt="$2"
-          wrap="wrap"
-        >
-          <Text fontSize="$sm">上传时段</Text>
-          <Input
-            value={String(ruStart())}
-            onInput={(e) => setRuStart(parseInt(e.currentTarget.value) || 0)}
-            w="$full"
-            maxW="80px"
-          />
-          <Text fontSize="$sm">-</Text>
-          <Input
-            value={String(ruEnd())}
-            onInput={(e) => setRuEnd(parseInt(e.currentTarget.value) || 0)}
-            w="$full"
-            maxW="80px"
-          />
-          <Text fontSize="$sm" color="$neutral9">
-            （中国时区小时，可跨天）
-          </Text>
-          <Text fontSize="$sm" ml="$3">
-            每批
-          </Text>
-          <Input
-            value={String(ruBatch())}
-            onInput={(e) => setRuBatch(parseInt(e.currentTarget.value) || 1)}
-            w="$full"
-            maxW="70px"
-          />
-          <Text fontSize="$sm">间隔</Text>
-          <Input
-            value={String(ruInterval())}
-            onInput={(e) => setRuInterval(parseInt(e.currentTarget.value) || 1)}
-            w="$full"
-            maxW="70px"
-          />
-          <Text fontSize="$sm">秒</Text>
-          <Button size="xs" colorScheme="accent" onClick={saveRu}>
-            保存配置
           </Button>
         </HStack>
       </Box>

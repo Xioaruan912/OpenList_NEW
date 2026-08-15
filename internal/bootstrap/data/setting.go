@@ -203,11 +203,6 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ThumbChunkSize, Value: "3145728", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `video segment size (bytes) downloaded for thumbnail extraction, default 3MB`},
 		{Key: conf.ThumbWidth, Value: "288", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail width in pixels, default 288`},
 		{Key: conf.ThumbFailTTL, Value: "604800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `negative cache duration in seconds for failed cover/folder detection, default 7 days`},
-		{Key: conf.ThumbRemoteUploadEnabled, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `deferred upload of remote thumbnails during low-traffic hours (avoid 115 rate control)`},
-		{Key: conf.ThumbRemoteUploadStart, Value: "3", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `deferred upload window start hour (China UTC+8), default 3`},
-		{Key: conf.ThumbRemoteUploadEnd, Value: "6", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `deferred upload window end hour (China UTC+8, exclusive), default 6`},
-		{Key: conf.ThumbRemoteUploadBatch, Value: "5", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `deferred upload batch size, default 5`},
-		{Key: conf.ThumbRemoteUploadInterval, Value: "30", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `deferred upload batch interval in seconds, default 30`},
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},

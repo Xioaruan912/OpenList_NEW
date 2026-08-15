@@ -37,7 +37,7 @@ func ThumbGenerate(c *gin.Context) {
 		return
 	}
 	// 115 风控中禁止触发缩略图生成：生成需从网盘下载视频片段（ffmpeg 抽帧），
-	// 风控中下载会加剧风控。风控解除后再生成，远程上传失败会自动进入上传窗口补传。
+	// 风控中下载会加剧风控。风控解除后再生成（缩略图上传在生成后立即进行）。
 	if blocked, _ := isStorageBlocked(req.Path); blocked {
 		common.ErrorStrResp(c, "115 网盘风控中，缩略图需下载视频生成，请稍后再试（风控通常 10-30 分钟）", 429)
 		return
@@ -123,7 +123,6 @@ func ThumbStatus(c *gin.Context) {
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
-	status["pending_upload"] = len(thumbPendingUploadList())
 	status["worker_concurrency"] = setting.GetInt(conf.ThumbWorkerConcurrency, 3)
 	pw := thumbGenPower()
 	status["gen_power"] = setting.GetStr(conf.ThumbGenerationPower, "medium")
@@ -141,11 +140,6 @@ func ThumbStatus(c *gin.Context) {
 		}
 	}
 	status["blocked"] = blockedAny
-	status["remote_upload_enabled"] = setting.GetStr(conf.ThumbRemoteUploadEnabled, "true") == "true"
-	status["remote_upload_start"] = setting.GetInt(conf.ThumbRemoteUploadStart, 3)
-	status["remote_upload_end"] = setting.GetInt(conf.ThumbRemoteUploadEnd, 6)
-	status["remote_upload_batch"] = setting.GetInt(conf.ThumbRemoteUploadBatch, 5)
-	status["remote_upload_interval"] = setting.GetInt(conf.ThumbRemoteUploadInterval, 30)
 	// 已有缩略图的目录清单（按目录分组，来自路径索引）
 	indexed := readThumbIndex()
 	cacheByDir := map[string]int{}
@@ -833,7 +827,7 @@ func ThumbClearAll(c *gin.Context) {
 			removed++
 			continue
 		}
-		if name == "index.jsonl" || name == "pending_upload.jsonl" {
+		if name == "index.jsonl" {
 			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
@@ -910,8 +904,8 @@ func ThumbMigrate(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	// 同步迁移待上传队列与排除列表中的路径前缀
-	for _, file := range []string{"pending_upload.jsonl", "excluded.jsonl"} {
+	// 同步迁移排除列表中的路径前缀
+	for _, file := range []string{"excluded.jsonl"} {
 		p := filepath.Join(thumbDir(), file)
 		data, err := os.ReadFile(p)
 		if err != nil {
