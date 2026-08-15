@@ -105,6 +105,12 @@ func (d *Pan115) getUA() string {
 	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+// getUploadUA 上传初始化（files/init, v4.0）必须使用 115Browser UA，
+// 否则返回 403 "请升级到最新版本"；其余 API 仍用 Chrome UA 规避下载风控。
+func (d *Pan115) getUploadUA() string {
+	return fmt.Sprintf("Mozilla/5.0 115Browser/%s", appVer)
+}
+
 func (c *Pan115) GenerateToken(fileID, preID, timeStamp, fileSize, signKey, signVal string) string {
 	userID := strconv.FormatInt(c.client.UserID, 10)
 	userIDMd5 := md5.Sum([]byte(userID))
@@ -165,6 +171,7 @@ func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID stri
 			SetQueryParams(params).
 			SetBody(encrypted).
 			SetHeaderVerbatim("Content-Type", "application/x-www-form-urlencoded").
+			SetHeader("User-Agent", d.getUploadUA()).
 			SetDoNotParseResponse(true)
 		resp, err := req.Post(driver115.ApiUploadInit)
 		if err != nil {

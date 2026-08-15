@@ -1,24 +1,19 @@
 {
   "115 Cloud": {
-    "cookie": "Cookie",
-    "cookie-tips": "需要二维码令牌和 Cookie 其中之一",
-    "limit_rate": "限制速率",
-    "limit_rate-tips": "限制所有 API 请求率（[limit]r/1s）",
+    "cookie": "登录 Cookie",
+    "cookie-tips": "115 网盘 Cookie（扫码登录成功后自动填入，无需手动获取）",
+    "limit_rate": "接口限速",
+    "limit_rate-tips": "限制所有 115 接口请求速率（次/秒）；0 表示不限制",
     "page_size": "分页大小",
-    "page_size-tips": "115 驱动程序的列表 API 的每页大小",
-    "qrcode_source": "二维码源",
-    "qrcode_source-tips": "选择二维码设备，默认 Linux",
-    "qrcode_sources": {
-      "alipaymini": "支付宝小程序",
-      "android": "安卓",
-      "ios": "iOS",
-      "qandroid": "QAndroid",
-      "tv": "TV",
-      "web": "网页",
-      "wechatmini": "微信小程序"
+    "page_size-tips": "115 驱动列表接口每页大小",
+    "thumb_store": "缩略图存储",
+    "thumb_store-tips": "local：缓存到服务器磁盘；remote：上传到视频同级的 _thumbnails 文件夹（不占服务器磁盘）",
+    "thumb_stores": {
+      "local": "本地磁盘",
+      "remote": "上传到网盘 _thumbnails"
     },
-    "qrcode_token": "二维码令牌",
-    "qrcode_token-tips": "需要二维码令牌和 Cookie 其中之一",
+    "thumb_folder": "缩略图文件夹名",
+    "thumb_folder-tips": "thumb_store 为 remote 时，存储缩略图的文件夹名",
     "root_folder_id": "根文件夹 ID"
   },
   "115 Open": {

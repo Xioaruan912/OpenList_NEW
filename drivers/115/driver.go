@@ -87,6 +87,19 @@ func (d *Pan115) Drop(ctx context.Context) error {
 	return nil
 }
 
+// SetUploadProxy 动态切换 115 客户端（API 与上传）代理；空字符串表示移除代理（走全局/直连）。
+// 供缩略图模块在自动模式下将"上传侧"指派到独立节点，与缩略图下载代理分离。
+func (d *Pan115) SetUploadProxy(px string) {
+	if d.client == nil {
+		return
+	}
+	if px != "" {
+		d.client.Client.SetProxy(px)
+	} else {
+		d.client.Client.RemoveProxy()
+	}
+}
+
 func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err

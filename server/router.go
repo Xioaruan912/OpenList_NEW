@@ -36,6 +36,7 @@ func Init(e *gin.Engine) {
 	g.GET("/manifest.json", static.ManifestJSON)
 	g.GET("/i/:link_name", handles.Plist)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
+	go handles.StartThumbProxyAssign()
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
 		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
@@ -180,6 +181,7 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/migrate", handles.ThumbMigrate)
 	thumb.GET("/proxy", handles.ThumbProxyConfig)
 	thumb.POST("/proxy", handles.ThumbProxySet)
+	thumb.POST("/upload", handles.ThumbUpload)
 
 	proxy := g.Group("/proxy")
 	proxy.GET("/list", handles.ListProxyNodes)

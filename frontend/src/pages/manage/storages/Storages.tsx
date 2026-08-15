@@ -32,9 +32,10 @@ import {
 import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js"
 import { useFetch, useManageTitle, useRouter, useT } from "~/hooks"
 import { handleResp, notify, r } from "~/utils"
-import { EmptyResp, PageResp, Resp, Storage } from "~/types"
+import { EmptyResp, Group, PageResp, Resp, Storage } from "~/types"
 import { StorageGridItem, StorageListItem } from "./Storage"
 import { createStorageSignal } from "@solid-primitives/storage"
+import { driverZhName, isDriverShown, parseDriversShow } from "~/utils/driverZh"
 
 type ThumbDirStat = { dir: string; count: number }
 type ThumbStatus = {
@@ -45,8 +46,6 @@ type ThumbStatus = {
   cached_by_dir?: ThumbDirStat[]
   fails_by_dir?: ThumbDirStat[]
 }
-
-type BlockedResult = { mount: string; blocked: boolean; msg: string }
 
 const Storages = () => {
   const t = useT()
@@ -68,6 +67,44 @@ const Storages = () => {
   }
   getDrivers()
   refresh()
+  const [driversShowOpen, setDriversShowOpen] = createSignal(false)
+  const [driversShowSel, setDriversShowSel] = createSignal<string[]>([])
+  const [driversShowLoading, setDriversShowLoading] = createSignal(false)
+  const loadDriversShow = async () => {
+    const resp: Resp<{ key: string; value: string }[]> = r.get(
+      `/admin/setting/list?group=${Group.GLOBAL}`,
+    )
+    const { code, data } = await resp
+    if (code === 200) {
+      const value =
+        data.find((i) => i.key === "pan_drivers_show")?.value || ""
+      const allow = parseDriversShow(value)
+      setDriversShowSel(
+        drivers().filter((d) => isDriverShown(d, allow)),
+      )
+    }
+  }
+  const saveDriversShow = async () => {
+    setDriversShowLoading(true)
+    const resp: Resp<{ key: string; value: string }[]> = r.get(
+      `/admin/setting/list?group=${Group.GLOBAL}`,
+    )
+    const { code, data } = await resp
+    if (code === 200) {
+      const item = data.find((i) => i.key === "pan_drivers_show")
+      const value = driversShowSel()
+        .map((d) => driverZhName(d))
+        .join(",")
+      const saveResp: EmptyResp = await r.post("/admin/setting/save", [
+        { ...item, value },
+      ])
+      handleResp(saveResp, () => {
+        notify.success("驱动显示设置已保存")
+        setDriversShowOpen(false)
+      })
+    }
+    setDriversShowLoading(false)
+  }
   const loadAll = async () => {
     const resp: EmptyResp = await r.post("/admin/storage/load_all")
     handleResp(resp, () => {
@@ -118,34 +155,6 @@ const Storages = () => {
   const thumbPageCount = () =>
     Math.max(1, Math.ceil(thumbDirs().length / 5))
   const thumbPageDirs = () => thumbDirs().slice((thumbPage() - 1) * 5, thumbPage() * 5)
-  const [fengkongOpen, setFengkongOpen] = createSignal(false)
-  const [blockResults, setBlockResults] = createSignal<BlockedResult[]>([])
-  const [checkingBlocked, setCheckingBlocked] = createSignal(false)
-  const check115Blocked = async () => {
-    setCheckingBlocked(true)
-    setBlockResults([])
-    const targets = storages().filter(
-      (s) => s.driver === "115 Cloud" || s.driver === "115 Share",
-    )
-    const results: BlockedResult[] = []
-    for (const s of targets) {
-      const resp: Resp<BlockedResult> = await r.post("/admin/storage/check_blocked", {
-        id: s.id,
-      })
-      if (resp.code === 200) {
-        results.push({
-          mount: resp.data.mount,
-          blocked: !!resp.data.blocked,
-          msg: resp.data.msg || "",
-        })
-      } else {
-        results.push({ mount: s.mount_path, blocked: false, msg: resp.message })
-      }
-    }
-    setBlockResults(results)
-    setCheckingBlocked(false)
-    setFengkongOpen(true)
-  }
   return (
     <VStack spacing="$3" alignItems="start" w="$full">
       <HStack
@@ -181,10 +190,12 @@ const Storages = () => {
         <Button
           colorScheme="danger"
           variant="outline"
-          loading={checkingBlocked()}
-          onClick={check115Blocked}
+          onClick={() => {
+            void loadDriversShow()
+            setDriversShowOpen(true)
+          }}
         >
-          115 风控检查
+          驱动显示设置
         </Button>
         <Button
           onClick={async () => {
@@ -363,57 +374,51 @@ const Storages = () => {
         </ModalContent>
       </Modal>
       <Modal
-        opened={fengkongOpen()}
-        onClose={() => setFengkongOpen(false)}
-        size={{ "@initial": "xs", "@md": "xl" }}
+        opened={driversShowOpen()}
+        onClose={() => setDriversShowOpen(false)}
+        size={{ "@initial": "xs", "@md": "md" }}
       >
         <ModalOverlay />
         <ModalContent>
-          <ModalHeader>115 风控检查</ModalHeader>
+          <ModalHeader>驱动显示设置</ModalHeader>
           <ModalBody>
             <Text size="sm" color="$neutral9" mb="$2">
-              基于内存中的风控标记（5 分钟内有效，不主动请求 115 接口）。风控中时缩略图生成将自动暂停。
+              选择"添加存储"下拉框中需要显示的驱动类型（不选即显示全部），保存后自动写入中文驱动名。
             </Text>
             <Show
-              when={blockResults().length > 0}
-              fallback={<Box color="$neutral9">未配置 115 存储</Box>}
+              when={drivers().length > 0}
+              fallback={<Box color="$neutral9">加载中...</Box>}
             >
-              <VStack direction="column" spacing="$1" w="$full">
-                <For each={blockResults()}>
-                  {(r) => (
-                    <HStack
-                      spacing="$2"
-                      alignItems="center"
-                      w="$full"
-                      rounded="$md"
-                      border="1px solid $neutral6"
-                      p="$2"
-                    >
-                      <Tag colorScheme={r.blocked ? "danger" : "success"}>
-                        {r.blocked ? "风控中" : "正常"}
-                      </Tag>
-                      <Text
-                        fontWeight="$medium"
-                        css={{ "word-break": "break-all" }}
-                      >
-                        {r.mount}
-                      </Text>
-                      <Show when={r.msg}>
-                        <Text size="sm" color="$neutral9">
-                          {r.msg}
-                        </Text>
-                      </Show>
-                    </HStack>
-                  )}
-                </For>
-              </VStack>
+              <Select
+                multiple
+                value={driversShowSel()}
+                onChange={setDriversShowSel}
+              >
+                <SelectTrigger>
+                  <SelectPlaceholder>选择要显示的驱动</SelectPlaceholder>
+                  <SelectValue />
+                  <SelectIcon />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectListbox>
+                    <For each={drivers()}>
+                      {(item) => (
+                        <SelectOption value={item}>
+                          <SelectOptionText>{driverZhName(item)}</SelectOptionText>
+                          <SelectOptionIndicator />
+                        </SelectOption>
+                      )}
+                    </For>
+                  </SelectListbox>
+                </SelectContent>
+              </Select>
             </Show>
           </ModalBody>
           <ModalFooter display="flex" gap="$2">
-            <Button loading={checkingBlocked()} onClick={check115Blocked}>
-              重新检查
+            <Button loading={driversShowLoading()} onClick={saveDriversShow}>
+              保存
             </Button>
-            <Button colorScheme="neutral" onClick={() => setFengkongOpen(false)}>
+            <Button colorScheme="neutral" onClick={() => setDriversShowOpen(false)}>
               关闭
             </Button>
           </ModalFooter>

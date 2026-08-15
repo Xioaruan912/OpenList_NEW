@@ -3,7 +3,14 @@ import {
   Box,
   Button,
   HStack,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  ModalOverlay,
   Td,
+  Tag,
   Text,
   Tr,
   useColorModeValue,
@@ -12,10 +19,10 @@ import {
   ProgressIndicator,
   ProgressLabel,
 } from "@hope-ui/solid"
-import { Show } from "solid-js"
+import { createSignal, Show } from "solid-js"
 import { useFetch, useRouter, useT } from "~/hooks"
 import { getMainColor } from "~/store"
-import { MountDetails, PEmptyResp, Storage } from "~/types"
+import { MountDetails, PEmptyResp, Resp, Storage } from "~/types"
 import {
   handleResp,
   handleRespWithNotifySuccess,
@@ -46,8 +53,36 @@ function StorageOp(props: StorageProps) {
       }`,
     ),
   )
+  const is115 =
+    props.storage.driver === "115 Cloud" || props.storage.driver === "115 Share"
+  const [fkOpen, setFkOpen] = createSignal(false)
+  const [fkLoading, setFkLoading] = createSignal(false)
+  const [fkResult, setFkResult] = createSignal<{ blocked: boolean; msg: string }>()
+  const checkBlocked = async () => {
+    setFkLoading(true)
+    const resp: Resp<{ blocked: boolean; msg: string }> = await r.post(
+      "/admin/storage/check_blocked",
+      { id: props.storage.id },
+    )
+    setFkLoading(false)
+    if (resp.code === 200) {
+      setFkResult({ blocked: !!resp.data.blocked, msg: resp.data.msg || "" })
+    } else {
+      setFkResult({ blocked: false, msg: resp.message })
+    }
+    setFkOpen(true)
+  }
   return (
     <>
+      <Show when={is115}>
+        <Button
+          colorScheme="warning"
+          loading={fkLoading()}
+          onClick={checkBlocked}
+        >
+          风控
+        </Button>
+      </Show>
       <Button
         onClick={() => {
           to(`/@manage/storages/edit/${props.storage.id}`)
@@ -78,6 +113,32 @@ function StorageOp(props: StorageProps) {
           })
         }}
       />
+      <Modal opened={fkOpen()} onClose={() => setFkOpen(false)} size="xs">
+        <ModalOverlay />
+        <ModalContent>
+          <ModalHeader>115 风控检查</ModalHeader>
+          <ModalBody>
+            <HStack spacing="$2" alignItems="center">
+              <Tag colorScheme={fkResult()?.blocked ? "danger" : "success"}>
+                {fkResult()?.blocked ? "风控中" : "正常"}
+              </Tag>
+              <Text fontWeight="$medium" css={{ "word-break": "break-all" }}>
+                {props.storage.mount_path}
+              </Text>
+            </HStack>
+            <Show when={fkResult()?.msg}>
+              <Text size="sm" color="$neutral9" mt="$2">
+                {fkResult()?.msg}
+              </Text>
+            </Show>
+          </ModalBody>
+          <ModalFooter display="flex" gap="$2">
+            <Button colorScheme="neutral" onClick={() => setFkOpen(false)}>
+              关闭
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
     </>
   )
 }

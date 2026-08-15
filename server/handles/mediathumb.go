@@ -862,7 +862,8 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 	return extractVideoFrame(tmpFile)
 }
 
-// thumbGenPower 返回生成强度参数（low/medium/high），兼顾速度与 115 风控
+// thumbGenPower 返回生成强度参数。当前不做任何节流约束：以最大速度生成
+// （8 个 worker、无批间/批内间隔、并发名额上限放宽），不再做 115 风控限速。
 type thumbGenPowerCfg struct {
 	Workers       int
 	BatchInterval time.Duration
@@ -873,18 +874,10 @@ type thumbGenPowerCfg struct {
 }
 
 func thumbGenPower() thumbGenPowerCfg {
-	switch setting.GetStr(conf.ThumbGenerationPower, "high") {
-	case "low":
-		return thumbGenPowerCfg{Workers: 1, BatchInterval: 30 * time.Second, AcquireLimit: 2, FrameInterval: 2 * time.Second, TaskInterval: 8 * time.Second, EnqueueMax: 50}
-	case "medium":
-		return thumbGenPowerCfg{Workers: 2, BatchInterval: 15 * time.Second, AcquireLimit: 4, FrameInterval: time.Second, TaskInterval: 3 * time.Second, EnqueueMax: 150}
-	default: // high：最大速度，不再限制批内间隔与吞吐
-		return thumbGenPowerCfg{Workers: 4, BatchInterval: 5 * time.Second, AcquireLimit: 8, FrameInterval: 500 * time.Millisecond, TaskInterval: 0, EnqueueMax: 300}
-	}
+	return thumbGenPowerCfg{Workers: 8, BatchInterval: 0, AcquireLimit: 64, FrameInterval: 0, TaskInterval: 0, EnqueueMax: 100000}
 }
 
-// prewarmStart 启动预热 worker（多 worker 并发生成，每批节流；
-// 115 API 请求率由驱动 limit_rate 全局限速兜底，不会因并发触发风控）
+// prewarmStart 启动预热 worker（多 worker 并发生成，不做节流）
 func prewarmStart() {
 	prewarmOnce.Do(func() {
 		prewarmCh = make(chan thumbPrewarmTask, 2048)
@@ -895,43 +888,16 @@ func prewarmStart() {
 	})
 }
 
-const (
-	prewarmBatchSize = 5 // 每批最多提交任务数（防风控）
-)
-
 // ---------- 预热 worker ----------
 
-// prewarmWorker 分批节流：每批最多 prewarmBatchSize 个任务串行处理，批间固定间隔
+// prewarmWorker 取到一个任务立即处理，不做批内/批间节流
 func prewarmWorker() {
 	for {
-		batch := make([]thumbPrewarmTask, 0, prewarmBatchSize)
-	collect:
-		for len(batch) < prewarmBatchSize {
-			select {
-			case task := <-prewarmCh:
-				batch = append(batch, task)
-			default:
-				if len(batch) == 0 {
-					// 队列空：阻塞等待新任务
-					task, ok := <-prewarmCh
-					if !ok {
-						return
-					}
-					batch = append(batch, task)
-				} else {
-					break collect
-				}
-			}
+		task, ok := <-prewarmCh
+		if !ok {
+			return
 		}
-		for i, task := range batch {
-			processTask(task)
-			// 批内任务间隔：摊开请求/下载频率，避免集中触发风控
-			if i < len(batch)-1 {
-				time.Sleep(thumbGenPower().TaskInterval)
-			}
-		}
-		// 批间间隔，限制 115 请求频率
-		time.Sleep(thumbGenPower().BatchInterval)
+		processTask(task)
 	}
 }
 

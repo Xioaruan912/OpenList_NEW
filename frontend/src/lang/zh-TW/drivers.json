@@ -1,25 +1,20 @@
 {
   "115 Cloud": {
-    "cookie": "Cookie",
-    "cookie-tips": "需要二維碼令牌和 Cookie 其中之一",
-    "limit_rate": "限制速率",
-    "limit_rate-tips": "限制所有 API 請求率（[limit]r/1s）",
+    "cookie": "登入 Cookie",
+    "cookie-tips": "115 網盤 Cookie（掃碼登入成功後自動填入，無需手動取得）",
+    "limit_rate": "介面限速",
+    "limit_rate-tips": "限制所有 115 介面請求速率（次/秒）；0 表示不限制",
     "page_size": "分頁大小",
-    "page_size-tips": "115 驅動程序的列表 API 的每頁大小",
-    "qrcode_source": "二維碼源",
-    "qrcode_source-tips": "選擇二維碼設備，默認 Linux",
-    "qrcode_sources": {
-      "alipaymini": "支付寶小程序",
-      "android": "安卓",
-      "ios": "iOS",
-      "qandroid": "QAndroid",
-      "tv": "TV",
-      "web": "網頁",
-      "wechatmini": "微信小程序"
+    "page_size-tips": "115 驅動列表介面每頁大小",
+    "thumb_store": "縮圖儲存",
+    "thumb_store-tips": "local：快取到伺服器磁碟；remote：上傳到影片同級的 _thumbnails 資料夾（不佔伺服器磁碟）",
+    "thumb_stores": {
+      "local": "本地磁碟",
+      "remote": "上傳到網盤 _thumbnails"
     },
-    "qrcode_token": "二維碼令牌",
-    "qrcode_token-tips": "需要二維碼令牌和 Cookie 其中之一",
-    "root_folder_id": "根文件夾 ID"
+    "thumb_folder": "縮圖資料夾名",
+    "thumb_folder-tips": "thumb_store 為 remote 時，儲存縮圖的資料夾名",
+    "root_folder_id": "根資料夾 ID"
   },
   "115 Open": {
     "access_token": "訪問令牌",

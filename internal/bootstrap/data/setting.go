@@ -163,7 +163,7 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.FilterReadMeScripts, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW}, // frontend
 		{Key: conf.NonEFSZipEncoding, Value: "IBM437", Type: conf.TypeString, Group: model.PREVIEW},
 		// global settings
-		{Key: conf.PanDriversShow, Value: "115 Cloud,Onedrive,BaiduNetdisk,Quark", Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `仅显示这些存储驱动类型（"添加存储"下拉框），逗号分隔；留空则显示全部。当前驱动名可通过 管理-存储 页面的筛选框查看`},
+		{Key: conf.PanDriversShow, Value: "115 网盘,OneDrive,百度网盘,夸克", Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `仅显示这些存储驱动类型（"添加存储"下拉框），请使用中文驱动名（见 管理-存储 页面的筛选框），逗号分隔；留空则显示全部`},
 		{Key: conf.HideFiles, Value: "/\\/README.md/i", Type: conf.TypeText, Group: model.GLOBAL},
 		{Key: "package_download", Value: "true", Type: conf.TypeBool, Group: model.GLOBAL},
 		{Key: conf.CustomizeHead, MigrationValue: `<script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=String.prototype.replaceAll"></script>`, Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE},
@@ -199,8 +199,6 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ThumbDirCover, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `show directory cover images in grid view`},
 		{Key: conf.ThumbPrewarm, Value: "true", Type: conf.TypeBool, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `pre-generate video thumbnails in background when a directory is browsed`},
 		{Key: conf.ThumbConcurrency, Value: "8", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail generation concurrency`},
-		{Key: conf.ThumbWorkerConcurrency, Value: "3", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `number of thumbnail generation workers (1-8), total 115 API rate is still capped by limit_rate`},
-		{Key: conf.ThumbGenerationPower, Value: "medium", Type: conf.TypeSelect, Options: "low,medium,high", Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail generation intensity: low (safest for rate control) / medium / high (fastest)`},
 		{Key: conf.ThumbChunkSize, Value: "3145728", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `video segment size (bytes) downloaded for thumbnail extraction, default 3MB`},
 		{Key: conf.ThumbWidth, Value: "288", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `thumbnail width in pixels, default 288`},
 		{Key: conf.ThumbFailTTL, Value: "604800", Type: conf.TypeNumber, Group: model.PREVIEW, Flag: model.PRIVATE, Help: `negative cache duration in seconds for failed cover/folder detection, default 7 days`},

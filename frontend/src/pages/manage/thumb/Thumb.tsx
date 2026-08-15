@@ -28,8 +28,6 @@ type ThumbStatus = {
   fail_markers: number
   cache_size: number
   prewarm_queued: number
-  worker_concurrency: number
-  gen_power: string
   active_workers: number
   blocked: boolean
   stale_by_dir?: { dir: string; count: number }[]
@@ -90,8 +88,6 @@ const Thumb = () => {
   const [st, setSt] = createSignal<ThumbStatus>()
   const [tree, setTree] = createSignal<TreeNode[]>([])
   const [queued, setQueued] = createSignal(0)
-  const [ruWorker, setRuWorker] = createSignal(3)
-  const [genPower, setGenPower] = createSignal("medium")
   const [genActive, setGenActive] = createSignal(0)
   const [genBlocked, setGenBlocked] = createSignal(false)
   const [totalQueued, setTotalQueued] = createSignal(0)
@@ -104,7 +100,6 @@ const Thumb = () => {
   const [checked, setChecked] = createSignal<Record<string, boolean>>({})
   const [expanded, setExp] = createSignal<Set<string>>(new Set())
   const [treeLoading, setTreeLoading] = createSignal(false)
-  const [scanStatus, setScanStatus] = createSignal("complete")
   const [open, setOpen] = createSignal(false)
   const [startPath, setStart] = createSignal("/")
   const [stale, setStale] = createSignal<{ dir: string; count: number }[]>([])
@@ -125,8 +120,6 @@ const Thumb = () => {
       setMounts(data.mounts || [])
       setOldP((data.stale_by_dir || [])[0]?.dir.split("/").slice(0, 2).join("/") || "")
       setNewP((data.mounts || [])[0] || "")
-      setRuWorker(data.worker_concurrency || 3)
-      setGenPower(data.gen_power || "medium")
       setGenActive(data.active_workers || 0)
       setGenBlocked(!!data.blocked)
     })
@@ -142,9 +135,8 @@ const Thumb = () => {
     try {
       const resp = await r.get("/admin/thumb/tree")
       handleResp(resp, (d) => {
-        const data = d as { children?: TreeNode[]; scan_status?: string }
+        const data = d as { children?: TreeNode[] }
         setTree(data.children || [])
-        setScanStatus(data.scan_status || "complete")
       })
     } finally {
       setTreeLoading(false)
@@ -190,23 +182,32 @@ const Thumb = () => {
     }
   }
 
+  const uploadDir = async (pp: string) => {
+    setBusy("up-" + pp)
+    try {
+      const resp = await r.post("/admin/thumb/upload", { path: pp })
+      handleResp(resp, (d) => {
+        const data = d as { uploaded?: number; failed?: number; total?: number }
+        if (!data.uploaded) {
+          notify.info("该目录没有可上传的本地缩略图")
+        } else {
+          notify.success(
+            `已上传 ${data.uploaded} 个缩略图到网盘 _thumbnails` +
+              (data.failed ? `，失败 ${data.failed} 个` : ""),
+          )
+        }
+        loadTree()
+      })
+    } finally {
+      setBusy("")
+    }
+  }
+
   const retryAll = async () => {
     const resp = await r.post("/admin/thumb/retry_fails", {})
     handleResp(resp, (d) => {
       const data = d as { retried?: number }
       notify.success(`已重试：${data.retried || 0} 个`)
-      load()
-    })
-  }
-
-  const saveGen = async () => {
-    const items = [
-      { key: "thumb_worker_concurrency", value: String(ruWorker()) },
-      { key: "thumb_generation_power", value: genPower() },
-    ]
-    const resp = await r.post("/admin/setting/save", items)
-    handleResp(resp, () => {
-      notify.success("已保存生成配置")
       load()
     })
   }
@@ -443,6 +444,17 @@ const Thumb = () => {
         >
           生成
         </Button>
+        <Button
+          size="xs"
+          colorScheme="info"
+          disabled={busy() === "up-" + nn.path}
+          onClick={(e) => {
+            e.stopPropagation()
+            uploadDir(nn.path)
+          }}
+        >
+          上传
+        </Button>
       </HStack>
       <Show when={expanded().has(nn.path) && (nn.children || []).length > 0}>
         <For each={nn.children}>{(q) => TN(q, depth + 1)}</For>
@@ -655,28 +667,9 @@ const Thumb = () => {
         </Progress>
         <HStack spacing="$2" alignItems="center" mt="$2" wrap={{ "@initial": "wrap", "@md": "unset" }}>
           <Text fontWeight="$medium">生成控制</Text>
-          <Text fontSize="$sm">生成强度</Text>
-          <Button size="xs" colorScheme={genPower() === "low" ? "accent" : "neutral"} onClick={() => setGenPower("low")}>
-            低
-          </Button>
-          <Button size="xs" colorScheme={genPower() === "medium" ? "accent" : "neutral"} onClick={() => setGenPower("medium")}>
-            中
-          </Button>
-          <Button size="xs" colorScheme={genPower() === "high" ? "accent" : "neutral"} onClick={() => setGenPower("high")}>
-            高
-          </Button>
-          <Text fontSize="$sm" ml="$3">
-            生成并发
+          <Text fontSize="$sm" color="$neutral10">
+            生成已解锁为最大速度（8 worker、不节流、不限速）
           </Text>
-          <Input
-            value={String(ruWorker())}
-            onInput={(e) => setRuWorker(Math.min(8, Math.max(1, parseInt(e.currentTarget.value) || 3)))}
-            w="$full"
-            maxW="70px"
-          />
-          <Button size="xs" colorScheme="accent" onClick={saveGen}>
-            保存生成配置
-          </Button>
         </HStack>
       </Box>
 
@@ -691,7 +684,7 @@ const Thumb = () => {
           清空全部缩略图
         </Button>
         <Text fontSize="$sm" color="$neutral10">
-          点击目录查看已有缩略图，可勾选排除不需要缩略图的视频；生成按 5 个一批提交（防风控）
+          点击目录查看已有缩略图，可勾选排除不需要缩略图的视频；生成已解锁为最大速度（8 worker 并发、不节流）
         </Text>
       </HStack>
 
@@ -710,11 +703,6 @@ const Thumb = () => {
           <Text fontWeight="$medium" p="$2">
             目录
           </Text>
-          <Show when={scanStatus() !== "complete"}>
-            <Text p="$2" fontSize="$sm" color="$warning9">
-              115 网盘受限中，当前仅展示已有缩略图的目录；恢复后自动显示全部
-            </Text>
-          </Show>
           <Show when={treeLoading()}>
             <Text p="$2" fontSize="$sm" color="$neutral9">
               加载中...
@@ -735,6 +723,14 @@ const Thumb = () => {
             </Tag>
             <Button size="xs" disabled={!sel()} onClick={() => genSel(false)}>
               生成缺失
+            </Button>
+            <Button
+              size="xs"
+              colorScheme="info"
+              disabled={!sel() || busy() === "up-" + sel()}
+              onClick={() => uploadDir(sel())}
+            >
+              上传
             </Button>
             <Button size="xs" colorScheme="accent" disabled={!sel()} onClick={() => genSel(true)}>
               重建优化

@@ -10,6 +10,7 @@ import { createMemo, createSignal, For, Show } from "solid-js"
 import { MaybeLoading, ModalInput } from "~/components"
 import { useFetch, useRouter, useT } from "~/hooks"
 import { handleResp, joinBase, notify, r } from "~/utils"
+import { isDriverShown, parseDriversShow } from "~/utils/driverZh"
 import {
   Addition,
   DriverConfig,
@@ -81,12 +82,7 @@ const AddOrEdit = () => {
   }
   const shownDrivers = createMemo(() => {
     const all = Object.keys(drivers())
-    const allow = panDriversShow()
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-    if (allow.length === 0) return all
-    return all.filter((d) => allow.includes(d))
+    return all.filter((d) => isDriverShown(d, parseDriversShow(panDriversShow())))
   })
   const initAdd = async () => {
     const resp = await loadDrivers()

@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"bytes"
 	"context"
 	"os"
 	stdpath "path"
@@ -16,7 +17,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -123,12 +126,12 @@ func ThumbStatus(c *gin.Context) {
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
 	}
-	status["worker_concurrency"] = setting.GetInt(conf.ThumbWorkerConcurrency, 3)
 	pw := thumbGenPower()
-	status["gen_power"] = setting.GetStr(conf.ThumbGenerationPower, "medium")
+	status["worker_concurrency"] = pw.Workers
+	status["gen_power"] = "max"
 	status["gen_workers"] = pw.Workers
 	status["gen_acquire_limit"] = pw.AcquireLimit
-	status["gen_batch_interval"] = int(pw.BatchInterval / time.Second)
+	status["gen_batch_interval"] = 0
 	status["gen_enqueue_max"] = pw.EnqueueMax
 	status["active_workers"] = atomic.LoadInt32(&thumbActiveWorkers)
 	// 是否有任一挂载处于 115 风控（前端提示"生成已暂停"）
@@ -942,4 +945,117 @@ func writeThumbIndex(paths []string) error {
 		sb.WriteString(`{"path":` + strconv.Quote(p) + `,"at":""}` + "\n")
 	}
 	return os.WriteFile(thumbIndexPath(), []byte(sb.String()), 0o666)
+}
+
+// thumbFolderNameForPath 返回指定视频所在存储的缩略图文件夹名（默认 _thumbnails）
+func thumbFolderNameForPath(rawPath string) string {
+	if storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{}); err == nil {
+		if a, ok := storage.GetAddition().(interface{ ThumbFolderName() string }); ok {
+			if n := a.ThumbFolderName(); n != "" {
+				return n
+			}
+		}
+	}
+	return "_thumbnails"
+}
+
+// uploadThumbManual 手动将本地缩略图上传到视频所在目录的缩略图文件夹（不经生成并发名额，可与生成并行）
+func uploadThumbManual(ctx context.Context, rawPath string, data []byte) error {
+	folder := thumbFolderNameForPath(rawPath)
+	thumbName := remoteThumbName(rawPath)
+	thumbFullPath := stdpath.Dir(rawPath) + "/" + folder + "/" + thumbName
+	if _, err := fs.Get(ctx, thumbFullPath, &fs.GetArgs{NoLog: true}); err == nil {
+		return nil // 已存在
+	}
+	s := &stream.FileStream{
+		Obj: &model.Object{
+			Name:     thumbName,
+			Size:     int64(len(data)),
+			Modified: time.Now(),
+		},
+		Reader: bytes.NewReader(data),
+	}
+	dir := stdpath.Dir(rawPath) + "/" + folder
+	return fs.PutDirectly(ctx, dir, s)
+}
+
+// ThumbUploadReq POST /api/admin/thumb/upload
+type ThumbUploadReq struct {
+	Path string `json:"path" binding:"required"`
+}
+
+// ThumbUpload POST /api/admin/thumb/upload
+// 将指定目录下已生成的本地缩略图并行上传到该目录的缩略图文件夹（_thumbnails）。
+// 上传走 115 驱动客户端（自动使用"上传代理"，与缩略图下载代理分离）；与后台生成互不阻塞。
+func ThumbUpload(c *gin.Context) {
+	var req ThumbUploadReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	dir := strings.TrimSuffix(req.Path, "/")
+	if dir == "" {
+		common.ErrorStrResp(c, "invalid path", 400)
+		return
+	}
+	if blocked, _ := isStorageBlocked(dir); blocked {
+		common.ErrorStrResp(c, "115 网盘风控中，暂时无法上传缩略图，请稍后再试", 429)
+		return
+	}
+	// 收集该目录下已有本地缩略图的视频
+	indexed := readThumbIndex()
+	seen := map[string]bool{}
+	var targets []string
+	for _, p := range indexed {
+		if stdpath.Dir(p) != dir || seen[p] {
+			continue
+		}
+		if _, err := os.ReadFile(thumbCachePath(thumbKindVideo, p)); err != nil {
+			continue
+		}
+		seen[p] = true
+		targets = append(targets, p)
+	}
+	if len(targets) == 0 {
+		common.SuccessResp(c, gin.H{"uploaded": 0, "failed": 0, "total": 0})
+		return
+	}
+	utils.Log.Infof("thumb upload targets dir=%s n=%d", dir, len(targets))
+	// 并行上传（每个文件独立任务，与生成并发共享 115 上传代理）
+	const uploadConcurrency = 4
+	sem := make(chan struct{}, uploadConcurrency)
+	var (
+		mu       sync.Mutex
+		uploaded int
+		failed   int
+	)
+	var wg sync.WaitGroup
+	for _, p := range targets {
+		wg.Add(1)
+		go func(rawPath string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			data, err := os.ReadFile(thumbCachePath(thumbKindVideo, rawPath))
+			if err != nil {
+				utils.Log.Errorf("thumb upload read cache failed rawPath=%s: %+v", rawPath, err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			if err := uploadThumbManual(c.Request.Context(), rawPath, data); err != nil {
+				utils.Log.Errorf("thumb upload failed rawPath=%s: %+v", rawPath, err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			uploaded++
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	common.SuccessResp(c, gin.H{"uploaded": uploaded, "failed": failed, "total": len(targets)})
 }

@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -60,7 +61,18 @@ func resolveThumbProxy() (string, uint) {
 			}
 		}
 	}
-	// auto 或手动节点不可用：选择最近最少使用的健康节点
+	// auto：优先使用当前指派的"下载节点"；节点失效则回退最近最少使用
+	thumbAssignMu.Lock()
+	assignedAddr, assignedID := thumbDownloadAddr, thumbDownloadID
+	thumbAssignMu.Unlock()
+	if assignedID != 0 && assignedAddr != "" {
+		for i := range nodes {
+			if nodes[i].ID == assignedID {
+				return nodes[i].Address(), nodes[i].ID
+			}
+		}
+	}
+	// 手动节点不可用：选择最近最少使用的健康节点
 	return pickLeastUsedNode(nodes)
 }
 
@@ -81,6 +93,104 @@ func pickLeastUsedNode(nodes []model.ProxyNode) (string, uint) {
 		return "", 0
 	}
 	return best.Address(), best.ID
+}
+
+// ---- 下载/上传代理指派 ----
+
+// 自动模式下，缩略图"下载侧"与"上传侧"使用不同节点，避免同一节点被瞬时风控
+var (
+	thumbAssignMu     sync.Mutex
+	thumbDownloadAddr string
+	thumbDownloadID   uint
+)
+
+// pickLeastUsedNodes 按最近使用时间升序返回健康节点（越靠前越少使用）
+func pickLeastUsedNodes(nodes []model.ProxyNode) []model.ProxyNode {
+	out := make([]model.ProxyNode, len(nodes))
+	copy(out, nodes)
+	sort.SliceStable(out, func(i, j int) bool {
+		ai := time.Time{}
+		aj := time.Time{}
+		if out[i].LastUsedAt != nil {
+			ai = *out[i].LastUsedAt
+		}
+		if out[j].LastUsedAt != nil {
+			aj = *out[j].LastUsedAt
+		}
+		return ai.Before(aj)
+	})
+	return out
+}
+
+// refreshThumbProxyAssign 按当前模式重新指派"下载节点"与"上传节点"，
+// 并同步应用到 115 驱动客户端（上传侧）与 op 共享变量。
+// auto：下载=最不常用节点，上传=次不常用节点；
+// manual：下载=上传=指定节点；off：清空指派（走全局代理/直连）。
+func refreshThumbProxyAssign() {
+	mode := thumbProxyMode()
+	uploadAddr := ""
+	switch mode {
+	case thumbProxyModeManual:
+		id := thumbProxyNodeID()
+		nodes, err := db.GetUsableProxyNodes()
+		if err == nil {
+			for i := range nodes {
+				if nodes[i].ID == id {
+					thumbAssignMu.Lock()
+					thumbDownloadAddr = nodes[i].Address()
+					thumbDownloadID = nodes[i].ID
+					thumbAssignMu.Unlock()
+					uploadAddr = nodes[i].Address()
+					break
+				}
+			}
+		}
+	case thumbProxyModeAuto:
+		nodes, err := db.GetUsableProxyNodes()
+		if err != nil || len(nodes) == 0 {
+			thumbAssignMu.Lock()
+			thumbDownloadAddr, thumbDownloadID = "", 0
+			thumbAssignMu.Unlock()
+		} else {
+			ordered := pickLeastUsedNodes(nodes)
+			thumbAssignMu.Lock()
+			thumbDownloadAddr = ordered[0].Address()
+			thumbDownloadID = ordered[0].ID
+			thumbAssignMu.Unlock()
+			if len(ordered) >= 2 {
+				uploadAddr = ordered[1].Address()
+			} else {
+				uploadAddr = ordered[0].Address()
+			}
+		}
+	default: // off
+		thumbAssignMu.Lock()
+		thumbDownloadAddr, thumbDownloadID = "", 0
+		thumbAssignMu.Unlock()
+	}
+	op.SetThumbUploadProxy(uploadAddr)
+	applyUploadProxyToDrivers(uploadAddr)
+}
+
+// applyUploadProxyToDrivers 将上传代理应用到已加载的 115 驱动客户端
+func applyUploadProxyToDrivers(addr string) {
+	for _, drv := range op.GetAllStorages() {
+		if s, ok := drv.(interface{ SetUploadProxy(string) }); ok {
+			s.SetUploadProxy(addr)
+		}
+	}
+}
+
+// StartThumbProxyAssign 应用启动时调用：立即指派一次并定时刷新（每次刷新会重新均衡下载/上传节点）
+func StartThumbProxyAssign() {
+	refreshThumbProxyAssign()
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			refreshThumbProxyAssign()
+		}
+	}()
 }
 
 // ---- 流量统计（内存窗口 + DB 累计）----
@@ -180,13 +290,19 @@ func recordProxyFailure(nodeID uint) {
 		return
 	}
 	node.FailCount++
+	becameRisk := false
 	if node.FailCount >= proxyRiskThreshold {
 		riskUntil := time.Now().Add(proxyRiskCooldown)
 		node.Status = model.ProxyNodeStatusRisk
 		node.RiskUntil = &riskUntil
 		node.FailCount = 0
+		becameRisk = true
 	}
 	_ = db.UpdateProxyNode(node)
+	// 节点变为风控后立即重新指派下载/上传节点，避免继续使用风险节点
+	if becameRisk {
+		refreshThumbProxyAssign()
+	}
 }
 
 // nodeRateSnapshot 单节点当前实时速率/连接数
@@ -331,6 +447,7 @@ func ThumbProxySet(c *gin.Context) {
 		common.ErrorResp(c, err, 500, true)
 		return
 	}
+	refreshThumbProxyAssign()
 	common.SuccessResp(c, thumbProxyConfigData())
 }
 
