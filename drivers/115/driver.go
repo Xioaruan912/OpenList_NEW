@@ -76,10 +76,11 @@ func (d *Pan115) Init(ctx context.Context) error {
 }
 
 func (d *Pan115) WaitLimit(ctx context.Context) error {
-	if d.limiter != nil {
-		return d.limiter.Wait(ctx)
+	// 配置了代理时不再限速：115 请求已走代理分散出口 IP，无需再靠限速规避风控
+	if d.limiter == nil || d.GetProxy() != "" {
+		return nil
 	}
-	return nil
+	return d.limiter.Wait(ctx)
 }
 
 func (d *Pan115) Drop(ctx context.Context) error {
@@ -150,9 +151,6 @@ func (d *Pan115) listMultiRoots(ctx context.Context) ([]model.Obj, error) {
 }
 
 func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	f, ok := file.(*FileObj)
 	if !ok {
 		// 多根虚拟文件夹等非文件对象不支持生成直链
@@ -244,10 +242,6 @@ func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
-
 	var (
 		fastInfo *driver115.UploadInitResp
 		dirID    = dstDir.GetID()

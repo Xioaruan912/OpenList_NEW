@@ -85,9 +85,6 @@ func (d *Pan115Share) List(ctx context.Context, dir model.Obj, args model.ListAr
 }
 
 func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	var ua string
 	if args.Header != nil {
 		ua = args.Header.Get("User-Agent")

@@ -11,7 +11,7 @@ import (
 type Addition struct {
 	Cookie      string  `json:"cookie" type:"text" help:"115 网盘 Cookie（扫码登录成功后自动填入，无需手动获取）"`
 	PageSize    int64   `json:"page_size" type:"number" default:"1000" help:"115 驱动列表接口每页大小"`
-	LimitRate   float64 `json:"limit_rate" type:"float" default:"2" help:"限制所有 115 接口请求速率（[limit] 次/秒），建议保持默认以规避风控"`
+	LimitRate   float64 `json:"limit_rate" type:"float" default:"0" help:"限制所有 115 接口请求速率（[limit] 次/秒）；0 表示不限制。配置了代理时自动不限速（代理已分散出口 IP 规避风控）"`
 	ThumbStore  string  `json:"thumb_store" type:"select" options:"local,remote" default:"local" help:"local：缩略图缓存在服务器磁盘；remote：缩略图上传到视频同级的 _thumbnails 文件夹（不占服务器磁盘）"`
 	ThumbFolder string  `json:"thumb_folder" type:"text" default:"_thumbnails" help:"thumb_store 为 remote 时，存储缩略图的文件夹名"`
 	Proxy       string  `json:"proxy" type:"text" help:"115 请求代理（http://host:port、socks5://host:port 或带账号 http://user:pass@host:port），115 API 与缩略图下载均走该代理以分散出口 IP 降低风控；留空则使用全局 proxy_address"`
