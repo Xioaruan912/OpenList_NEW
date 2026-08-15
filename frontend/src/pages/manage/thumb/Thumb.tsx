@@ -516,6 +516,7 @@ const Thumb = () => {
       <HStack
         spacing="$1"
         alignItems="center"
+        w="$full"
         p="$2"
         rounded="$md"
         _hover={{ bgColor: useColorModeValue("$neutral2", "$neutral3")() }}
@@ -540,7 +541,16 @@ const Thumb = () => {
           </Button>
         </Show>
         <Box mr="$1">📁</Box>
-        <Box css={{ flex: "1 1 auto", "word-break": "break-all", "font-size": "$sm" }}>
+        <Box
+          css={{
+            flex: "1 1 auto",
+            "font-size": "$sm",
+            "white-space": "nowrap",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+          }}
+          title={nn.name}
+        >
           {nn.name}
         </Box>
         <Tag colorScheme={sel() === nn.path ? "info" : "neutral"}>{nn.cached}</Tag>
