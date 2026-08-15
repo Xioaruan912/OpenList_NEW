@@ -714,7 +714,7 @@ const Thumb = () => {
             {sel() || "未选择目录"}
           </Text>
           <HStack spacing="$1" mt="$2" wrap="wrap">
-            <Tag colorScheme="neutral">共有 {selNode()?.videos || 0} 个媒体</Tag>
+            <Tag colorScheme="neutral">共有 {selNode()?.videos || selCount()} 个媒体</Tag>
             <Tag colorScheme="info">已有缩略图 {selCount()} 个</Tag>
             <Tag colorScheme={selExcluded().length ? "warning" : "neutral"}>
               已排除 {selExcluded().length} 个
