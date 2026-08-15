@@ -184,6 +184,15 @@ func ThumbStatus(c *gin.Context) {
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i]["count"].(int) > dirs[j]["count"].(int) })
 	status["fails_by_dir"] = dirs
 	status["fails_unknown"] = unknown
+	// 失败明细（带路径与原因，供前端告警/展示）
+	failItems := make([]gin.H, 0, len(fails))
+	for _, f := range fails {
+		if f.Path == "" {
+			continue
+		}
+		failItems = append(failItems, gin.H{"path": f.Path, "dir": f.Dir, "msg": f.Msg, "at": f.At})
+	}
+	status["fail_items"] = failItems
 
 	// 失效挂载路径目录：索引中不属于任何当前存储挂载路径的条目（挂载路径变更后遗留）
 	status["stale_by_dir"] = thumbStaleByDir(indexed)
@@ -711,6 +720,12 @@ func ThumbDir(c *gin.Context) {
 	}
 	var files []string
 	hasThumb := map[string]bool{}
+	failed := map[string]string{}
+	for _, f := range listThumbFails() {
+		if f.Path != "" && f.Dir == path {
+			failed[f.Path] = f.Msg
+		}
+	}
 	var exFiles []string
 	withThumb := 0
 	// 列出本目录下所有媒体（视频）文件：有缩略图的标记 has_thumb=true，
@@ -731,7 +746,7 @@ func ThumbDir(c *gin.Context) {
 		}
 		common.SuccessResp(c, gin.H{
 			"path": path, "files": files, "count": withThumb,
-			"has_thumb": hasThumb, "excluded": exFiles, "listed": false,
+			"has_thumb": hasThumb, "excluded": exFiles, "failed": failed, "listed": false,
 		})
 		return
 	}
@@ -757,7 +772,7 @@ func ThumbDir(c *gin.Context) {
 	}
 	common.SuccessResp(c, gin.H{
 		"path": path, "files": files, "count": withThumb,
-		"has_thumb": hasThumb, "excluded": exFiles, "listed": true,
+		"has_thumb": hasThumb, "excluded": exFiles, "failed": failed, "listed": true,
 	})
 }
 

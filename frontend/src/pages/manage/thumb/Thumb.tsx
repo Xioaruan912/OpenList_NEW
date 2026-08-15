@@ -32,6 +32,7 @@ type ThumbStatus = {
   queue_paused: boolean
   active_workers: number
   active_tasks?: { path: string; since: number }[]
+  fail_items?: { path: string; dir: string; msg: string; at: string }[]
   blocked: boolean
   stale_by_dir?: { dir: string; count: number }[]
   mounts?: string[]
@@ -114,6 +115,9 @@ const Thumb = () => {
   const [viewPath, setViewPath] = createSignal("")
   const [viewUrl, setViewUrl] = createSignal("")
   const [viewLoading, setViewLoading] = createSignal(false)
+  const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
+  const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
+  let firstStatusLoaded = false
 
   const load = async () => {
     const resp = await r.get("/admin/thumb/status")
@@ -132,6 +136,23 @@ const Thumb = () => {
       if ((data.prewarm_queued || 0) === 0 && (data.active_workers || 0) === 0) {
         setTotalQueued(0)
       }
+      // 检测新增失败并告警（首次加载不弹，之后新增失败才弹）
+      const items = data.fail_items || []
+      if (firstStatusLoaded) {
+        const newOnes = items.filter((i) => !knownFails().has(i.path))
+        if (newOnes.length > 0) {
+          const samples = newOnes
+            .slice(0, 5)
+            .map((i) => `${i.path.split("/").pop()}（${i.msg || "生成失败"}）`)
+            .join("、")
+          notify.error(
+            `${newOnes.length} 个缩略图生成失败：${samples}` +
+              (newOnes.length > 5 ? ` 等 ${newOnes.length} 个` : ""),
+          )
+        }
+      }
+      firstStatusLoaded = true
+      setKnownFails(new Set(items.map((i) => i.path)))
     })
   }
 
@@ -162,12 +183,14 @@ const Thumb = () => {
         count?: number
         excluded?: string[]
         has_thumb?: Record<string, boolean>
+        failed?: Record<string, string>
         listed?: boolean
       }
       setSelFiles(data.files || [])
       setSelCount(data.count || 0)
       setSelExcluded(data.excluded || [])
       setHasThumb(data.has_thumb || {})
+      setFailedMap(data.failed || {})
       setDirListed(!!data.listed)
       const z: Record<string, boolean> = {}
       for (const f of data.files || []) {
@@ -979,6 +1002,11 @@ const Thumb = () => {
                   <Show when={!hasThumb()[q]}>
                     <Tag colorScheme="neutral" size="sm">
                       无缩略图
+                    </Tag>
+                  </Show>
+                  <Show when={failedMap()[q]}>
+                    <Tag colorScheme="danger" size="sm" title={failedMap()[q] || "生成失败"}>
+                      失败
                     </Tag>
                   </Show>
                   <Show when={!checked()[q]}>

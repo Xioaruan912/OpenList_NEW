@@ -90,6 +90,34 @@ func isPermanentThumbError(err error) bool {
 	return false
 }
 
+// thumbFailReason 把生成错误映射为面向用户的简短失败原因
+func thumbFailReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, errThumbTooLarge):
+		return "文件过大"
+	case errors.Is(err, errThumbNoCover):
+		return "无封面/无法抽帧"
+	case strings.Contains(msg, "403") || strings.Contains(msg, "pmt") || strings.Contains(msg, "access denied"):
+		return "115 拦截访问（无法取帧）"
+	case strings.Contains(msg, "405"):
+		return "115 风控拦截"
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline"):
+		return "下载/抽帧超时"
+	case strings.Contains(msg, "partial file"):
+		return "视频数据不完整（深偏移被限）"
+	case strings.Contains(msg, "unable to extract") || strings.Contains(msg, "no frame"):
+		return "无法抽帧（可能被 115 拦截或文件损坏）"
+	case strings.Contains(msg, "blank"):
+		return "生成结果为空白图"
+	default:
+		return "生成失败"
+	}
+}
+
 // isBlankThumb 判断生成的缩略图是否为近纯色/空白图（抽帧失败时 ffmpeg 常输出纯白图）。
 // 采用网格采样：99% 以上像素与左上角基准色相差 <=10 视为空白。
 func isBlankThumb(png []byte) bool {
@@ -218,11 +246,12 @@ func thumbFailed(kind, rawPath string) bool {
 	return time.Since(fi.ModTime()) < thumbFailTTLDuration()
 }
 
-func markThumbFailed(kind, rawPath string) {
-	// 记录失败路径，便于按目录统计失败与重试
+func markThumbFailed(kind, rawPath, msg string) {
+	// 记录失败路径与原因，便于按目录统计失败与重试、前端告警
 	data, _ := json.Marshal(map[string]string{
 		"path": rawPath,
 		"at":   time.Now().Format(time.RFC3339),
+		"msg":  msg,
 	})
 	_ = os.WriteFile(thumbFailPath(kind, rawPath), data, 0o666)
 }
@@ -233,6 +262,7 @@ type thumbFailItem struct {
 	Path string `json:"path"`
 	Dir  string `json:"dir"`
 	At   string `json:"at"`
+	Msg  string `json:"msg"`
 }
 
 // listThumbFails 扫描 fail 标记文件，解析出失败路径（旧格式无内容视为路径未知）
@@ -254,6 +284,7 @@ func listThumbFails() []thumbFailItem {
 			if json.Unmarshal(data, &m) == nil {
 				item.Path = m["path"]
 				item.At = m["at"]
+				item.Msg = m["msg"]
 				if item.Path != "" {
 					item.Dir = stdpath.Dir(item.Path)
 				}
@@ -482,18 +513,22 @@ func extractVideoFrameRemote(ctx context.Context, url string, header http.Header
 	return encodeThumb(data)
 }
 
-// generateVideoMiddleFrame 长视频取中间（50%）单帧缩略图（1x1）。
-// 只做 1 次远程 seek，比多帧网格更快、更可靠：115 对深偏移 Range 常返回 403/partial
-// （实测 3 部 >1h 电影的 2x2 深 seek 全部失败），单帧中间抽帧更稳。
-func generateVideoMiddleFrame(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
+// generateVideoAdaptiveFrame 长视频单帧缩略图（1x1）：按"中间优先"依次尝试远程 seek
+// 深度 50%→30%→15%→7%→3%，取第一个成功的帧（越深越接近中间内容）。
+// 115 对大文件深偏移 Range 常返回 403（每次失败 ~0.5s 快速跳过），
+// 单帧+自适应比多帧网格更快更可靠。
+func generateVideoAdaptiveFrame(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
 	if duration <= 0 {
 		return nil, errors.New("invalid duration")
 	}
-	data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", duration*0.5))
-	if err != nil {
-		return nil, err
+	for _, ratio := range []float64{0.5, 0.3, 0.15, 0.07, 0.03} {
+		data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", duration*ratio))
+		if err != nil {
+			continue
+		}
+		return encodeThumb(data)
 	}
-	return encodeThumb(data)
+	return nil, errors.New("no frame extractable at any depth")
 }
 
 // extractAudioCover 从本地音频文件提取内嵌封面（无封面时返回 errThumbNoCover）
@@ -666,23 +701,23 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	png, err := generate()
 	if err != nil {
 		if errors.Is(err, errThumbNoCover) {
-			markThumbFailed(kind, rawPath)
+			markThumbFailed(kind, rawPath, "无封面/无法抽帧")
 			serveThumbPlaceholder(c)
 			return
 		}
 		if errors.Is(err, errThumbTooLarge) {
-			markThumbFailed(kind, rawPath)
+			markThumbFailed(kind, rawPath, "文件过大")
 			serveThumbPlaceholder(c)
 			return
 		}
 		// 所有生成失败都写负缓存，避免反复重试加重风控
-		markThumbFailed(kind, rawPath)
+		markThumbFailed(kind, rawPath, thumbFailReason(err))
 		log.Warnf("thumb generate failed [%s] %s: %v", kind, rawPath, err)
 		serveThumbPlaceholder(c)
 		return
 	}
 	if isBlankThumb(png) {
-		markThumbFailed(kind, rawPath)
+		markThumbFailed(kind, rawPath, "生成结果为空白图")
 		log.Warnf("thumb blank [%s] %s", kind, rawPath)
 		serveThumbPlaceholder(c)
 		return
@@ -859,7 +894,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	if moovAtTail(ctx, link, size, rawPath) {
 		if size > thumbProbeMinSize {
 			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-				if data, err := generateVideoMiddleFrame(ctx, remoteURL, link.Header, dur); err == nil {
+				if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, dur); err == nil {
 					return data, nil
 				}
 			}
@@ -870,7 +905,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 	// 长视频：探测时长后取"中间单帧"（1x1，中间内容）；失败降级本地头部抽帧
 	if size > thumbProbeMinSize {
 		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-			if data, err := generateVideoMiddleFrame(ctx, remoteURL, link.Header, dur); err == nil {
+			if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, dur); err == nil {
 				return data, nil
 			}
 			log.Debugf("middle frame failed for %s, fallback to head chunk", rawPath)
@@ -1098,16 +1133,16 @@ func processTask(task thumbPrewarmTask) {
 		return
 	}
 	if err != nil {
-		// 永久性失败（文件被 115 拦截/结构损坏等）：写失败标记、不重试，让用户可见
-		if isPermanentThumbError(err) {
+		// 永久性失败（文件被 115 拦截/结构损坏/文件过大/无封面等）：写失败标记、不重试，让用户可见
+		if isPermanentThumbError(err) || errors.Is(err, errThumbTooLarge) || errors.Is(err, errThumbNoCover) {
 			log.Warnf("thumb prewarm permanent fail [%s] %s: %v", task.kind, task.rawPath, err)
-			markThumbFailed(task.kind, task.rawPath)
+			markThumbFailed(task.kind, task.rawPath, thumbFailReason(err))
 			prewarmDone.Store(task.rawPath, struct{}{})
 			return
 		}
 		// 生成失败不写 fail 标记（可能为网盘风控等临时问题），
 		// 长间隔退避重试（风控冻结通常 10-30 分钟，短间隔只会加重风控）
-		if task.retry < 3 && !errors.Is(err, errThumbNoCover) && !errors.Is(err, errThumbTooLarge) {
+		if task.retry < 3 {
 			prewarmDone.Delete(task.rawPath)
 			time.Sleep(180 * time.Second)
 			task.retry++
@@ -1116,13 +1151,14 @@ func processTask(task thumbPrewarmTask) {
 			return
 		}
 		log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
+		markThumbFailed(task.kind, task.rawPath, thumbFailReason(err))
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
 	// 空白/纯色缩略图：视为生成失败（写失败标记、不缓存），避免占着"已有缩略图"名额
 	if isBlankThumb(png) {
 		log.Warnf("thumb prewarm blank [%s] %s", task.kind, task.rawPath)
-		markThumbFailed(task.kind, task.rawPath)
+		markThumbFailed(task.kind, task.rawPath, "生成结果为空白图")
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
