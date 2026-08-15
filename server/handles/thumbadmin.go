@@ -695,27 +695,64 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 // 返回指定目录下（含子目录）已有缩略图的视频文件清单（来自索引，不依赖网盘列表）
 func ThumbDir(c *gin.Context) {
 	path := strings.TrimSuffix(c.Query("path"), "/")
-	indexed := readThumbIndex()
+	ex := readThumbExcluded()
+	// 已生成缩略图的路径集合（仅本目录直接子文件）
+	thumbnailed := map[string]bool{}
+	for _, p := range readThumbIndex() {
+		if stdpath.Dir(p) == path {
+			thumbnailed[p] = true
+		}
+	}
 	var files []string
-	total := 0
-	prefix := path + "/"
-	for _, p := range indexed {
-		if !strings.HasPrefix(p, prefix) {
+	hasThumb := map[string]bool{}
+	var exFiles []string
+	withThumb := 0
+	// 列出本目录下所有媒体（视频）文件：有缩略图的标记 has_thumb=true，
+	// 前端可点击查看；无缩略图的也可展示（生成缺失）。
+	objs, err := fs.List(c.Request.Context(), path, &fs.ListArgs{})
+	if err != nil {
+		// 列表失败（如 115 风控）：回退到索引中该目录的直接子文件（有缩略图的）
+		for p := range thumbnailed {
+			if len(files) >= 1000 {
+				break
+			}
+			files = append(files, p)
+			hasThumb[p] = true
+			withThumb++
+			if ex[p] {
+				exFiles = append(exFiles, p)
+			}
+		}
+		common.SuccessResp(c, gin.H{
+			"path": path, "files": files, "count": withThumb,
+			"has_thumb": hasThumb, "excluded": exFiles, "listed": false,
+		})
+		return
+	}
+	for _, obj := range objs {
+		if obj.IsDir() {
 			continue
 		}
-		total++
-		if len(files) < 200 {
-			files = append(files, p)
+		if utils.GetFileType(obj.GetName()) != conf.VIDEO {
+			continue
+		}
+		rawPath := path + "/" + obj.GetName()
+		if len(files) >= 1000 {
+			break
+		}
+		files = append(files, rawPath)
+		hasThumb[rawPath] = thumbnailed[rawPath]
+		if hasThumb[rawPath] {
+			withThumb++
+		}
+		if ex[rawPath] {
+			exFiles = append(exFiles, rawPath)
 		}
 	}
-	ex := readThumbExcluded()
-	var exFiles []string
-	for _, f := range files {
-		if ex[f] {
-			exFiles = append(exFiles, f)
-		}
-	}
-	common.SuccessResp(c, gin.H{"path": path, "files": files, "count": total, "excluded": exFiles})
+	common.SuccessResp(c, gin.H{
+		"path": path, "files": files, "count": withThumb,
+		"has_thumb": hasThumb, "excluded": exFiles, "listed": true,
+	})
 }
 
 // ThumbExcludeReq POST /api/admin/thumb/exclude

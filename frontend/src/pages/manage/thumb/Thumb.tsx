@@ -99,6 +99,8 @@ const Thumb = () => {
   const [selFiles, setSelFiles] = createSignal<string[]>([])
   const [selCount, setSelCount] = createSignal(0)
   const [selExcluded, setSelExcluded] = createSignal<string[]>([])
+  const [hasThumb, setHasThumb] = createSignal<Record<string, boolean>>({})
+  const [dirListed, setDirListed] = createSignal(true)
   const [checked, setChecked] = createSignal<Record<string, boolean>>({})
   const [expanded, setExp] = createSignal<Set<string>>(new Set())
   const [treeLoading, setTreeLoading] = createSignal(false)
@@ -150,10 +152,18 @@ const Thumb = () => {
     if (!pp) return
     const resp = await r.get("/admin/thumb/dir", { params: { path: pp } })
     handleResp(resp, (d) => {
-      const data = d as { files?: string[]; count?: number; excluded?: string[] }
+      const data = d as {
+        files?: string[]
+        count?: number
+        excluded?: string[]
+        has_thumb?: Record<string, boolean>
+        listed?: boolean
+      }
       setSelFiles(data.files || [])
       setSelCount(data.count || 0)
       setSelExcluded(data.excluded || [])
+      setHasThumb(data.has_thumb || {})
+      setDirListed(!!data.listed)
       const z: Record<string, boolean> = {}
       for (const f of data.files || []) {
         z[f] = !(data.excluded || []).includes(f)
@@ -466,19 +476,6 @@ const Thumb = () => {
     })
     loadDir(pp)
   }
-
-  const findNode = (ns: TreeNode[], p: string): TreeNode | undefined => {
-    for (const n of ns || []) {
-      if (n.path === p) return n
-      if (n.children?.length) {
-        const f = findNode(n.children, p)
-        if (f) return f
-      }
-    }
-    return undefined
-  }
-
-  const selNode = () => findNode(tree(), sel())
 
   const TN = (nn: TreeNode, depth: number) => (
     <>
@@ -820,8 +817,11 @@ const Thumb = () => {
             {sel() || "未选择目录"}
           </Text>
           <HStack spacing="$1" mt="$2" wrap="wrap">
-            <Tag colorScheme="neutral">共有 {selNode()?.videos || selCount()} 个媒体</Tag>
+            <Tag colorScheme="neutral">共有 {selFiles().length} 个媒体</Tag>
             <Tag colorScheme="info">已有缩略图 {selCount()} 个</Tag>
+            <Show when={!dirListed()}>
+              <Tag colorScheme="warning">列表受限（115 风控），仅展示有缩略图的文件</Tag>
+            </Show>
             <Tag colorScheme={selExcluded().length ? "warning" : "neutral"}>
               已排除 {selExcluded().length} 个
             </Tag>
@@ -870,22 +870,45 @@ const Thumb = () => {
                   >
                     {checked()[q] ? "✓" : "○"}
                   </Button>
-                  <Box
-                    css={{
-                      flex: "1 1 auto",
-                      "word-break": "break-all",
-                      "font-size": "$sm",
-                      opacity: checked()[q] ? "1" : "0.5",
-                      cursor: "pointer",
-                    }}
-                    title="点击查看缩略图"
-                    onClick={() => viewThumb(q)}
-                    _hover={{ color: "$info9" }}
+                  <Show
+                    when={hasThumb()[q]}
+                    fallback={
+                      <Box
+                        css={{
+                          flex: "1 1 auto",
+                          "word-break": "break-all",
+                          "font-size": "$sm",
+                          opacity: "0.45",
+                        }}
+                      >
+                        {q.replace(sel(), "").replace(/^\//, "")}
+                      </Box>
+                    }
                   >
-                    {q.replace(sel(), "").replace(/^\//, "")}
-                  </Box>
+                    <Box
+                      css={{
+                        flex: "1 1 auto",
+                        "word-break": "break-all",
+                        "font-size": "$sm",
+                        opacity: checked()[q] ? "1" : "0.5",
+                        cursor: "pointer",
+                      }}
+                      title="点击查看缩略图"
+                      onClick={() => viewThumb(q)}
+                      _hover={{ color: "$info9" }}
+                    >
+                      {q.replace(sel(), "").replace(/^\//, "")}
+                    </Box>
+                  </Show>
+                  <Show when={!hasThumb()[q]}>
+                    <Tag colorScheme="neutral" size="sm">
+                      无缩略图
+                    </Tag>
+                  </Show>
                   <Show when={!checked()[q]}>
-                    <Tag colorScheme="warning">已排除</Tag>
+                    <Tag colorScheme="warning" size="sm">
+                      已排除
+                    </Tag>
                   </Show>
                 </HStack>
               )}
