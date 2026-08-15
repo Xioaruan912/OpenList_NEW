@@ -44,6 +44,8 @@ type TreeNode = {
   path: string
   name: string
   cached: number
+  local?: number
+  cloud?: number
   videos?: number
   children?: TreeNode[]
 }
@@ -628,6 +630,17 @@ const Thumb = () => {
     loadDir(pp)
   }
 
+  // 目录计数 Tag 颜色：网盘→绿，本地→橙，都有→灰
+  const treeCachedColor = (nn: TreeNode) => {
+    const total = nn.cached || 0
+    if (total === 0) return "neutral"
+    const l = nn.local || 0
+    const c = nn.cloud || 0
+    if (c > 0 && l === 0) return "success"
+    if (l > 0 && c === 0) return "warning"
+    return "neutral"
+  }
+
   const TN = (nn: TreeNode, depth: number) => (
     <>
       <HStack
@@ -670,7 +683,7 @@ const Thumb = () => {
         >
           {nn.name}
         </Box>
-        <Tag colorScheme={sel() === nn.path ? "info" : "neutral"}>{nn.cached}</Tag>
+        <Tag colorScheme={treeCachedColor(nn)}>{nn.cached}</Tag>
         <Show when={(nn.videos || 0) > nn.cached}>
           <Tag colorScheme="warning">缺 {nn.videos! - nn.cached}</Tag>
         </Show>

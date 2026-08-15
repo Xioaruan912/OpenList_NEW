@@ -605,6 +605,8 @@ type thumbTreeNode struct {
 	Path     string           `json:"path"`
 	Name     string           `json:"name"`
 	Cached   int              `json:"cached"`
+	Local    int              `json:"local"` // 本地缓存存在的缩略图数
+	Cloud    int              `json:"cloud"` // 网盘已上传的缩略图数
 	Videos   int              `json:"videos"`
 	Children []*thumbTreeNode `json:"children"`
 }
@@ -624,13 +626,22 @@ func ThumbTree(c *gin.Context) {
 func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	scanCtx, cancel := context.WithTimeout(ctx, thumbTreeScanTO)
 	defer cancel()
-	// 索引：每目录已有缩略图数（直接子项）
+	// 索引：每目录已有缩略图数（直接子项），并按存放位置区分本地/网盘
 	indexed := readThumbIndex()
 	cachedByDir := map[string]int{}
+	localByDir := map[string]int{}
+	cloudByDir := map[string]int{}
+	cloud := readThumbCloudIndex()
 	for _, p := range indexed {
 		dir := stdpath.Dir(p)
 		if dir != "" && dir != "." {
 			cachedByDir[dir]++
+			if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
+				localByDir[dir]++
+			}
+			if cloud[p] {
+				cloudByDir[dir]++
+			}
 		}
 	}
 	root := &thumbTreeNode{}
@@ -658,7 +669,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 					continue
 				}
 				childPath := dir + "/" + obj.GetName()
-				child := &thumbTreeNode{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath]}
+				child := &thumbTreeNode{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath], Local: localByDir[childPath], Cloud: cloudByDir[childPath]}
 				cur.Children = append(cur.Children, child)
 				scan(childPath, child)
 			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
@@ -670,7 +681,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	if len(mounts) > 0 {
 		for _, m := range mounts {
 			realDirs[m] = true
-			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m]}
+			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m], Local: localByDir[m], Cloud: cloudByDir[m]}
 			root.Children = append(root.Children, child)
 			scan(m, child)
 		}
@@ -685,16 +696,27 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			// 索引已迁移，重建缓存计数并刷新树节点
 			indexed = readThumbIndex()
 			cachedByDir = map[string]int{}
+			localByDir = map[string]int{}
+			cloudByDir = map[string]int{}
+			cloud = readThumbCloudIndex()
 			for _, p := range indexed {
 				dir := stdpath.Dir(p)
 				if dir != "" && dir != "." {
 					cachedByDir[dir]++
+					if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
+						localByDir[dir]++
+					}
+					if cloud[p] {
+						cloudByDir[dir]++
+					}
 				}
 			}
 			var refreshCached func(ns []*thumbTreeNode)
 			refreshCached = func(ns []*thumbTreeNode) {
 				for _, n := range ns {
 					n.Cached = cachedByDir[n.Path]
+					n.Local = localByDir[n.Path]
+					n.Cloud = cloudByDir[n.Path]
 					if len(n.Children) > 0 {
 						refreshCached(n.Children)
 					}
@@ -720,26 +742,28 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 					break
 				}
 			}
-			if child == nil {
-				child = &thumbTreeNode{Path: path, Name: part, Cached: cnt}
-				cur.Children = append(cur.Children, child)
-			}
-			cur = child
+		if child == nil {
+			child = &thumbTreeNode{Path: path, Name: part, Cached: cnt, Local: localByDir[dir], Cloud: cloudByDir[dir]}
+			cur.Children = append(cur.Children, child)
 		}
+		cur = child
 	}
-	// 汇总子树计数：Videos/Cached 改为含子目录的累计值，
-	// 与"点击生成（递归）"处理的数量一致，避免"缺 N"与实际入队数对不上
-	var sumSubtree func(n *thumbTreeNode) (vids, cached int)
-	sumSubtree = func(n *thumbTreeNode) (int, int) {
-		v, c := n.Videos, n.Cached
-		for _, ch := range n.Children {
-			cv, cc := sumSubtree(ch)
-			v += cv
-			c += cc
-		}
-		n.Videos, n.Cached = v, c
-		return v, c
+}
+// 汇总子树计数：Videos/Cached 改为含子目录的累计值，
+// 与"点击生成（递归）"处理的数量一致，避免"缺 N"与实际入队数对不上
+var sumSubtree func(n *thumbTreeNode) (vids, cached, local, cloud int)
+sumSubtree = func(n *thumbTreeNode) (int, int, int, int) {
+	v, c, l, cl := n.Videos, n.Cached, n.Local, n.Cloud
+	for _, ch := range n.Children {
+		cv, cc, cl2, ccl := sumSubtree(ch)
+		v += cv
+		c += cc
+		l += cl2
+		cl += ccl
 	}
+	n.Videos, n.Cached, n.Local, n.Cloud = v, c, l, cl
+	return v, c, l, cl
+}
 	for _, m := range root.Children {
 		sumSubtree(m)
 	}
