@@ -31,8 +31,12 @@ set -euo pipefail
 
 GOST_VER="2.12.0"
 GOST_REPO="https://github.com/ginuerzh/gost/releases/download/v${GOST_VER}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || pwd)"
-LOCAL_BIN="${SCRIPT_DIR}/bin"
+# curl | bash 管道执行时没有 BASH_SOURCE，此时无法确定本地 bin 目录，直接走网络下载
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+LOCAL_BIN="${SCRIPT_DIR:+${SCRIPT_DIR}/bin}"
 
 log()  { echo -e "\033[32m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
