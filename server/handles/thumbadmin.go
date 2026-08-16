@@ -134,18 +134,37 @@ func ThumbGenerate(c *gin.Context) {
 	})
 }
 
+// 目录树聚合统计缓存：buildThumbTree 完整扫描后填充（覆盖全部目录，含非索引目录的网盘清单），
+// ThumbStatus 读取以保持与目录树一致（避免状态接口只统计索引目录导致数字对不上）。
+var (
+	thumbAggMu sync.Mutex
+	thumbAgg   struct{ cached, local, cloud int }
+	thumbAggAt time.Time
+)
+
+const thumbAggTTL = 10 * time.Minute
+
 // ThumbStatus GET /api/admin/thumb/status
 // 缩略图缓存与预热队列状态（含按目录失败统计）
 func ThumbStatus(c *gin.Context) {
-	localFiles, failCount, totalSize := thumbCacheStats()
-	// 网盘实际缩略图数（按 _thumbnails 清单统计，带缓存）与本地/网盘重叠数
-	cloudCount, overlap := thumbCloudStats(c.Request.Context())
-	union := localFiles + cloudCount - overlap
+	_, failCount, totalSize := thumbCacheStats()
+	var cachedFiles, localFiles, cloudFiles int
+	thumbAggMu.Lock()
+	if time.Since(thumbAggAt) < thumbAggTTL {
+		cachedFiles, localFiles, cloudFiles = thumbAgg.cached, thumbAgg.local, thumbAgg.cloud
+		thumbAggMu.Unlock()
+	} else {
+		thumbAggMu.Unlock()
+		lf, _, _ := thumbCacheStats()
+		cf, overlap := thumbCloudStats(c.Request.Context())
+		localFiles, cloudFiles = lf, cf
+		cachedFiles = lf + cf - overlap
+	}
 	status := gin.H{
 		"cache_dir":    thumbDir(),
-		"cached_files": union,
+		"cached_files": cachedFiles,
 		"local_files":  localFiles,
-		"cloud_files":  cloudCount,
+		"cloud_files":  cloudFiles,
 		"fail_markers": failCount,
 		"cache_size":   totalSize,
 		"prewarm_enabled": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
@@ -796,6 +815,17 @@ sumSubtree = func(n *thumbTreeNode) (int, int, int, int) {
 	for _, m := range root.Children {
 		sumSubtree(m)
 	}
+	// 缓存聚合统计（覆盖全部目录，含非索引目录的网盘清单），供 ThumbStatus 保持一致
+	tc, tl, tcl := 0, 0, 0
+	for _, m := range root.Children {
+		tc += m.Cached
+		tl += m.Local
+		tcl += m.Cloud
+	}
+	thumbAggMu.Lock()
+	thumbAgg.cached, thumbAgg.local, thumbAgg.cloud = tc, tl, tcl
+	thumbAggAt = time.Now()
+	thumbAggMu.Unlock()
 	return root.Children, status
 }
 
