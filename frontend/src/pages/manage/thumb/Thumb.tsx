@@ -807,8 +807,8 @@ const Thumb = () => {
     </>
   )
 
-  load()
-  loadTree()
+  // 先加载目录树（填充后端聚合统计），再刷新状态，保证顶部与树数字一致
+  void loadTree().then(() => load())
   loadProxy()
   // 挂载时拉一次上传状态，恢复"正在上传 N"（若服务端有运行中则启动快轮询）
   void pollUploadStatus()
