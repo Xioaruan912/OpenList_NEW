@@ -741,6 +741,55 @@ func thumbCloudCount() int {
 	return len(thumbCloudSet)
 }
 
+// thumbCloudStats 统计网盘 _thumbnails 实际缩略图总数，以及"本地存在且网盘清单也有"的重叠数。
+// 以实际目录清单为准（loadRemoteThumbListing 带缓存），而非仅 cloud.jsonl 上传记录，
+// 覆盖此前上传/手动上传而未写入 cloud.jsonl 的文件。聚合结果缓存，避免高频轮询反复列目录。
+func thumbCloudStats(ctx context.Context) (cloudCount, overlap int) {
+	thumbCloudStatsMu.Lock()
+	if time.Since(thumbCloudStatsAt) < thumbCloudStatsTTL {
+		v := thumbCloudStatsVal
+		thumbCloudStatsMu.Unlock()
+		return v.cloud, v.overlap
+	}
+	thumbCloudStatsMu.Unlock()
+	cloud, ov := computeThumbCloudStats(ctx)
+	thumbCloudStatsMu.Lock()
+	thumbCloudStatsVal.cloud, thumbCloudStatsVal.overlap = cloud, ov
+	thumbCloudStatsAt = time.Now()
+	thumbCloudStatsMu.Unlock()
+	return cloud, ov
+}
+
+func computeThumbCloudStats(ctx context.Context) (cloudCount, overlap int) {
+	indexed := readThumbIndex()
+	cache := map[string]map[string]bool{}
+	for _, p := range indexed {
+		dir := stdpath.Dir(p)
+		if dir == "" || dir == "." {
+			continue
+		}
+		names, ok := cache[dir]
+		if !ok {
+			names = loadRemoteThumbListing(ctx, dir, folderNameOnly{thumbFolderNameForPath(dir)})
+			cache[dir] = names
+			cloudCount += len(names)
+		}
+		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
+			if names[remoteThumbName(p)] {
+				overlap++
+			}
+		}
+	}
+	return cloudCount, overlap
+}
+
+var (
+	thumbCloudStatsMu  sync.Mutex
+	thumbCloudStatsAt  time.Time
+	thumbCloudStatsVal struct{ cloud, overlap int }
+)
+
+const thumbCloudStatsTTL = 10 * time.Minute
 
 // serveThumb 通用缩略图入口：缓存命中直接返回，未命中则串行生成
 func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, error)) {

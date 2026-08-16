@@ -138,14 +138,8 @@ func ThumbGenerate(c *gin.Context) {
 // 缩略图缓存与预热队列状态（含按目录失败统计）
 func ThumbStatus(c *gin.Context) {
 	localFiles, failCount, totalSize := thumbCacheStats()
-	cloudCount := thumbCloudCount()
-	// 并集统计：本地 + 网盘，两边都有的只算一次（如恢复预览后又本地缓存）
-	overlap := 0
-	for p := range readThumbCloudIndex() {
-		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
-			overlap++
-		}
-	}
+	// 网盘实际缩略图数（按 _thumbnails 清单统计，带缓存）与本地/网盘重叠数
+	cloudCount, overlap := thumbCloudStats(c.Request.Context())
 	union := localFiles + cloudCount - overlap
 	status := gin.H{
 		"cache_dir":    thumbDir(),
@@ -678,6 +672,8 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			scanFailed++
 			return
 		}
+		// 本目录网盘 _thumbnails 实际文件数（清单带缓存；以实际为准而非仅 cloud.jsonl）
+		cur.Cloud = len(loadRemoteThumbListing(scanCtx, dir, folderNameOnly{thumbFolderNameForPath(dir)}))
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if obj.GetName() == "_thumbnails" {
@@ -731,7 +727,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 				for _, n := range ns {
 					n.Cached = cachedByDir[n.Path]
 					n.Local = localByDir[n.Path]
-					n.Cloud = cloudByDir[n.Path]
+					n.Cloud = len(loadRemoteThumbListing(scanCtx, n.Path, folderNameOnly{thumbFolderNameForPath(n.Path)}))
 					if len(n.Children) > 0 {
 						refreshCached(n.Children)
 					}
