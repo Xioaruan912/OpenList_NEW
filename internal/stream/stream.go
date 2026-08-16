@@ -101,6 +101,9 @@ func (f *FileStream) CacheFullAndWriter(up *model.UpdateProgress, writer io.Writ
 			if err != nil {
 				return nil, err
 			}
+			// 哈希读取消耗了 peek 的读位置：复位到 0，
+			// 否则后续（如 OSS 上传）从 f.Reader=MultiReader(peek,...) 读时 peek 已到 EOF，
+			// 会得到空内容（OSS 对象 0 字节 → 115 回调 size 校验失败 990005）
 			f.peek.Seek(0, io.SeekStart)
 		}
 		reader = f.oriReader

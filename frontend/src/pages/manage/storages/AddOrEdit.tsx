@@ -222,8 +222,18 @@ const AddOrEdit = () => {
           </Button>
           <Show when={addition.root_folder_id}>
             <Heading size="sm" color="$neutral9">
-              当前挂载文件夹：{addition.root_folder_id.split(",").length} 个
-              {addition.root_folder_id.split(",").length === 1
+              当前挂载文件夹：
+              {(
+                Array.isArray(addition.root_folder_id)
+                  ? addition.root_folder_id.join(",")
+                  : addition.root_folder_id
+              ).split(",").length}{" "}
+              个
+              {(
+                Array.isArray(addition.root_folder_id)
+                  ? addition.root_folder_id.join(",")
+                  : addition.root_folder_id
+              ).split(",").length === 1
                 ? `（ID ${addition.root_folder_id}）`
                 : ""}
             </Heading>

@@ -80,7 +80,13 @@ export const FolderPicker115 = (props: {
       setCrumbs([])
       setFolders([])
       const pre: Record<string, boolean> = {}
-      for (const id of (props.current || "").split(",")) {
+      const cur =
+        typeof props.current === "string"
+          ? props.current
+          : Array.isArray(props.current)
+            ? props.current.join(",")
+            : ""
+      for (const id of cur.split(",")) {
         if (id.trim()) pre[id.trim()] = true
       }
       setSelected(pre)

@@ -131,8 +131,8 @@ export const QrcodeLogin115 = (props: {
     setFolderModal(true)
   }
 
-  const confirmFolder = (id: string, name: string) => {
-    props.setAddition("root_folder_id", id)
+  const confirmFolder = (ids: string[]) => {
+    props.setAddition("root_folder_id", ids.join(","))
   }
 
   return (
