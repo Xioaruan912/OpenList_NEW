@@ -657,6 +657,10 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	dirsCount := 0
 	scanFailed := 0
 	realDirs := map[string]bool{}
+	indexedSet := map[string]bool{}
+	for _, p := range indexed {
+		indexedSet[p] = true
+	}
 	var scan func(dir string, cur *thumbTreeNode)
 	scan = func(dir string, cur *thumbTreeNode) {
 		if scanCtx.Err() != nil {
@@ -672,19 +676,33 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			scanFailed++
 			return
 		}
-		// 本目录网盘 _thumbnails 实际文件数（清单带缓存；以实际为准而非仅 cloud.jsonl）
-		cur.Cloud = len(loadRemoteThumbListing(scanCtx, dir, folderNameOnly{thumbFolderNameForPath(dir)}))
+		// 本目录网盘 _thumbnails 清单（带缓存）：逐视频匹配，本地索引或网盘清单有即算有缩略图
+		names := loadRemoteThumbListing(scanCtx, dir, folderNameOnly{thumbFolderNameForPath(dir)})
 		for _, obj := range objs {
 			if obj.IsDir() {
 				if obj.GetName() == "_thumbnails" {
 					continue
 				}
 				childPath := dir + "/" + obj.GetName()
-				child := &thumbTreeNode{Path: childPath, Name: obj.GetName(), Cached: cachedByDir[childPath], Local: localByDir[childPath], Cloud: cloudByDir[childPath]}
+				child := &thumbTreeNode{Path: childPath, Name: obj.GetName()}
 				cur.Children = append(cur.Children, child)
 				scan(childPath, child)
 			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
 				cur.Videos++
+				rawPath := dir + "/" + obj.GetName()
+				inCloud := names[remoteThumbName(rawPath)]
+				inIndex := indexedSet[rawPath]
+				if inIndex || inCloud {
+					cur.Cached++
+				}
+				if inCloud {
+					cur.Cloud++
+				}
+				if inIndex {
+					if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+						cur.Local++
+					}
+				}
 			}
 		}
 	}
@@ -692,7 +710,7 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	if len(mounts) > 0 {
 		for _, m := range mounts {
 			realDirs[m] = true
-			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/"), Cached: cachedByDir[m], Local: localByDir[m], Cloud: cloudByDir[m]}
+			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/")}
 			root.Children = append(root.Children, child)
 			scan(m, child)
 		}
