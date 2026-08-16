@@ -328,18 +328,12 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	}
 
 	var uploadResult *UploadResult
-	// 闪传失败，上传
-	if stream.GetSize() <= 10*utils.MB { // 文件大小小于10MB，改用普通模式上传
-		if uploadResult, err = d.UploadByOSS(ctx, &fastInfo.UploadOSSParams, stream, dirID, up); err != nil {
-			MarkUploadError(d.GetStorage().MountPath, err)
-			return nil, err
-		}
-	} else {
-		// 分片上传
-		if uploadResult, err = d.UploadByMultipart(ctx, &fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID, up); err != nil {
-			MarkUploadError(d.GetStorage().MountPath, err)
-			return nil, err
-		}
+	// 统一使用分片上传：分片路径启用 x-oss-enable-sha1（InitiateMultipartUpload），
+	// 单文件 PutObject 无法开启服务端 SHA-1 计算，回调体 ${sha1} 无法插值 → 115 回调 990005。
+	// 小文件分片为单块（末片允许 <100KB），实测可成功。
+	if uploadResult, err = d.UploadByMultipart(ctx, &fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID, up); err != nil {
+		MarkUploadError(d.GetStorage().MountPath, err)
+		return nil, err
 	}
 
 	file, err := d.getNewFile(uploadResult.Data.FileID)

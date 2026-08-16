@@ -1508,8 +1508,10 @@ var sanitize115Re = regexp.MustCompile(`[^\p{L}\p{N}\-_\s\.\(\)\[\]]+`)
 func sanitize115Name(name string) string {
 	name = sanitize115Re.ReplaceAllString(name, "_")
 	name = strings.Trim(name, "._")
-	if len(name) > 40 {
-		name = name[:40]
+	// 按 rune 截断，避免按字节切断 UTF-8 中文字符产生非法字节序列
+	// （115 files/init 会以 990005 非法参数错误拒绝非法 UTF-8 文件名）
+	if r := []rune(name); len(r) > 40 {
+		name = string(r[:40])
 	}
 	if name == "" {
 		name = "thumb"

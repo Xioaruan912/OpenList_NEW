@@ -223,41 +223,6 @@ func UploadDigestRange(stream model.FileStreamer, rangeSpec string) (result stri
 	return
 }
 
-// UploadByOSS use aliyun sdk to upload
-func (c *Pan115) UploadByOSS(ctx context.Context, params *driver115.UploadOSSParams, s model.FileStreamer, dirID string, up driver.UpdateProgress) (*UploadResult, error) {
-	ossToken, err := c.client.GetOSSToken()
-	if err != nil {
-		return nil, err
-	}
-	ossClient, err := netutil.NewOSSClient(driver115.OSSEndpoint, ossToken.AccessKeyID, ossToken.AccessKeySecret)
-	if err != nil {
-		return nil, err
-	}
-	bucket, err := ossClient.Bucket(params.Bucket)
-	if err != nil {
-		return nil, err
-	}
-
-	var bodyBytes []byte
-	r := driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
-		Reader:         s,
-		UpdateProgress: up,
-	})
-	if err = bucket.PutObject(params.Object, r, append(
-		driver115.OssOption(params, ossToken),
-		oss.CallbackResult(&bodyBytes),
-	)...); err != nil {
-		return nil, err
-	}
-
-	var uploadResult UploadResult
-	if err = json.Unmarshal(bodyBytes, &uploadResult); err != nil {
-		return nil, err
-	}
-	return &uploadResult, uploadResult.Err(string(bodyBytes))
-}
-
-// UploadByMultipart upload by mutipart blocks
 func (d *Pan115) UploadByMultipart(ctx context.Context, params *driver115.UploadOSSParams, fileSize int64, s model.FileStreamer,
 	dirID string, up driver.UpdateProgress, opts ...driver115.UploadMultipartOption,
 ) (*UploadResult, error) {
@@ -395,8 +360,9 @@ LOOP:
 		}
 	}
 
-	// 不知道啥原因，oss那边分片上传不计算sha1，导致115服务器校验错误
-	// params.Callback.Callback = strings.ReplaceAll(params.Callback.Callback, "${sha1}", params.SHA1)
+	// OSS 回调不会插值 ${sha1}（分片与单文件都不计算），需用文件实际 SHA1 替换，
+	// 否则 115 completeupload.php 收到字面量 ${sha1} → 校验失败 990005 非法参数错误
+	params.Callback.Callback = strings.ReplaceAll(params.Callback.Callback, "${sha1}", params.SHA1)
 	if _, err := bucket.CompleteMultipartUpload(imur, parts, append(
 		driver115.OssOption(params, ossToken),
 		oss.CallbackResult(&bodyBytes),
