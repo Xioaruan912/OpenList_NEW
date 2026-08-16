@@ -226,6 +226,9 @@ func UploadDigestRange(stream model.FileStreamer, rangeSpec string) (result stri
 func (d *Pan115) UploadByMultipart(ctx context.Context, params *driver115.UploadOSSParams, fileSize int64, s model.FileStreamer,
 	dirID string, up driver.UpdateProgress, opts ...driver115.UploadMultipartOption,
 ) (*UploadResult, error) {
+	// body 已全量缓存到临时文件，分片上传不受客户端断开影响；
+	// 否则 WebDAV/大文件上传期间请求 ctx 取消会使 RateLimitReader 返回 0 字节 → OSS UploadPart body 空 → 连接中断
+	ctx = context.WithoutCancel(ctx)
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
