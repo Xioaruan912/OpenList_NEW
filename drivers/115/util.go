@@ -384,6 +384,11 @@ func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {
 }
 
 func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
+	// <1000B 文件：SplitFileByPartNum(fileSize,1000) 会因 chunkNum>fileSize 报"oss: chunkNum invalid"，
+	// 直接按大小分片（产出单块，作为末片允许 <100KB）
+	if fileSize < 1000 {
+		return SplitFileByPartSize(fileSize, 100*utils.KB)
+	}
 	for i := int64(1); i < 10; i++ {
 		if fileSize < i*utils.GB { // 文件大小小于iGB时分为i*1000片
 			if chunks, err = SplitFileByPartNum(fileSize, int(i*1000)); err != nil {
