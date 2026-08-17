@@ -39,6 +39,7 @@ func Init(e *gin.Engine) {
 	go handles.StartThumbProxyAssign()
 	go handles.StartProxyHealthCheck()
 	go handles.StartGlobalProxyAssign()
+	go handles.StartThumbAuto()
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
 		g.Use(middlewares.MaxAllowed(conf.Conf.MaxConnections))
@@ -183,6 +184,7 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/clear_all", handles.ThumbClearAll)
 	thumb.POST("/exclude", handles.ThumbExclude)
 	thumb.POST("/migrate", handles.ThumbMigrate)
+	thumb.POST("/auto", handles.ThumbSetAuto)
 	thumb.GET("/proxy", handles.ThumbProxyConfig)
 	thumb.POST("/proxy", handles.ThumbProxySet)
 	thumb.POST("/upload", handles.ThumbUpload)

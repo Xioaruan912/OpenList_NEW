@@ -107,6 +107,11 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	// 自动生成缩略图：浏览目录时把其中视频入队（受 thumb_prewarm 设置控制），
+	// 游客浏览不触发，避免无谓的 115 请求
+	if !user.IsGuest() {
+		prewarmDir(c, reqPath, objs)
+	}
 	total, objs := pagination(objs, &req.PageReq)
 	provider := "unknown"
 	var directUploadTools []string

@@ -164,6 +164,7 @@ const (
 	ThumbCoverNames   = "thumb_cover_names"
 	ThumbDirCover     = "thumb_dir_cover"
 	ThumbPrewarm      = "thumb_prewarm"
+	ThumbAutoUpload   = "thumb_auto_upload"
 	ThumbConcurrency  = "thumb_concurrency"
 	ThumbChunkSize    = "thumb_chunk_size"
 	ThumbWidth        = "thumb_width"

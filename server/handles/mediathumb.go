@@ -661,6 +661,10 @@ func thumbRecord(rawPath string) {
 	if fi, err := os.Stat(thumbIndexPath()); err == nil && fi.Size() > 4*1024*1024 {
 		thumbRewriteIndex()
 	}
+	// 新缩略图生成成功：使顶部聚合统计失效，下次轮询立即重算（磁盘扫描廉价）
+	thumbAggMu.Lock()
+	thumbAggAt = time.Time{}
+	thumbAggMu.Unlock()
 }
 
 // thumbRewriteIndex 重写索引：只保留仍有效（本地缓存存在或已上传到网盘）的条目
@@ -730,11 +734,11 @@ func thumbCloudRecord(rawPath string) {
 		return
 	}
 	thumbCloudMu.Lock()
-	defer thumbCloudMu.Unlock()
 	if thumbCloudSet == nil {
 		thumbCloudSet = readThumbCloudIndex()
 	}
 	if thumbCloudSet[rawPath] {
+		thumbCloudMu.Unlock()
 		return
 	}
 	thumbCloudSet[rawPath] = true
@@ -742,10 +746,28 @@ func thumbCloudRecord(rawPath string) {
 		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
 	f, err := os.OpenFile(thumbCloudIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
 	if err != nil {
+		thumbCloudMu.Unlock()
 		return
 	}
 	_, _ = f.WriteString(line)
 	_ = f.Close()
+	thumbCloudMu.Unlock()
+
+	// 网盘上传成功：增量更新网盘计数，顶部统计立即可见（无需等 10 分钟网络重算）。
+	// 仅当网盘计数已计算过才递增，避免从未计算时从 0 起跳导致与真实值漂移；
+	// 未计算时保持无效，下一次 ThumbStatus 会重新全量计算。
+	thumbCloudStatsMu.Lock()
+	if !thumbCloudStatsAt.IsZero() {
+		thumbCloudStatsVal.cloud++
+		if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+			thumbCloudStatsVal.overlap++
+		}
+		thumbCloudStatsAt = time.Now()
+	}
+	thumbCloudStatsMu.Unlock()
+	thumbAggMu.Lock()
+	thumbAggAt = time.Time{}
+	thumbAggMu.Unlock()
 }
 
 // readThumbCloudIndex 读取网盘已上传缩略图的路径集合
@@ -1169,6 +1191,58 @@ func prewarmStart() {
 			go prewarmWorker()
 		}
 	})
+}
+
+// ---------- 自动上传 worker ----------
+
+var autoUploadOnce sync.Once
+
+// autoUploadStart 启动自动上传循环（幂等）；开启后定期扫描本地未上传缩略图并入队。
+// 扫描只用本地缓存索引（index.jsonl + cloud.jsonl），不发 115 请求，防风控。
+func autoUploadStart() {
+	autoUploadOnce.Do(func() {
+		go autoUploadWorker()
+	})
+}
+
+const autoUploadInterval = 60 * time.Second
+
+func autoUploadWorker() {
+	for {
+		time.Sleep(autoUploadInterval)
+		autoUploadScanOnce()
+	}
+}
+
+// autoUploadScanOnce 执行一轮自动上传扫描：本地已有缩略图但网盘（cloud 索引）没有的，
+// 且当前不在上传队列/未处理/未失败的，加入上传队列。
+func autoUploadScanOnce() {
+	if setting.GetStr(conf.ThumbAutoUpload, "false") != "true" {
+		return
+	}
+	if thumbUploadPaused.Load() {
+		return
+	}
+	cloudSet := readThumbCloudIndex()
+	var toUpload []string
+	for _, p := range readThumbIndex() {
+		if cloudSet[p] {
+			continue
+		}
+		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err != nil {
+			continue
+		}
+		toUpload = append(toUpload, p)
+	}
+	if len(toUpload) > 0 {
+		log.Infof("thumb auto upload: %d local thumbnails not uploaded, enqueue", len(toUpload))
+		thumbUploadEnqueue(toUpload)
+	}
+}
+
+// StartThumbAuto 启动自动上传循环（服务启动时调用；也随开关启用时启动）
+func StartThumbAuto() {
+	autoUploadStart()
 }
 
 // ---------- 预热 worker ----------

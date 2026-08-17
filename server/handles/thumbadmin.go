@@ -19,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -142,7 +143,19 @@ var (
 	thumbAggAt time.Time
 )
 
-const thumbAggTTL = 10 * time.Minute
+// thumbAggTTL 顶部聚合统计缓存时长：本地磁盘扫描廉价，网盘计数另有 10 分钟缓存，
+// 这里用短 TTL 让统计接近实时（前端 10s 轮询即可看到更新）
+const thumbAggTTL = 30 * time.Second
+
+// refreshThumbAgg 重算顶部聚合统计（本地磁盘扫描 + 网盘计数缓存，无额外 115 请求）
+func refreshThumbAgg(ctx context.Context) {
+	lf, _, _ := thumbCacheStats()
+	cf, overlap := thumbCloudStats(ctx)
+	thumbAggMu.Lock()
+	thumbAgg.cached, thumbAgg.local, thumbAgg.cloud = lf+cf-overlap, lf, cf
+	thumbAggAt = time.Now()
+	thumbAggMu.Unlock()
+}
 
 // ThumbStatus GET /api/admin/thumb/status
 // 缩略图缓存与预热队列状态（含按目录失败统计）
@@ -155,10 +168,10 @@ func ThumbStatus(c *gin.Context) {
 		thumbAggMu.Unlock()
 	} else {
 		thumbAggMu.Unlock()
-		lf, _, _ := thumbCacheStats()
-		cf, overlap := thumbCloudStats(c.Request.Context())
-		localFiles, cloudFiles = lf, cf
-		cachedFiles = lf + cf - overlap
+		refreshThumbAgg(c.Request.Context())
+		thumbAggMu.Lock()
+		cachedFiles, localFiles, cloudFiles = thumbAgg.cached, thumbAgg.local, thumbAgg.cloud
+		thumbAggMu.Unlock()
 	}
 	status := gin.H{
 		"cache_dir":    thumbDir(),
@@ -169,6 +182,7 @@ func ThumbStatus(c *gin.Context) {
 		"cache_size":   totalSize,
 		"prewarm_enabled": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
 		"queue_paused":    thumbQueuePaused.Load(),
+		"auto_upload":     setting.GetStr(conf.ThumbAutoUpload, "false") == "true",
 	}
 	if prewarmCh != nil {
 		status["prewarm_queued"] = len(prewarmCh)
@@ -239,6 +253,66 @@ func ThumbStatus(c *gin.Context) {
 	status["stale_by_dir"] = thumbStaleByDir(indexed)
 	status["mounts"] = currentMountPaths()
 	common.SuccessResp(c, status)
+}
+
+// ThumbSetAutoReq POST /api/admin/thumb/auto
+type ThumbSetAutoReq struct {
+	Generate *bool `json:"generate"` // 自动生成缩略图（浏览目录时入队）
+	Upload   *bool `json:"upload"`   // 自动上传未上传的本地缩略图
+}
+
+// ThumbSetAuto POST /api/admin/thumb/auto
+// 用户控制"自动生成缩略图 + 自动上传"，变更记录到存储活动日志
+func ThumbSetAuto(c *gin.Context) {
+	var req ThumbSetAutoReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	var items []model.SettingItem
+	if req.Generate != nil {
+		items = append(items, model.SettingItem{
+			Key: conf.ThumbPrewarm, Value: strconv.FormatBool(*req.Generate),
+			Type: conf.TypeString, Group: model.SINGLE, Flag: model.PUBLIC,
+		})
+	}
+	if req.Upload != nil {
+		items = append(items, model.SettingItem{
+			Key: conf.ThumbAutoUpload, Value: strconv.FormatBool(*req.Upload),
+			Type: conf.TypeString, Group: model.SINGLE, Flag: model.PUBLIC,
+		})
+	}
+	if len(items) == 0 {
+		common.ErrorStrResp(c, "empty setting", 400)
+		return
+	}
+	if err := op.SaveSettingItems(items); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	// 记录到存储活动日志（缩略图功能作用于 115 存储）
+	msg := ""
+	if req.Generate != nil {
+		msg += "自动生成缩略图" + map[bool]string{true: "已开启", false: "已关闭"}[*req.Generate]
+	}
+	if req.Upload != nil {
+		if msg != "" {
+			msg += "；"
+		}
+		msg += "自动上传" + map[bool]string{true: "已开启", false: "已关闭"}[*req.Upload]
+	}
+	for _, m := range currentMountPaths() {
+		driver115pkg.RecordActivity(m, driver115pkg.ActivityWarn, "storage_settings", msg)
+	}
+	// 开启自动上传时启动 worker 并立即扫描一轮
+	if req.Upload != nil && *req.Upload {
+		StartThumbAuto()
+		go autoUploadScanOnce()
+	}
+	common.SuccessResp(c, gin.H{
+		"generate": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
+		"upload":   setting.GetStr(conf.ThumbAutoUpload, "false") == "true",
+	})
 }
 
 // ThumbQueuePause POST /api/admin/thumb/queue/pause

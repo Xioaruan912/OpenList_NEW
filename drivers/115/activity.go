@@ -29,6 +29,7 @@ const (
 	ActivityStorageError  ActivityAction = "storage_error"  // 存储操作错误
 	ActivityBlocked       ActivityAction = "blocked"        // 风控标记
 	ActivityUnblocked     ActivityAction = "unblocked"      // 风控解除
+	ActivitySettings      ActivityAction = "settings"       // 功能开关变更
 )
 
 type ActivityEntry struct {

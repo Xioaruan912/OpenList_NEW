@@ -17,6 +17,7 @@ import {
   Text,
   VStack,
   useColorModeValue,
+  Switch as HopeSwitch,
 } from "@hope-ui/solid"
 import { createSignal, createEffect, For, Show, onCleanup } from "solid-js"
 import { useManageTitle } from "~/hooks"
@@ -32,6 +33,8 @@ type ThumbStatus = {
   cache_dir: string
   prewarm_queued: number
   queue_paused: boolean
+  prewarm_enabled: boolean
+  auto_upload: boolean
   active_workers: number
   active_tasks?: { path: string; since: number }[]
   fail_items?: { path: string; dir: string; msg: string; at: string }[]
@@ -211,6 +214,15 @@ const Thumb = () => {
   const loadProxy = async () => {
     const resp = await r.get("/admin/thumb/proxy")
     handleResp(resp, (d) => setPxCfg(d as ThumbProxyConfig))
+  }
+
+  // 自动生成 / 自动上传开关：保存设置并刷新状态
+  const setAuto = async (generate?: boolean, upload?: boolean) => {
+    const resp = await r.post("/admin/thumb/auto", {
+      ...(generate !== undefined ? { generate } : {}),
+      ...(upload !== undefined ? { upload } : {}),
+    })
+    handleResp(resp, () => void load())
   }
 
   const loadTree = async () => {
@@ -863,6 +875,31 @@ const Thumb = () => {
              缓存目录 {st()!.cache_dir}
            </Box>
          </Show>
+        <Box
+          p="$3"
+          rounded="$lg"
+          border="1px solid $neutral7"
+          background={useColorModeValue("$neutral1", "$neutral2")()}
+        >
+          <VStack spacing="$1" alignItems="start">
+            <HopeSwitch
+              checked={!!st()?.prewarm_enabled}
+              onChange={(e: Event) =>
+                setAuto((e.currentTarget as HTMLInputElement).checked, undefined)
+              }
+            >
+              自动生成
+            </HopeSwitch>
+            <HopeSwitch
+              checked={!!st()?.auto_upload}
+              onChange={(e: Event) =>
+                setAuto(undefined, (e.currentTarget as HTMLInputElement).checked)
+              }
+            >
+              自动上传
+            </HopeSwitch>
+          </VStack>
+        </Box>
        </HStack>
 
       {/* 代理节点选择 */}
