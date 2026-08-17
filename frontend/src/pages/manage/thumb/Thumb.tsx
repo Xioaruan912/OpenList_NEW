@@ -1,6 +1,7 @@
 import {
   Box,
   Button,
+  Grid,
   HStack,
   Input,
   Modal,
@@ -122,6 +123,9 @@ const Thumb = () => {
   const [viewPath, setViewPath] = createSignal("")
   const [viewUrl, setViewUrl] = createSignal("")
   const [viewLoading, setViewLoading] = createSignal(false)
+  const [cands, setCands] = createSignal<{ index: number; at: string; png: string }[]>([])
+  const [candLoading, setCandLoading] = createSignal(false)
+  const [applying, setApplying] = createSignal(false)
   const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
   let firstStatusLoaded = false
@@ -488,6 +492,8 @@ const Thumb = () => {
   const viewThumb = async (pp: string) => {
     setViewPath(pp)
     setViewLoading(true)
+    setCands([])
+    setApplying(false)
     try {
       const resp = await r.get("/admin/thumb/view", {
         params: { path: pp },
@@ -511,6 +517,37 @@ const Thumb = () => {
     if (viewUrl()) URL.revokeObjectURL(viewUrl())
     setViewUrl("")
     setViewPath("")
+    setCands([])
+    setApplying(false)
+  }
+
+  // 生成候选缩略图（9 个）供手动挑选
+  const loadCandidates = async (pp: string) => {
+    setCandLoading(true)
+    try {
+      const resp = await r.post("/admin/thumb/candidates", { path: pp })
+      handleResp(resp, (d) => {
+        const data = d as { candidates?: { index: number; at: string; png: string }[] }
+        setCands(data.candidates || [])
+        if (!data.candidates?.length) notify.error("未能生成候选缩略图")
+      })
+    } finally {
+      setCandLoading(false)
+    }
+  }
+
+  // 保留所选候选缩略图
+  const applyCandidate = async (pp: string, png: string) => {
+    setApplying(true)
+    const resp = await r.post("/admin/thumb/apply_candidate", { path: pp, png })
+    handleResp(resp, () => {
+      notify.success("已应用所选缩略图")
+      closeView()
+      if (sel()) loadDir(sel())
+      loadTree()
+      load()
+    })
+    setApplying(false)
   }
 
   const retryAll = async () => {
@@ -660,6 +697,33 @@ const Thumb = () => {
     const resp = await r.post("/admin/thumb/exclude", { paths: ex, exclude: false })
     handleResp(resp, () => {
       notify.success(`已恢复 ${ex.length} 个视频`)
+      loadDir(sel())
+    })
+  }
+
+  // 全排除：排除本目录全部媒体（不生成缩略图）
+  const excludeAll = async () => {
+    if (!sel() || !selFiles().length) {
+      notify.warning("请先选择目录")
+      return
+    }
+    if (!window.confirm(`确认排除本目录全部 ${selFiles().length} 个媒体？（${sel()}）`)) return
+    const resp = await r.post("/admin/thumb/exclude", { paths: selFiles(), exclude: true })
+    handleResp(resp, () => {
+      notify.success(`已排除 ${selFiles().length} 个视频`)
+      loadDir(sel())
+    })
+  }
+
+  // 恢复全部纳入：取消本目录全部排除
+  const restoreAll = async () => {
+    if (!sel() || !selFiles().length) {
+      notify.warning("请先选择目录")
+      return
+    }
+    const resp = await r.post("/admin/thumb/exclude", { paths: selFiles(), exclude: false })
+    handleResp(resp, () => {
+      notify.success(`已恢复 ${selFiles().length} 个视频`)
       loadDir(sel())
     })
   }
@@ -1274,8 +1338,14 @@ const Thumb = () => {
             <Button size="xs" colorScheme="warning" disabled={!sel()} onClick={excludeUnchecked}>
               排除未勾选
             </Button>
+            <Button size="xs" colorScheme="danger" disabled={!sel()} onClick={excludeAll}>
+              全排除
+            </Button>
             <Button size="xs" disabled={!sel() || !selExcluded().length} onClick={restoreExcluded}>
               恢复已排除
+            </Button>
+            <Button size="xs" colorScheme="success" disabled={!sel()} onClick={restoreAll}>
+              恢复全部纳入
             </Button>
             <Text fontSize="$xs" color="$neutral9">
               勾选 = 纳入操作（生成/删除），取消勾选 = 排除
@@ -1473,14 +1543,68 @@ const Thumb = () => {
                 border="1px solid $neutral6"
                 overflow="hidden"
                 background="#000"
-                css={{ display: "flex", justifyContent: "center", alignItems: "center", maxH: "70vh" }}
+                css={{ display: "flex", justifyContent: "center", alignItems: "center", maxH: "45vh" }}
               >
                 <img
                   src={viewUrl()}
                   alt={viewPath()}
-                  css={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain" }}
+                  css={{ maxWidth: "100%", maxHeight: "45vh", objectFit: "contain" }}
                 />
               </Box>
+            </Show>
+            <HStack mt="$2" spacing="$2" wrap="wrap">
+              <Button
+                size="xs"
+                colorScheme="info"
+                loading={candLoading()}
+                disabled={!viewPath()}
+                onClick={() => loadCandidates(viewPath())}
+              >
+                换缩略图（生成候选）
+              </Button>
+              <Text fontSize="$xs" color="$neutral9">
+                不喜欢自动生成的缩略图？生成多个候选画面手动挑选
+              </Text>
+            </HStack>
+            <Show when={cands().length}>
+              <Grid
+                mt="$3"
+                w="$full"
+                gap="$2"
+                templateColumns={{ "@initial": "1fr", "@sm": "repeat(3, 1fr)" }}
+              >
+                <For each={cands()}>
+                  {(cd) => (
+                    <Box
+                      rounded="$md"
+                      border="1px solid $neutral6"
+                      p="$1"
+                      background={useColorModeValue("$neutral1", "$neutral2")()}
+                    >
+                      <img
+                        src={`data:image/png;base64,${cd.png}`}
+                        alt={`候选${cd.index}`}
+                        css={{ width: "100%", borderRadius: "6px", display: "block" }}
+                      />
+                      <HStack mt="$1" spacing="$1" justifyContent="space-between" alignItems="center">
+                        <Text fontSize="$xs" color="$neutral9">
+                          {Number(cd.at) >= 60
+                            ? `${Math.floor(Number(cd.at) / 60)}m${Math.round(Number(cd.at) % 60)}s`
+                            : `${cd.at}s`}
+                        </Text>
+                        <Button
+                          size="xs"
+                          colorScheme="success"
+                          loading={applying()}
+                          onClick={() => applyCandidate(viewPath(), cd.png)}
+                        >
+                          保留此图
+                        </Button>
+                      </HStack>
+                    </Box>
+                  )}
+                </For>
+              </Grid>
             </Show>
           </ModalBody>
           <ModalFooter display="flex" gap="$2" justifyContent="flex-end">

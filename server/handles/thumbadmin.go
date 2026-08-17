@@ -3,6 +3,7 @@ package handles
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	stdpath "path"
@@ -22,6 +23,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
@@ -1884,6 +1886,135 @@ func ThumbView(c *gin.Context) {
 	_ = os.WriteFile(cachePath, png, 0o666)
 	thumbRecord(path)
 	serve(png)
+}
+
+// ThumbCandidatesReq POST /api/admin/thumb/candidates
+type ThumbCandidatesReq struct {
+	Path string `json:"path"`
+}
+
+// ThumbCandidate 候选缩略图（base64 PNG）
+type ThumbCandidate struct {
+	Index int    `json:"index"`
+	At    string `json:"at"` // 取帧时间点（秒）
+	Png   string `json:"png"` // base64 PNG
+}
+
+// ThumbCandidates POST /api/admin/thumb/candidates
+// 为一个视频生成多个候选缩略图帧（默认 9 个，跳过空白帧），
+// 供用户手动挑选喜欢的画面。走 ffmpeg HTTP Range 远程抽帧（与正常生成一致）。
+func ThumbCandidates(c *gin.Context) {
+	var req ThumbCandidatesReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	rawPath := req.Path
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	if rawPath == "" {
+		common.ErrorStrResp(c, "invalid path", 400)
+		return
+	}
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		common.ErrorStrResp(c, "存储风控中，暂不能生成候选缩略图", 423)
+		return
+	}
+	if !thumbAcquire(false) {
+		common.ErrorStrResp(c, "生成并发已满，请稍后再试", 429)
+		return
+	}
+	defer thumbRelease()
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 150*time.Second)
+	defer cancel()
+	link, obj, err := fs.Link(ctx, rawPath, model.LinkArgs{Header: thumbLinkHeader()})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	defer link.Close()
+	remoteURL := common.GetApiUrl(c) + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
+	var positions []string
+	if size := obj.GetSize(); size > thumbProbeMinSize {
+		if dur := probeVideoDuration(ctx, rawPath, common.GetApiUrl(c)); dur > 0 {
+			// 按时长 10%~90% 均匀取 9 帧
+			for i := 1; i <= 9; i++ {
+				positions = append(positions, fmt.Sprintf("%.1f", dur*float64(i)/10.0))
+			}
+		}
+	}
+	if len(positions) == 0 {
+		// 未知时长：固定时间点兜底
+		positions = []string{"3", "10", "30", "60", "120", "300", "600", "1800", "3600"}
+	}
+	var cands []ThumbCandidate
+	for i, ss := range positions {
+		if ctx.Err() != nil {
+			break
+		}
+		data, err := extractVideoFrameAt(ctx, remoteURL, link.Header, ss)
+		if err != nil {
+			continue
+		}
+		png, err := encodeThumb(data)
+		if err != nil || isBlankThumb(png) {
+			continue
+		}
+		cands = append(cands, ThumbCandidate{Index: i + 1, At: ss, Png: base64.StdEncoding.EncodeToString(png)})
+		if len(cands) >= 9 {
+			break
+		}
+	}
+	common.SuccessResp(c, gin.H{"path": rawPath, "candidates": cands})
+}
+
+// ThumbApplyCandidateReq POST /api/admin/thumb/apply_candidate
+type ThumbApplyCandidateReq struct {
+	Path string `json:"path"`
+	Png  string `json:"png"` // base64 PNG
+}
+
+// ThumbApplyCandidate POST /api/admin/thumb/apply_candidate
+// 将选中的候选缩略图设为该视频的缩略图：覆盖本地缓存与索引，
+// remote 模式同步替换网盘同名文件（先删后传），并失效相关缓存。
+func ThumbApplyCandidate(c *gin.Context) {
+	var req ThumbApplyCandidateReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	rawPath := req.Path
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	png, err := base64.StdEncoding.DecodeString(req.Png)
+	if err != nil || len(png) == 0 || rawPath == "" {
+		common.ErrorStrResp(c, "invalid data", 400)
+		return
+	}
+	ctx := c.Request.Context()
+	cachePath := thumbCachePath(thumbKindVideo, rawPath)
+	if err := os.WriteFile(cachePath, png, 0o666); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	thumbRecord(rawPath)
+	_ = os.Remove(thumbFailPath(thumbKindVideo, rawPath))
+	if addition := remoteThumbStore(rawPath); addition != nil {
+		// 替换云端同名缩略图：先删旧文件（内部刷新目录缓存），再上传新图
+		removeRemoteThumb(ctx, rawPath, addition)
+		if err := uploadThumbRemote(ctx, rawPath, addition, png); err != nil {
+			log.Warnf("thumb apply candidate upload failed %s: %v", rawPath, err)
+		}
+		thumbCloudRecord(rawPath)
+		remoteThumbCacheSet(rawPath, png)
+	}
+	thumbListingInvalidate(stdpath.Dir(rawPath))
+	thumbStatsInvalidate()
+	prewarmDone.Delete(rawPath)
+	common.SuccessResp(c, gin.H{"path": rawPath})
 }
 
 // ThumbDeletePathsReq POST /api/admin/thumb/delete_paths
