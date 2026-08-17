@@ -30,7 +30,8 @@
     "traffic": "传输",
     "thumb": "缩略图",
     "proxy": "代理管理",
-    "api": "API"
+    "api": "API",
+    "activity_log": "活动日志"
   },
   "title": "OpenList 管理",
   "not_admin": "您不是管理员用户，请使用管理员账户登录。",

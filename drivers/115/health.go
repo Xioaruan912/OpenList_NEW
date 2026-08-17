@@ -38,6 +38,9 @@ func MarkStorageError(mount string, err error) {
 	health[mount] = entry
 	if isRiskControlError(err) {
 		blocked[mount] = time.Now()
+		RecordActivityWithPath(mount, ActivityWarn, ActivityBlocked, "", "风控标记: "+err.Error())
+	} else {
+		RecordActivityWithPath(mount, ActivityError, ActivityStorageError, "", err.Error())
 	}
 	if len(health) > 200 {
 		for k, v := range health {
@@ -73,6 +76,7 @@ func IsStorageBlocked(mount string) bool {
 	}
 	if time.Since(t) > 5*time.Minute {
 		delete(blocked, mount)
+		MarkUnblockedActivity(mount)
 		return false
 	}
 	return true
@@ -119,6 +123,7 @@ func MarkUploadError(mount string, err error) {
 	list = append(list, now)
 	if len(list) >= uploadRiskThreshold {
 		blocked[mount] = now
+		MarkBlockedActivity(mount, "上传风控连续失败，已标记风控并降速")
 		uploadRiskFails[mount] = nil
 	} else {
 		uploadRiskFails[mount] = list

@@ -293,3 +293,15 @@ func CheckStorageBlocked(c *gin.Context) {
 		"msg":        health.Msg,
 	})
 }
+
+// GetStorageLogs GET /api/admin/storage/logs?mount=&limit=20
+// 存储活动日志：mount 空=聚合所有存储；limit 默认 20，时间倒序
+func GetStorageLogs(c *gin.Context) {
+	mount := strings.TrimSuffix(c.Query("mount"), "/")
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	entries := driver115pkg.GetActivityLogs(mount, limit)
+	common.SuccessResp(c, gin.H{"content": entries})
+}

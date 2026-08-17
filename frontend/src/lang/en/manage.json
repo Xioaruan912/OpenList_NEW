@@ -30,7 +30,8 @@
     "traffic": "Traffic",
     "thumb": "Thumbnails",
     "proxy": "Proxy",
-    "api": "API"
+    "api": "API",
+    "activity_log": "Activity Log"
   },
   "title": "OpenList Management",
   "not_admin": "You are not an admin user, please login with an admin account.",

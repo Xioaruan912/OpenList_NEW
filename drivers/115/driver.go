@@ -270,6 +270,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		if r := recover(); r != nil {
 			err = fmt.Errorf("upload internal error: %v", r)
 			MarkUploadError(d.GetStorage().MountPath, err)
+			RecordActivityWithPath(d.GetStorage().MountPath, ActivityError, ActivityUploadFail, stream.GetName(), "上传内部错误: "+err.Error())
 		}
 	}()
 	var (
@@ -315,6 +316,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	// and "sig invalid" err is thrown even when the hash is correct after timeout.
 	if fastInfo, err = d.rapidUpload(stream.GetSize(), stream.GetName(), dirID, preHash, fullHash, stream); err != nil {
 		MarkUploadError(d.GetStorage().MountPath, err)
+		RecordActivityWithPath(d.GetStorage().MountPath, ActivityError, ActivityUploadFail, stream.GetName(), "上传失败(秒传): "+err.Error())
 		return nil, err
 	}
 	if matched, err := fastInfo.Ok(); err != nil {
@@ -324,6 +326,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		if err != nil {
 			return nil, nil
 		}
+		RecordActivityWithPath(d.GetStorage().MountPath, ActivitySuccess, ActivitySecUpload, stream.GetName(), "秒传成功 "+stream.GetName())
 		return f, nil
 	}
 
@@ -333,6 +336,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	// 小文件分片为单块（末片允许 <100KB），实测可成功。
 	if uploadResult, err = d.UploadByMultipart(ctx, &fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID, up); err != nil {
 		MarkUploadError(d.GetStorage().MountPath, err)
+		RecordActivityWithPath(d.GetStorage().MountPath, ActivityError, ActivityUploadFail, stream.GetName(), "上传失败: "+err.Error())
 		return nil, err
 	}
 
@@ -340,6 +344,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	if err != nil {
 		return nil, nil
 	}
+	RecordActivityWithPath(d.GetStorage().MountPath, ActivitySuccess, ActivityUploadSuccess, stream.GetName(), "上传成功 "+stream.GetName())
 	return file, nil
 }
 

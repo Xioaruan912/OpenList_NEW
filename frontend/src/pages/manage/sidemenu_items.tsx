@@ -15,6 +15,7 @@ import {
   BsArrowLeftRight,
   BsImages,
   BsBoxArrowUpRight,
+  BsNewspaper,
 } from "solid-icons/bs"
 import { FiLogIn } from "solid-icons/fi"
 import { SiMetabase } from "solid-icons/si"
@@ -186,6 +187,12 @@ export const side_menu_items: SideMenuItem[] = [
     icon: BsHddNetwork,
     to: "/@manage/proxy",
     component: lazy(() => import("./proxy/Proxy")),
+  },
+  {
+    title: "manage.sidemenu.activity_log",
+    icon: BsNewspaper,
+    to: "/@manage/logs",
+    component: lazy(() => import("./logs/Logs")),
   },
   {
     title: "manage.sidemenu.shares",
