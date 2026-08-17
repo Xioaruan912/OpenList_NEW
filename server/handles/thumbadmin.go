@@ -738,12 +738,17 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 	for _, p := range indexed {
 		dir := stdpath.Dir(p)
 		if dir != "" && dir != "." {
-			cachedByDir[dir]++
+			exists := false
 			if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
 				localByDir[dir]++
+				exists = true
 			}
 			if cloud[p] {
 				cloudByDir[dir]++
+				exists = true
+			}
+			if exists {
+				cachedByDir[dir]++
 			}
 		}
 	}
@@ -785,17 +790,22 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 				cur.Videos++
 				rawPath := dir + "/" + obj.GetName()
 				inCloud := names[remoteThumbName(rawPath)]
-				inIndex := indexedSet[rawPath]
-				if inIndex || inCloud {
+				localExists := false
+				if indexedSet[rawPath] {
+					if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
+						localExists = true
+					}
+				}
+				// 仅计数真实存在的缩略图（本地文件或网盘清单命中），
+				// 避免删除缩略图后残留的索引条目把 cached 虚高
+				if inCloud || localExists {
 					cur.Cached++
 				}
 				if inCloud {
 					cur.Cloud++
 				}
-				if inIndex {
-					if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
-						cur.Local++
-					}
+				if localExists {
+					cur.Local++
 				}
 			}
 		}
