@@ -1169,6 +1169,27 @@ func ThumbClearAll(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"removed": removed})
 }
 
+// ThumbClearFails POST /api/admin/thumb/clear_fails
+// 清除全部缩略图失败标记（.fail 文件），仅删除失败记录，不影响已生成缓存
+func ThumbClearFails(c *gin.Context) {
+	dir := thumbDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".fail") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+		removed++
+	}
+	thumbStatsInvalidate()
+	common.SuccessResp(c, gin.H{"removed": removed})
+}
+
 // ---------- 挂载路径迁移 ----------
 
 type ThumbMigrateReq struct {

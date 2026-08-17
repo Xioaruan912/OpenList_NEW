@@ -1435,6 +1435,20 @@ const Thumb = () => {
             </Show>
           </ModalBody>
           <ModalFooter display="flex" gap="$2" justifyContent="flex-end">
+            <Button
+              colorScheme="danger"
+              onClick={async () => {
+                if (!window.confirm("确认删除全部失败日志？（不影响已生成的缩略图）")) return
+                const resp = await r.post("/admin/thumb/clear_fails")
+                handleResp(resp, (d) => {
+                  setLogItems([])
+                  void load()
+                  notify.success(`已删除 ${(d as { removed?: number }).removed ?? 0} 条失败日志`)
+                })
+              }}
+            >
+              删除失败日志
+            </Button>
             <Button colorScheme="neutral" onClick={() => setLogOpen(false)}>
               关闭
             </Button>
