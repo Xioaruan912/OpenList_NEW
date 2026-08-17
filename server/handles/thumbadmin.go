@@ -1949,10 +1949,7 @@ func ThumbDeletePaths(c *gin.Context) {
 			if addition == nil {
 				continue
 			}
-			full := remoteThumbPath(addition, p)
-			if full != "" {
-				_ = fs.Remove(ctx, full)
-			}
+			removeRemoteThumb(ctx, p, addition)
 		}
 	} else {
 		remoteSkipped = true

@@ -1756,6 +1756,21 @@ type folderNameOnly struct{ folder string }
 
 func (f folderNameOnly) ThumbFolderName() string { return f.folder }
 
+// removeRemoteThumb 删除网盘 _thumbnails 中的单个缩略图文件。
+// 先刷新该目录列表再删除：fs.Remove 内部 Get 会命中过期的目录对象缓存，
+// 若缓存缺失该文件会判定"对象不存在"而静默跳过（不删除），导致删除后云端残留、
+// 生成时误判"网盘已有"而不入队。
+func removeRemoteThumb(ctx context.Context, rawPath string, addition interface {
+	ThumbFolderName() string
+}) {
+	folder := addition.ThumbFolderName()
+	dir := stdpath.Dir(rawPath)
+	// 刷新目录缓存（1 次 115 列表请求）
+	_, _ = fs.List(ctx, stdpath.Join(dir, folder), &fs.ListArgs{Refresh: true, NoLog: true})
+	full := stdpath.Join(dir, folder, remoteThumbName(rawPath))
+	_ = fs.Remove(ctx, full)
+}
+
 // tryRestoreRemoteThumb 本地模式视频缩略图未命中时，尝试从网盘 _thumbnails 恢复上传副本，
 // 避免"上传→清空本地→重新获取"时重复下载+ffmpeg 生成。恢复成功返回图片字节。
 func tryRestoreRemoteThumb(ctx context.Context, rawPath string) ([]byte, bool) {
