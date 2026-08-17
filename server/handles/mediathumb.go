@@ -1757,13 +1757,15 @@ type folderNameOnly struct{ folder string }
 func (f folderNameOnly) ThumbFolderName() string { return f.folder }
 
 // removeRemoteThumb 删除网盘 _thumbnails 中的单个缩略图文件。
+// 与 thumb_store 模式无关（local 模式用户也可能手动上传到网盘，删除时必须同步云端）。
 // 先刷新该目录列表再删除：fs.Remove 内部 Get 会命中过期的目录对象缓存，
 // 若缓存缺失该文件会判定"对象不存在"而静默跳过（不删除），导致删除后云端残留、
 // 生成时误判"网盘已有"而不入队。
-func removeRemoteThumb(ctx context.Context, rawPath string, addition interface {
-	ThumbFolderName() string
-}) {
-	folder := addition.ThumbFolderName()
+func removeRemoteThumb(ctx context.Context, rawPath string) {
+	folder := thumbFolderNameForPath(rawPath)
+	if folder == "" {
+		return
+	}
 	dir := stdpath.Dir(rawPath)
 	// 刷新目录缓存（1 次 115 列表请求）
 	_, _ = fs.List(ctx, stdpath.Join(dir, folder), &fs.ListArgs{Refresh: true, NoLog: true})
@@ -2249,7 +2251,7 @@ func fillCoverThumb(c *gin.Context, parent string, obj model.Obj) string {
 	if !obj.IsDir() {
 		return ""
 	}
-	if setting.GetStr(conf.ThumbDirCover, "true") != "true" {
+	if setting.GetStr(conf.ThumbDirCover, "false") != "true" {
 		return ""
 	}
 	// 缩略图文件夹自身不作为封面候选（避免"无封面/无法抽帧"失败）

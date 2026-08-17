@@ -2002,10 +2002,10 @@ func ThumbApplyCandidate(c *gin.Context) {
 	}
 	thumbRecord(rawPath)
 	_ = os.Remove(thumbFailPath(thumbKindVideo, rawPath))
-	if addition := remoteThumbStore(rawPath); addition != nil {
-		// 替换云端同名缩略图：先删旧文件（内部刷新目录缓存），再上传新图
-		removeRemoteThumb(ctx, rawPath, addition)
-		if err := uploadThumbRemote(ctx, rawPath, addition, png); err != nil {
+	// 上传/替换网盘同名缩略图（与 thumb_store 模式无关，用户可能手动上传到网盘）
+	if folder := thumbFolderNameForPath(rawPath); folder != "" {
+		removeRemoteThumb(ctx, rawPath)
+		if err := uploadThumbRemote(ctx, rawPath, folderNameOnly{folder}, png); err != nil {
 			log.Warnf("thumb apply candidate upload failed %s: %v", rawPath, err)
 		}
 		thumbCloudRecord(rawPath)
@@ -2072,15 +2072,11 @@ func ThumbDeletePaths(c *gin.Context) {
 	thumbCloudRemove(req.Paths)
 	thumbDeleteReset(req.Paths)
 	thumbStatsInvalidate()
-	// 远程 _thumbnails：逐个删除对应文件（remote 模式；风控中跳过）
+	// 远程 _thumbnails：逐个删除对应文件（与 thumb_store 模式无关，用户可能手动上传到网盘；风控中跳过）
 	remoteSkipped := false
 	if blocked, _ := isStorageBlocked(req.Paths[0]); !blocked {
 		for _, p := range req.Paths {
-			addition := remoteThumbStore(p)
-			if addition == nil {
-				continue
-			}
-			removeRemoteThumb(ctx, p, addition)
+			removeRemoteThumb(ctx, p)
 		}
 	} else {
 		remoteSkipped = true
