@@ -30,6 +30,7 @@ const (
 	ActivityBlocked       ActivityAction = "blocked"        // 风控标记
 	ActivityUnblocked     ActivityAction = "unblocked"      // 风控解除
 	ActivitySettings      ActivityAction = "settings"       // 功能开关变更
+	ActivityThumbDelete   ActivityAction = "thumb_delete"   // 删除缩略图
 )
 
 type ActivityEntry struct {

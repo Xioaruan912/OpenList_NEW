@@ -3,6 +3,7 @@ package handles
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	stdpath "path"
 	"path/filepath"
@@ -1787,6 +1788,7 @@ func ThumbDeleteFolder(c *gin.Context) {
 	indexed := readThumbIndex()
 	removed := 0
 	var keep []string
+	var removedPaths []string
 	prefix := dir + "/"
 	kinds := []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover}
 	for _, p := range indexed {
@@ -1795,6 +1797,7 @@ func ThumbDeleteFolder(c *gin.Context) {
 				_ = os.Remove(thumbCachePath(kind, p))
 				_ = os.Remove(thumbFailPath(kind, p))
 			}
+			removedPaths = append(removedPaths, p)
 			removed++
 			continue
 		}
@@ -1802,6 +1805,18 @@ func ThumbDeleteFolder(c *gin.Context) {
 	}
 	if removed > 0 {
 		_ = writeThumbIndex(keep)
+	}
+	// 3) 使缓存失效并清理，避免旧清单/索引导致树计数、生成判断仍认为缩略图存在
+	thumbListingInvalidate(dir)
+	thumbCloudRemove(removedPaths)
+	thumbDeleteReset(removedPaths)
+	thumbStatsInvalidate()
+	// 4) 记录到存储活动日志
+	if len(removedPaths) > 0 {
+		for _, m := range currentMountPaths() {
+			driver115pkg.RecordActivity(m, driver115pkg.ActivityWarn, driver115pkg.ActivityThumbDelete,
+				fmt.Sprintf("删除 %s 缩略图文件夹（%d 个）", dir, len(removedPaths)))
+		}
 	}
 	common.SuccessResp(c, gin.H{"removed": removed, "folder": full})
 }
@@ -1882,6 +1897,19 @@ func ThumbDeletePaths(c *gin.Context) {
 	if removed > 0 {
 		_ = writeThumbIndex(keep)
 	}
+	// 使相关缓存失效并清理，避免旧清单/索引导致计数与生成判断错误
+	dirs := map[string]struct{}{}
+	for p := range target {
+		if d := stdpath.Dir(p); d != "" && d != "." {
+			dirs[d] = struct{}{}
+		}
+	}
+	for d := range dirs {
+		thumbListingInvalidate(d)
+	}
+	thumbCloudRemove(req.Paths)
+	thumbDeleteReset(req.Paths)
+	thumbStatsInvalidate()
 	// 远程 _thumbnails：逐个删除对应文件（remote 模式；风控中跳过）
 	remoteSkipped := false
 	if blocked, _ := isStorageBlocked(req.Paths[0]); !blocked {
@@ -1897,6 +1925,13 @@ func ThumbDeletePaths(c *gin.Context) {
 		}
 	} else {
 		remoteSkipped = true
+	}
+	// 记录到存储活动日志
+	if removed > 0 {
+		for _, m := range currentMountPaths() {
+			driver115pkg.RecordActivity(m, driver115pkg.ActivityWarn, driver115pkg.ActivityThumbDelete,
+				fmt.Sprintf("删除缩略图 %d 个", removed))
+		}
 	}
 	common.SuccessResp(c, gin.H{"removed": removed, "remote_skipped": remoteSkipped})
 }

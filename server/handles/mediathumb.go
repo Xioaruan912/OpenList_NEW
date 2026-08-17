@@ -1518,6 +1518,77 @@ func remoteThumbInListing(dirPath, rawPath string) (bool, bool) {
 	return exists, true
 }
 
+// thumbListingInvalidate 清除指定目录的远程缩略图清单缓存。
+// 删除缩略图后调用，否则旧的清单缓存会让目录树计数/生成判断仍认为缩略图存在。
+func thumbListingInvalidate(dirPath string) {
+	if dirPath != "" && !strings.HasPrefix(dirPath, "/") {
+		dirPath = "/" + dirPath
+	}
+	thumbListingMu.Lock()
+	delete(thumbListing, dirPath)
+	thumbListingMu.Unlock()
+}
+
+// thumbDeleteReset 删除缩略图后的通用清理：清除该路径的预热完成标记、
+// 远程内存缓存与目录防抖，使其可被重新生成/上传。
+func thumbDeleteReset(paths []string) {
+	dirs := map[string]struct{}{}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		prewarmDone.Delete(p)
+		remoteThumbCacheMu.Lock()
+		delete(remoteThumbCache, p)
+		remoteThumbCacheMu.Unlock()
+		if d := stdpath.Dir(p); d != "" && d != "." {
+			dirs[d] = struct{}{}
+		}
+	}
+	for d := range dirs {
+		prewarmDirDeb.Delete(d)
+	}
+}
+
+// thumbStatsInvalidate 使聚合统计与网盘计数缓存失效，下次状态/树请求重新计算
+func thumbStatsInvalidate() {
+	thumbCloudStatsMu.Lock()
+	thumbCloudStatsAt = time.Time{}
+	thumbCloudStatsMu.Unlock()
+	thumbAggMu.Lock()
+	thumbAggAt = time.Time{}
+	thumbAggMu.Unlock()
+}
+
+// thumbCloudRemove 从网盘索引(cloud.jsonl)移除指定路径（删除缩略图后同步，
+// 避免自动上传/计数仍认为已上传）
+func thumbCloudRemove(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	thumbCloudMu.Lock()
+	if thumbCloudSet == nil {
+		thumbCloudSet = readThumbCloudIndex()
+	}
+	removed := false
+	for _, p := range paths {
+		if p != "" && thumbCloudSet[p] {
+			delete(thumbCloudSet, p)
+			removed = true
+		}
+	}
+	if removed {
+		lines := make([]string, 0, len(thumbCloudSet))
+		for p := range thumbCloudSet {
+			lines = append(lines, fmt.Sprintf(`{"path":%s,"at":%q}`,
+				strconv.Quote(p), time.Now().Format(time.RFC3339)))
+		}
+		sort.Strings(lines)
+		_ = os.WriteFile(thumbCloudIndexPath(), []byte(strings.Join(lines, "\n")+"\n"), 0o666)
+	}
+	thumbCloudMu.Unlock()
+}
+
 // prewarmEnqueue 入队预热任务（去重）
 func prewarmEnqueue(kind, rawPath, apiURL string) {
 	prewarmStart()
@@ -1965,6 +2036,10 @@ func generateImageThumb(ctx context.Context, rawPath string) ([]byte, error) {
 
 // generateCoverThumb 生成目录封面（直接请求与预热共用）
 func generateCoverThumb(ctx context.Context, rawPath string) ([]byte, error) {
+	// 缩略图文件夹自身不作为封面候选
+	if stdpath.Base(rawPath) == thumbFolderNameForPath(rawPath) {
+		return nil, errThumbNoCover
+	}
 	maxSize := int64(setting.GetInt(conf.ThumbImageMaxSize, 20*1024*1024))
 	names := strings.Split(setting.GetStr(conf.ThumbCoverNames, "folder.jpg,cover.jpg,thumb.jpg,folder.png,cover.png,thumb.png"), ",")
 	objs, err := fs.List(ctx, rawPath, &fs.ListArgs{})
@@ -2160,6 +2235,10 @@ func fillCoverThumb(c *gin.Context, parent string, obj model.Obj) string {
 		return ""
 	}
 	if setting.GetStr(conf.ThumbDirCover, "true") != "true" {
+		return ""
+	}
+	// 缩略图文件夹自身不作为封面候选（避免"无封面/无法抽帧"失败）
+	if obj.GetName() == thumbFolderNameForPath(parent+"/"+obj.GetName()) {
 		return ""
 	}
 	return thumbURL(c, "ct", parent, obj)
