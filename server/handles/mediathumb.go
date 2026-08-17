@@ -449,15 +449,30 @@ func extractVideoFrame(ctx context.Context, localPath string) ([]byte, error) {
 		}
 		return srcBuf.Bytes(), nil
 	}
-	var data []byte
-	var err error
-	if data, err = extract("3"); err == nil {
-		return encodeThumb(data)
+	var last []byte
+	var lastErr error
+	// 依次尝试多个取帧点：跳过空白帧（片头黑屏/纯色转场等），
+	// 避免抽到单帧空白被误判"生成结果为空白图"。
+	for _, ss := range []string{"3", "", "10", "30", "60"} {
+		data, err := extract(ss)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		thumb, err := encodeThumb(data)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		last = thumb
+		if !isBlankThumb(thumb) {
+			return thumb, nil
+		}
 	}
-	if data, err = extract(""); err == nil {
-		return encodeThumb(data)
+	if last != nil {
+		return last, nil
 	}
-	return nil, err
+	return nil, lastErr
 }
 
 // setStreamContext 让 ffmpeg-go stream 使用可取消的 context（保留 Stdout/Stderr 值），
@@ -507,15 +522,31 @@ func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss
 // 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）。
 // 深偏移 seek 对部分文件（moov 在尾部/结构稀疏）抽不到帧，回退到首帧（offset 0）。
 func extractVideoFrameRemote(ctx context.Context, url string, header http.Header) ([]byte, error) {
-	data, err := extractVideoFrameAt(ctx, url, header, "3")
-	if err == nil {
-		return encodeThumb(data)
+	var (
+		last    []byte
+		lastErr error
+	)
+	// 依次尝试多个远程取帧点，跳过空白帧（见 extractVideoFrame 注释）
+	for _, ss := range []string{"3", "0", "10", "30", "60"} {
+		data, err := extractVideoFrameAt(ctx, url, header, ss)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		thumb, err := encodeThumb(data)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		last = thumb
+		if !isBlankThumb(thumb) {
+			return thumb, nil
+		}
 	}
-	data, err = extractVideoFrameAt(ctx, url, header, "0")
-	if err == nil {
-		return encodeThumb(data)
+	if last != nil {
+		return last, nil
 	}
-	return nil, err
+	return nil, lastErr
 }
 
 // generateVideoAdaptiveFrame 长视频单帧缩略图（1x1）：按"中间优先"依次尝试远程 seek
@@ -532,7 +563,15 @@ func generateVideoAdaptiveFrame(ctx context.Context, url string, header http.Hea
 		if err != nil {
 			continue
 		}
-		return encodeThumb(data)
+		thumb, err := encodeThumb(data)
+		if err != nil {
+			continue
+		}
+		// 跳过空白帧（该深度恰好为黑屏/纯色转场时继续试下一个深度）
+		if isBlankThumb(thumb) {
+			continue
+		}
+		return thumb, nil
 	}
 	return nil, errors.New("no frame extractable at any depth")
 }
