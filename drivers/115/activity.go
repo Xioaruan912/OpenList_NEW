@@ -79,7 +79,7 @@ func RecordActivityWithPath(mount string, level ActivityLevel, action ActivityAc
 func GetActivityLogs(mount string, limit int) []ActivityEntry {
 	activityMu.Lock()
 	defer activityMu.Unlock()
-	var entries []ActivityEntry
+	var entries = []ActivityEntry{}
 	if mount != "" {
 		entries = append(entries, activity[strings.TrimSuffix(mount, "/")]...)
 	} else {

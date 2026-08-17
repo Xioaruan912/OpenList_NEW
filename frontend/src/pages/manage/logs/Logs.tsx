@@ -76,7 +76,7 @@ const Logs = () => {
     const resp = await r.get("/admin/storage/logs", {
       params: { mount: mount() || undefined, limit: 20 },
     })
-    handleResp(resp, (data) => setLogs(data.content))
+    handleResp(resp, (data) => setLogs(data.content || []))
   }
   loadStorages()
   loadLogs()
