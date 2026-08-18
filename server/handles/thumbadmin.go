@@ -1649,9 +1649,8 @@ func thumbUploadBatch(batch []string) {
 				return // 队列已删除：丢弃剩余
 			}
 			if names[remoteThumbName(p)] {
-				// 网盘清单已确认存在：记录网盘索引并删除本地（同一缩略图不会同时占用两边）
+				// 网盘清单已确认存在：记录网盘索引（本地保留，本地优先展示）
 				thumbCloudRecord(p)
-				_ = os.Remove(thumbCachePath(thumbKindVideo, p))
 				thumbUploadFinalize(p, "exists")
 				continue
 			}
@@ -1667,9 +1666,8 @@ func thumbUploadBatch(batch []string) {
 			}
 			// 更新目录清单缓存，后续批次/轮次去重跳过
 			thumbListingMarkUploaded(d, remoteThumbName(p))
-			// 确认上传成功后才删除本地缩略图，并记录网盘索引
+			// 确认上传成功，记录网盘索引；本地保留用于本地优先展示
 			thumbCloudRecord(p)
-			_ = os.Remove(thumbCachePath(thumbKindVideo, p))
 			if thumbUploadStopped.Load() {
 				return
 			}
