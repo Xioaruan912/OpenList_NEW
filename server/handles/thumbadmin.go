@@ -792,6 +792,11 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 				cur.Videos++
 				rawPath := dir + "/" + obj.GetName()
 				inCloud := names[remoteThumbName(rawPath)]
+				// 云清单拉取失败（风控/超时返回空）时，回退到 cloud.jsonl（已记录上传的），
+				// 避免目录明明有缩略图却显示 0/缺 N
+				if len(names) == 0 && !inCloud {
+					inCloud = cloud[rawPath]
+				}
 				localExists := false
 				if indexedSet[rawPath] {
 					if _, err := os.Stat(thumbCachePath(thumbKindVideo, rawPath)); err == nil {
@@ -2080,6 +2085,12 @@ func ThumbDeletePaths(c *gin.Context) {
 		}
 	} else {
 		remoteSkipped = true
+	}
+	// 删除后强制刷新受影响目录的 _thumbnails 清单（fs 对象缓存 + thumbListing），
+	// 否则生成/计数仍读到删除前的过期清单，误判"网盘已有"而不入队
+	for d := range dirs {
+		thumbListingInvalidate(d)
+		_, _ = fs.List(ctx, stdpath.Join(d, thumbFolderNameForPath(d)), &fs.ListArgs{Refresh: true, NoLog: true})
 	}
 	// 记录到存储活动日志
 	if removed > 0 {
