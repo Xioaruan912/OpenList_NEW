@@ -25,7 +25,9 @@ import (
 	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/go-resty/resty/v2"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 // var UserAgent = driver115.UA115Browser
@@ -44,6 +46,7 @@ func (d *Pan115) login() error {
 	// 115 请求必须设超时：网盘风控黑洞连接时 resty 默认永久挂起，
 	// 会导致缩略图预热等后台任务无限卡死
 	d.client.Client.SetTimeout(30 * time.Second)
+	d.registerLixianHook()
 	cr := &driver115.Credential{}
 	if d.Cookie != "" {
 		if err = cr.FromCookie(d.Cookie); err != nil {
@@ -54,6 +57,33 @@ func (d *Pan115) login() error {
 		return errors.New("missing cookie or qrcode account")
 	}
 	return d.client.LoginCheck()
+}
+
+// lixian 加密接口（离线云下载 add_task_urls 等）要求使用 115Browser UA 才能解码 data 参数；
+// 而驱动默认 getUA() 为 Chrome UA（用于规避直链下载风控），二者冲突会导致 115 返回 "decode fail!"。
+// 这里在 resty 层对 lixian.115.com 的请求强制改写为 115Browser UA，并记录请求/原始响应以便排查。
+func (d *Pan115) registerLixianHook() {
+	d.client.Client.OnBeforeRequest(func(_ *resty.Client, r *resty.Request) error {
+		if strings.Contains(r.URL, "lixian.115.com") {
+			r.SetHeader("User-Agent", "Mozilla/5.0 115Browser/"+appVer)
+			log.Infof("[115-lixian] REQ %s %s UA=%s", r.Method, r.URL, r.Header.Get("User-Agent"))
+		}
+		return nil
+	})
+	d.client.Client.OnAfterResponse(func(_ *resty.Client, resp *resty.Response) error {
+		if resp == nil || resp.Request == nil || !strings.Contains(resp.Request.URL, "lixian.115.com") {
+			return nil
+		}
+		body := ""
+		if b := resp.Body(); b != nil {
+			body = string(b)
+		}
+		if len(body) > 600 {
+			body = body[:600]
+		}
+		log.Infof("[115-lixian] RESP %s status=%d body=%s", resp.Request.URL, resp.StatusCode(), body)
+		return nil
+	})
 }
 
 func (d *Pan115) getFiles(fileId string) ([]FileObj, error) {

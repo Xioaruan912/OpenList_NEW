@@ -2,6 +2,20 @@
 
 > 开始开发前，请先阅读 [`DEVELOPMENT.md`](DEVELOPMENT.md)：里面包含本仓库的架构速览、构建/部署/验证流程、前端设计规范、后端开发规范，以及 115 与代理系统的关键事实。**不要重复造已存在的功能。**
 
+## ⚠️ 每次构建/部署必做（不要等用户提醒）
+
+**任何一次 `go build` 或部署前，必须先构建前端并嵌入，否则线上会显示"前端尚未构建"占位页：**
+
+```bash
+cd frontend && pnpm install && pnpm build   # 产物在 frontend/dist/
+cd .. && rm -rf public/dist && cp -r frontend/dist public/dist   # 嵌入到 public/dist
+go build -o openlist .   # 必须在上述两步之后执行
+```
+
+- **顺序陷阱**：`go build` 必须在 `cp 前端产物到 public/dist` 之后，否则二进制里是占位页。
+- 即使本次只改了后端，也要照做（保持产物最新、避免覆盖旧前端）。
+- **提交前**：`git checkout -- public/dist/index.html`（构建产物不入库，只还原占位）。
+
 ## Issues
 
 Before creating an issue, review the available issue templates in the `.github` directory.
