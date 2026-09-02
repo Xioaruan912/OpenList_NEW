@@ -114,7 +114,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
   - 生命周期清理：本地未被 DB 引用的 managed cache 超过 1h 自动回收；远端只识别本项目命名格式的 orphan，并且需连续观察 24h 后才删除，每小时最多校准 20 个目录，避免误删用户文件或突发 115 请求。
   - 失败重试：失败按 risk/auth/timeout/not_found/blank/range/media/policy/transient 分类并写入 `retry_after`；到期后自动允许重新入队，不再统一依赖 7 天 `.fail` TTL。
   - 状态轮询：`/api/admin/thumb/status` 不同步枚举远程 `_thumbnails` 目录；过期时先返回数据库/本地缓存已知统计，并在后台刷新远程真实计数，避免管理页 10s 轮询被 115 API 卡住。
-  - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile，扫描成功后更新快照并删除已确认不存在的旧路径记录。
+  - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile。每个挂载有独立 30s 预算（整轮最多 2min），慢 115 不会饿死后续挂载；只有扫描完整的挂载才参与删除已确认不存在的旧路径记录。
   - 候选九宫格：`/admin/thumb/candidates` 只创建后台 job；前端轮询 `/candidates/status` 显示 1/9~9/9 进度，可调用 `/candidates/cancel` 取消，不再用一个最长 150s 的 HTTP 请求撑住页面。
   - 可观测性：Thumb 状态页显示缓存命中率、生成平均/P95、Range URL/RangeReader/Loopback Gateway 次数和按失败类别统计。
   - 风控：`isStorageBlocked`（115 health 5 分钟窗口）。

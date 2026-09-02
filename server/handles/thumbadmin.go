@@ -748,7 +748,8 @@ type thumbTreeNode struct {
 }
 
 const (
-	thumbTreeScanTO      = 30 * time.Second
+	thumbTreeScanTO      = 30 * time.Second // 每个挂载独立预算，慢挂载不能饿死后续挂载
+	thumbTreeReconcileTO = 2 * time.Minute  // 单轮后台 reconcile 总预算
 	thumbTreeSnapshotTTL = 5 * time.Minute
 )
 
@@ -911,8 +912,8 @@ func fastThumbTree() ([]*thumbTreeNode, string, time.Time) {
 
 func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 	scanStarted := time.Now()
-	scanCtx, cancel := context.WithTimeout(ctx, thumbTreeScanTO)
-	defer cancel()
+	reconcileCtx, reconcileCancel := context.WithTimeout(ctx, thumbTreeReconcileTO)
+	defer reconcileCancel()
 	// 索引：每目录已有缩略图数（直接子项），并按存放位置区分本地/网盘
 	indexed := readThumbIndex()
 	cachedByDir := map[string]int{}
@@ -937,28 +938,27 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 		}
 	}
 	root := &thumbTreeNode{}
-	dirsCount := 0
-	scanFailed := 0
-	scanTruncated := false
+	totalDirsCount := 0
+	completeMounts := map[string]bool{}
 	realDirs := map[string]bool{}
 	indexedSet := map[string]bool{}
 	for _, p := range indexed {
 		indexedSet[p] = true
 	}
-	var scan func(dir string, cur *thumbTreeNode)
-	scan = func(dir string, cur *thumbTreeNode) {
+	var scan func(scanCtx context.Context, dir string, cur *thumbTreeNode, dirsCount *int, scanFailed *int, scanTruncated *bool)
+	scan = func(scanCtx context.Context, dir string, cur *thumbTreeNode, dirsCount *int, scanFailed *int, scanTruncated *bool) {
 		if scanCtx.Err() != nil {
 			return
 		}
-		if dirsCount >= thumbScanMaxDirs {
-			scanTruncated = true
+		if *dirsCount >= thumbScanMaxDirs {
+			*scanTruncated = true
 			return
 		}
-		dirsCount++
+		*dirsCount++
 		realDirs[dir] = true
 		objs, err := fs.List(scanCtx, dir, &fs.ListArgs{})
 		if err != nil {
-			scanFailed++
+			*scanFailed++
 			return
 		}
 		// 本目录网盘 _thumbnails 清单（带缓存）：逐视频匹配，本地索引或网盘清单有即算有缩略图
@@ -971,7 +971,7 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 				childPath := dir + "/" + obj.GetName()
 				child := &thumbTreeNode{Path: childPath, Name: obj.GetName()}
 				cur.Children = append(cur.Children, child)
-				scan(childPath, child)
+				scan(scanCtx, childPath, child, dirsCount, scanFailed, scanTruncated)
 			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
 				cur.Videos++
 				rawPath := dir + "/" + obj.GetName()
@@ -1008,12 +1008,29 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 			realDirs[m] = true
 			child := &thumbTreeNode{Path: m, Name: strings.TrimPrefix(m, "/")}
 			root.Children = append(root.Children, child)
-			scan(m, child)
+			if reconcileCtx.Err() != nil {
+				continue
+			}
+			mountCtx, mountCancel := context.WithTimeout(reconcileCtx, thumbTreeScanTO)
+			mountDirs, mountFailed := 0, 0
+			mountTruncated := false
+			scan(mountCtx, m, child, &mountDirs, &mountFailed, &mountTruncated)
+			mountTimedOut := mountCtx.Err() != nil
+			mountCancel()
+			totalDirsCount += mountDirs
+			completeMounts[m] = mountDirs > 0 && mountFailed == 0 && !mountTruncated && !mountTimedOut
 		}
 	}
 	status := "complete"
-	if scanFailed > 0 || scanCtx.Err() != nil || dirsCount == 0 || scanTruncated {
+	if totalDirsCount == 0 || reconcileCtx.Err() != nil {
 		status = "partial"
+	} else {
+		for _, mount := range mounts {
+			if !completeMounts[mount] {
+				status = "partial"
+				break
+			}
+		}
 	}
 	// 完整扫描后：自动迁移失效的缩略图索引（文件夹移动/挂载根变更时缩略图跟随）
 	if status == "complete" {
@@ -1037,11 +1054,13 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 				}
 			}
 			var refreshCached func(ns []*thumbTreeNode)
+			refreshCtx, refreshCancel := context.WithTimeout(reconcileCtx, thumbTreeScanTO)
+			defer refreshCancel()
 			refreshCached = func(ns []*thumbTreeNode) {
 				for _, n := range ns {
 					n.Cached = cachedByDir[n.Path]
 					n.Local = localByDir[n.Path]
-					n.Cloud = len(loadRemoteThumbListing(scanCtx, n.Path, folderNameOnly{thumbFolderNameForPath(n.Path)}))
+					n.Cloud = len(loadRemoteThumbListing(refreshCtx, n.Path, folderNameOnly{thumbFolderNameForPath(n.Path)}))
 					if len(n.Children) > 0 {
 						refreshCached(n.Children)
 					}
@@ -1049,27 +1068,27 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 			}
 			refreshCached(root.Children)
 		}
-		// A complete traversal is authoritative for object existence. Rows not observed during this
-		// pass represent deleted/moved media; removing them lets local/remote orphan reconciliation
-		// reclaim the old cache files without guessing from path hashes.
-		if records, err := db.ListThumbnailRecords(thumbKindVideo); err == nil {
-			for _, record := range records {
-				if !record.LastSeenAt.IsZero() && !record.LastSeenAt.Before(scanStarted) {
+	}
+	// Each mount is authoritative independently. A slow/failed 115 scan must not prevent a fully
+	// scanned OneDrive mount from pruning records that are confirmed gone, while partial mounts are
+	// never used for destructive reconciliation.
+	if records, err := db.ListThumbnailRecords(thumbKindVideo); err == nil {
+		for _, record := range records {
+			if !record.LastSeenAt.IsZero() && !record.LastSeenAt.Before(scanStarted) {
+				continue
+			}
+			for mount, complete := range completeMounts {
+				if !complete {
 					continue
 				}
-				underMount := false
-				for _, mount := range mounts {
-					prefix := strings.TrimRight(mount, "/")
-					if record.Path == mount || strings.HasPrefix(record.Path, prefix+"/") {
-						underMount = true
-						break
-					}
+				prefix := strings.TrimRight(mount, "/")
+				if record.Path != mount && !strings.HasPrefix(record.Path, prefix+"/") {
+					continue
 				}
-				if underMount {
-					_ = db.DeleteThumbnailRecord(record.PathKey)
-					prewarmDone.Delete(record.Path)
-					remoteThumbCacheDelete(record.Path)
-				}
+				_ = db.DeleteThumbnailRecord(record.PathKey)
+				prewarmDone.Delete(record.Path)
+				remoteThumbCacheDelete(record.Path)
+				break
 			}
 		}
 	}
