@@ -114,7 +114,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
   - 生命周期清理：本地未被 DB 引用的 managed cache 超过 1h 自动回收；远端只识别本项目命名格式的 orphan，并且需连续观察 24h 后才删除，每小时最多校准 20 个目录，避免误删用户文件或突发 115 请求。
   - 失败重试：失败按 risk/auth/timeout/not_found/blank/range/media/policy/transient 分类并写入 `retry_after`；到期后自动允许重新入队，不再统一依赖 7 天 `.fail` TTL。
   - 状态轮询：`/api/admin/thumb/status` 不同步枚举远程 `_thumbnails` 目录；过期时先返回数据库/本地缓存已知统计，并在后台刷新远程真实计数，避免管理页 10s 轮询被 115 API 卡住。
-  - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile。每个挂载有独立 30s 预算（整轮最多 2min），慢 115 不会饿死后续挂载；只有扫描完整的挂载才参与删除已确认不存在的旧路径记录。
+  - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile。每个挂载有独立 30s 预算（整轮最多 2min），慢 115 不会饿死后续挂载；只有扫描完整的挂载才参与删除已确认不存在的旧路径记录。若扫描为 partial，则以 DB 已知聚合值作为 `videos/cached/local/cloud` 下限并补齐缺失分支，目录数字不会因远端超时突然跳低。
   - 候选九宫格：`/admin/thumb/candidates` 只创建后台 job。最多 16 个活动任务、后台严格单路执行，并保留最多 32 个最近任务摘要/结果（30 分钟 TTL）；同一路径复用进行中任务。关闭预览弹窗或离开 Thumb 页面只会 detach UI，不会取消服务端任务；用户回来后可从“3×3 后台任务”继续看进度/结果，只有显式“取消任务”才 cancel。候选会等待普通生成任务让出资源，而不是要求用户先手动暂停生成队列。
   - 控制面：`/api/admin/thumb/runtime` 每 2s 可安全轮询，只读取内存中的生成队列、上传队列、3×3 job、Tree reconcile 状态；不扫描磁盘、不访问网盘、不调用 ffmpeg。较重的缓存统计/metrics 仍由 `/status` 低频刷新，避免“为了显示进度反而制造 115 请求”。
   - 前端结构：`thumb/api.ts` 集中路由；`types.ts` 定义契约；`useCandidateController.ts` 管理 3×3 生命周期；`components/` 内分别维护 Overview、Generation/Upload Queue、Candidate Task Center、Candidate Modal、Tree、Directory Detail、Failure Log、Stale Path Migration。新增 UI 不应重新堆回 `Thumb.tsx`。

@@ -131,6 +131,47 @@ func sumThumbTree(nodes []*thumbTreeNode) (videos, cached, local, cloud int) {
 	return
 }
 
+// mergeThumbTreeFloor overlays DB-known aggregate counts onto a partial remote scan. A partial
+// traversal may have better information for directories it reached, but it must never make known
+// cached/local/cloud counts visibly jump backwards just because a remote mount timed out.
+func mergeThumbTreeFloor(current, floor []*thumbTreeNode) []*thumbTreeNode {
+	byPath := make(map[string]*thumbTreeNode, len(current))
+	for _, node := range current {
+		if node != nil {
+			byPath[node.Path] = node
+		}
+	}
+	for _, known := range floor {
+		if known == nil {
+			continue
+		}
+		node := byPath[known.Path]
+		if node == nil {
+			cloned := cloneThumbTree([]*thumbTreeNode{known})
+			if len(cloned) > 0 {
+				current = append(current, cloned[0])
+				byPath[known.Path] = cloned[0]
+			}
+			continue
+		}
+		if node.Videos < known.Videos {
+			node.Videos = known.Videos
+		}
+		if node.Cached < known.Cached {
+			node.Cached = known.Cached
+		}
+		if node.Local < known.Local {
+			node.Local = known.Local
+		}
+		if node.Cloud < known.Cloud {
+			node.Cloud = known.Cloud
+		}
+		node.Children = mergeThumbTreeFloor(node.Children, known.Children)
+	}
+	sortThumbTree(current)
+	return current
+}
+
 func buildThumbTreeFromDB() []*thumbTreeNode {
 	root := &thumbTreeNode{}
 	for _, mount := range currentMountPaths() {
@@ -407,6 +448,9 @@ func scanThumbTreeRemote(ctx context.Context) ([]*thumbTreeNode, string) {
 	}
 	for _, mount := range root.Children {
 		sumSubtree(mount)
+	}
+	if status != "complete" {
+		root.Children = mergeThumbTreeFloor(root.Children, buildThumbTreeFromDB())
 	}
 	allCached, allLocal, allCloud := 0, 0, 0
 	for _, mount := range root.Children {
