@@ -145,6 +145,7 @@ var (
 	thumbAggMu sync.Mutex
 	thumbAgg   struct{ cached, local, cloud int }
 	thumbAggAt time.Time
+	thumbAggRefreshing atomic.Bool
 )
 
 // thumbAggTTL 顶部聚合统计缓存时长：本地磁盘扫描廉价，网盘计数另有 10 分钟缓存，
@@ -161,10 +162,37 @@ func refreshThumbAgg(ctx context.Context) {
 	thumbAggMu.Unlock()
 }
 
+// knownThumbAgg uses only local DB/index state. It is intentionally network-free and gives the
+// status endpoint an immediate, stable fallback while the more expensive remote directory scan is
+// refreshed in the background.
+func knownThumbAgg() (cached, cloud int) {
+	union := map[string]struct{}{}
+	for _, p := range readThumbIndex() {
+		union[p] = struct{}{}
+	}
+	cloudSet := readThumbCloudIndex()
+	for p := range cloudSet {
+		union[p] = struct{}{}
+	}
+	return len(union), len(cloudSet)
+}
+
+func refreshThumbAggAsync() {
+	if !thumbAggRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer thumbAggRefreshing.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		refreshThumbAgg(ctx)
+	}()
+}
+
 // ThumbStatus GET /api/admin/thumb/status
 // 缩略图缓存与预热队列状态（含按目录失败统计）
 func ThumbStatus(c *gin.Context) {
-	_, failCount, totalSize := thumbCacheStats()
+	localCount, failCount, totalSize := thumbCacheStats()
 	var cachedFiles, localFiles, cloudFiles int
 	thumbAggMu.Lock()
 	if time.Since(thumbAggAt) < thumbAggTTL {
@@ -172,10 +200,15 @@ func ThumbStatus(c *gin.Context) {
 		thumbAggMu.Unlock()
 	} else {
 		thumbAggMu.Unlock()
-		refreshThumbAgg(c.Request.Context())
+		// Never make the 10s management-page polling path wait for 115 directory enumeration.
+		// Return local/DB-known counts immediately and refresh remote truth asynchronously.
+		cachedFiles, cloudFiles = knownThumbAgg()
+		localFiles = localCount
 		thumbAggMu.Lock()
-		cachedFiles, localFiles, cloudFiles = thumbAgg.cached, thumbAgg.local, thumbAgg.cloud
+		thumbAgg.cached, thumbAgg.local, thumbAgg.cloud = cachedFiles, localFiles, cloudFiles
+		thumbAggAt = time.Now()
 		thumbAggMu.Unlock()
+		refreshThumbAggAsync()
 	}
 	status := gin.H{
 		"cache_dir":       thumbDir(),
