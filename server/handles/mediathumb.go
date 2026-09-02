@@ -13,6 +13,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -38,6 +39,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/tache"
 	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -375,18 +377,43 @@ func thumbRelease() {
 
 // 预热队列：浏览目录时后台批量生成视频缩略图
 type thumbPrewarmTask struct {
+	tache.Base
 	kind    string
 	rawPath string
+	manager *tache.Manager[*thumbPrewarmTask]
+}
+
+func (t *thumbPrewarmTask) Run() error {
+	processTask(t, t.Ctx())
+	return nil
+}
+
+func (t *thumbPrewarmTask) OnSucceeded() {
+	if t.manager != nil {
+		t.manager.Remove(t.GetID())
+	}
+}
+
+func (t *thumbPrewarmTask) OnFailed() {
+	prewarmDone.Delete(t.rawPath)
+	if t.manager != nil {
+		t.manager.Remove(t.GetID())
+	}
 }
 
 var (
-	prewarmOnce   sync.Once
-	prewarmCh     chan thumbPrewarmTask
-	prewarmDone   sync.Map // path -> done
-	prewarmDirDeb sync.Map // dir -> last prewarm time, 防抖
+	prewarmDone sync.Map // path -> done
+	// tache manager replaces the old hand-written buffered channel/worker pool. A mutex protects
+	// manager replacement during "clear queue" so abandoned pending tasks can be discarded at once.
+	thumbPrewarmManagerMu sync.Mutex
+	thumbPrewarmManager   *tache.Manager[*thumbPrewarmTask]
+	thumbPrewarmEnqueueMu sync.Mutex
+	prewarmDirDeb         sync.Map // dir -> last prewarm time, 防抖
 	// 队列暂停标记：暂停时 worker 不再取任务，已入队任务保留等待恢复
 	thumbQueuePaused atomic.Bool
 )
+
+var thumbTacheLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 const prewarmDebounce = 10 * time.Minute
 
@@ -1839,15 +1866,55 @@ func thumbGenPower() thumbGenPowerCfg {
 	return thumbGenPowerCfg{Workers: limit, AcquireLimit: limit, EnqueueMax: 2048}
 }
 
-// prewarmStart 启动预热 worker（多 worker 并发生成，不做节流）
-func prewarmStart() {
-	prewarmOnce.Do(func() {
-		prewarmCh = make(chan thumbPrewarmTask, 2048)
-		n := thumbGenPower().Workers
-		for i := 0; i < n; i++ {
-			go prewarmWorker()
+func newThumbPrewarmManager(running bool) *tache.Manager[*thumbPrewarmTask] {
+	return tache.NewManager[*thumbPrewarmTask](
+		tache.WithWorks(thumbGenPower().Workers),
+		tache.WithMaxRetry(0),
+		tache.WithRunning(running),
+		tache.WithLogger(thumbTacheLogger),
+	)
+}
+
+// prewarmStart returns the tache manager backing thumbnail generation and keeps its active worker
+// count in sync with thumb_concurrency.
+func prewarmStart() *tache.Manager[*thumbPrewarmTask] {
+	thumbPrewarmManagerMu.Lock()
+	defer thumbPrewarmManagerMu.Unlock()
+	if thumbPrewarmManager == nil {
+		thumbPrewarmManager = newThumbPrewarmManager(!thumbQueuePaused.Load())
+	}
+	thumbPrewarmManager.SetWorkersNumActive(int64(thumbGenPower().Workers))
+	return thumbPrewarmManager
+}
+
+func thumbPrewarmQueued() int {
+	manager := prewarmStart()
+	return len(manager.GetByState(
+		tache.StatePending,
+		tache.StateWaitingRetry,
+		tache.StateBeforeRetry,
+	))
+}
+
+// thumbPrewarmReset abandons the old manager after canceling it and installs a fresh manager.
+// This is the tache equivalent of draining the old buffered channel without leaving canceled
+// entries to be popped one-by-one on resume.
+func thumbPrewarmReset(running bool) (dropped int) {
+	thumbPrewarmManagerMu.Lock()
+	defer thumbPrewarmManagerMu.Unlock()
+	if thumbPrewarmManager != nil {
+		for _, task := range thumbPrewarmManager.GetAll() {
+			switch task.GetState() {
+			case tache.StatePending, tache.StateWaitingRetry, tache.StateBeforeRetry:
+				dropped++
+			}
+			prewarmDone.Delete(task.rawPath)
 		}
-	})
+		thumbPrewarmManager.Pause()
+		thumbPrewarmManager.CancelAll()
+	}
+	thumbPrewarmManager = newThumbPrewarmManager(running)
+	return dropped
 }
 
 // ---------- 自动上传 worker ----------
@@ -1900,29 +1967,6 @@ func autoUploadScanOnce() {
 // StartThumbAuto 启动自动上传循环（服务启动时调用；也随开关启用时启动）
 func StartThumbAuto() {
 	autoUploadStart()
-}
-
-// ---------- 预热 worker ----------
-
-// prewarmWorker 取到一个任务立即处理，不做批内/批间节流
-func prewarmWorker() {
-	for {
-		// 暂停时阻塞等待恢复
-		for thumbQueuePaused.Load() {
-			time.Sleep(500 * time.Millisecond)
-		}
-		task, ok := <-prewarmCh
-		if !ok {
-			return
-		}
-		// pause 可能发生在 worker 已经阻塞于 channel receive 之后；取到任务后再检查一次，
-		// 保证“暂停”不会额外漏跑一个任务。刚取出一个元素后 channel 必有回填空间。
-		if thumbQueuePaused.Load() {
-			prewarmRequeue(task)
-			continue
-		}
-		processTask(task)
-	}
 }
 
 // thumbActiveWorkers 当前正在处理缩略图生成的 worker 数（供前端进度条显示）
@@ -1997,7 +2041,20 @@ func thumbTaskCancelled(genCtx context.Context, epoch int64) bool {
 	return atomic.LoadInt64(&thumbGenEpoch) != epoch
 }
 
-func processTask(task thumbPrewarmTask) {
+func processTask(task *thumbPrewarmTask, baseCtx context.Context) {
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	for thumbQueuePaused.Load() {
+		// A task may already have been popped by tache when the user presses Pause. Keep that
+		// task parked before any remote work; Clear cancels the task context and releases it.
+		select {
+		case <-baseCtx.Done():
+			prewarmDone.Delete(task.rawPath)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	// 风控中不循环重排队，等下一次浏览或手动操作再入队。
 	if blocked, _ := isStorageBlocked(task.rawPath); blocked {
 		prewarmDone.Delete(task.rawPath)
@@ -2012,22 +2069,27 @@ func processTask(task thumbPrewarmTask) {
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
-	if thumbCandidateActive.Load() {
-		// 候选任务正在进行，暂不让预热 worker 发起新的远程请求
-		time.Sleep(250 * time.Millisecond)
-		prewarmRequeue(task)
-		return
+	for thumbCandidateActive.Load() {
+		// 候选任务正在进行时保留 tache 任务，不重新入队、不制造队列风暴。
+		select {
+		case <-baseCtx.Done():
+			prewarmDone.Delete(task.rawPath)
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
-	if !thumbAcquire(context.Background(), 2*time.Second) {
-		// 并发资源被直接请求或候选生成占用，让位稍后重试
-		prewarmRequeue(task)
-		return
+	for !thumbAcquire(baseCtx, 2*time.Second) {
+		// 浏览器直接请求占满并发时，tache 任务保持 Running 等待，而不是重复出队/入队。
+		if baseCtx.Err() != nil {
+			prewarmDone.Delete(task.rawPath)
+			return
+		}
 	}
 	atomic.AddInt32(&thumbActiveWorkers, 1)
 	defer atomic.AddInt32(&thumbActiveWorkers, -1)
 	defer thumbRelease()
 	epoch := atomic.LoadInt64(&thumbGenEpoch)
-	genCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	genCtx, cancel := context.WithTimeout(baseCtx, 90*time.Second)
 	defer cancel()
 	thumbActiveTrack(task.rawPath, true)
 	thumbActiveCancelAdd(task.rawPath, cancel)
@@ -2070,7 +2132,7 @@ func processTask(task thumbPrewarmTask) {
 	cachePath = thumbCachePath(task.kind, task.rawPath)
 	// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
 	if addition := remoteThumbStore(task.rawPath); addition != nil {
-		uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		uploadCtx, uploadCancel := context.WithTimeout(genCtx, 60*time.Second)
 		if err := uploadThumbRemote(uploadCtx, task.rawPath, addition, png); err != nil {
 			log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
 		}
@@ -2250,28 +2312,25 @@ func thumbCloudRemove(paths []string) {
 	thumbCloudMu.Unlock()
 }
 
-func prewarmRequeue(task thumbPrewarmTask) bool {
-	select {
-	case prewarmCh <- task:
-		return true
-	default:
-		prewarmDone.Delete(task.rawPath)
+// prewarmEnqueue adds a deduplicated generation task to tache. The historical 2048-entry safety
+// cap is kept so a single recursive scan cannot grow memory without bound.
+func prewarmEnqueue(kind, rawPath string) bool {
+	if _, done := prewarmDone.Load(rawPath); done {
 		return false
 	}
-}
-
-// prewarmEnqueue 入队预热任务（去重）。队列满时丢弃本次预热，等待后续浏览重新发现。
-func prewarmEnqueue(kind, rawPath string) {
-	prewarmStart()
+	thumbPrewarmEnqueueMu.Lock()
+	defer thumbPrewarmEnqueueMu.Unlock()
 	if _, done := prewarmDone.Load(rawPath); done {
-		return
+		return false
+	}
+	manager := prewarmStart()
+	if len(manager.GetAll()) >= thumbGenPower().EnqueueMax {
+		return false
 	}
 	prewarmDone.Store(rawPath, struct{}{})
-	select {
-	case prewarmCh <- thumbPrewarmTask{kind: kind, rawPath: rawPath}:
-	default:
-		prewarmDone.Delete(rawPath)
-	}
+	task := &thumbPrewarmTask{kind: kind, rawPath: rawPath, manager: manager}
+	manager.Add(task)
+	return true
 }
 
 // prewarmDir 浏览目录时预热视频缩略图（带目录防抖）

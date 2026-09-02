@@ -8,7 +8,6 @@ import (
 	"os"
 	stdpath "path"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/tache"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
@@ -113,8 +113,9 @@ func ThumbGenerate(c *gin.Context) {
 			}
 			// 本地与网盘都缺失的视频：清除 done 标记以便重新入队（含之前失败/中断的）
 			prewarmDone.Delete(rawPath)
-			prewarmEnqueue(thumbKindVideo, rawPath)
-			queued++
+			if prewarmEnqueue(thumbKindVideo, rawPath) {
+				queued++
+			}
 		}
 	}
 	// 根目录不是有效存储路径：遍历所有挂载
@@ -187,9 +188,7 @@ func ThumbStatus(c *gin.Context) {
 		"queue_paused":    thumbQueuePaused.Load(),
 		"auto_upload":     setting.GetStr(conf.ThumbAutoUpload, "false") == "true",
 	}
-	if prewarmCh != nil {
-		status["prewarm_queued"] = len(prewarmCh)
-	}
+	status["prewarm_queued"] = thumbPrewarmQueued()
 	pw := thumbGenPower()
 	status["worker_concurrency"] = pw.Workers
 	status["gen_power"] = "max"
@@ -322,6 +321,7 @@ func ThumbSetAuto(c *gin.Context) {
 // 暂停缩略图生成队列：worker 停止取任务，已入队任务保留等待恢复。
 func ThumbQueuePause(c *gin.Context) {
 	thumbQueuePaused.Store(true)
+	prewarmStart().Pause()
 	// 取消进行中的生成（杀 ffmpeg），让"正在生成"立即停下并与顶部队列状态一致
 	cancelActiveGeneration()
 	common.SuccessResp(c, gin.H{"paused": true})
@@ -331,6 +331,9 @@ func ThumbQueuePause(c *gin.Context) {
 // 恢复缩略图生成队列。
 func ThumbQueueResume(c *gin.Context) {
 	thumbQueuePaused.Store(false)
+	manager := prewarmStart()
+	manager.SetWorkersNumActive(int64(thumbGenPower().Workers))
+	manager.Start()
 	common.SuccessResp(c, gin.H{"paused": false})
 }
 
@@ -338,24 +341,10 @@ func ThumbQueueResume(c *gin.Context) {
 // 清空当前队列：丢弃所有待处理任务，并清除其去重标记，
 // 之后重新点生成可再次入队。返回丢弃的任务数。
 func ThumbQueueClear(c *gin.Context) {
-	if prewarmCh == nil {
-		cancelActiveGeneration()
-		common.SuccessResp(c, gin.H{"dropped": 0})
-		return
-	}
-	// 先取消进行中的生成，再清空待处理队列
+	// 先取消进行中的生成，再用新的 tache manager 替换旧队列。
 	cancelActiveGeneration()
-	dropped := 0
-	for {
-		select {
-		case task := <-prewarmCh:
-			prewarmDone.Delete(task.rawPath)
-			dropped++
-		default:
-			common.SuccessResp(c, gin.H{"dropped": dropped})
-			return
-		}
-	}
+	dropped := thumbPrewarmReset(!thumbQueuePaused.Load())
+	common.SuccessResp(c, gin.H{"dropped": dropped})
 }
 
 // currentMountPaths 返回当前所有存储的挂载路径列表
@@ -1501,8 +1490,8 @@ func ThumbUpload(c *gin.Context) {
 		common.SuccessResp(c, gin.H{"queued": 0, "total": 0})
 		return
 	}
-	thumbUploadEnqueue(targets)
-	common.SuccessResp(c, gin.H{"queued": len(targets), "total": thumbUploadTotal})
+	added, total := thumbUploadEnqueue(targets)
+	common.SuccessResp(c, gin.H{"queued": added, "total": total})
 }
 
 // ThumbUploadAll POST /api/admin/thumb/upload_all
@@ -1517,44 +1506,47 @@ func ThumbUploadAll(c *gin.Context) {
 		common.SuccessResp(c, gin.H{"queued": 0, "total": 0})
 		return
 	}
-	thumbUploadEnqueue(targets)
-	common.SuccessResp(c, gin.H{"queued": len(targets), "total": thumbUploadTotal})
+	added, total := thumbUploadEnqueue(targets)
+	common.SuccessResp(c, gin.H{"queued": added, "total": total})
 }
 
 // ThumbUploadStatus GET /api/admin/thumb/upload_status
 func ThumbUploadStatus(c *gin.Context) {
+	tasks := thumbUploadManagerSnapshot()
+	queued, running := thumbUploadStateCounts(tasks)
 	thumbUploadMu.Lock()
-	defer thumbUploadMu.Unlock()
 	remaining := thumbUploadTotal - thumbUploadDone - thumbUploadExists - thumbUploadFailed
 	if remaining < 0 {
 		remaining = 0
 	}
 	failItems := make([]gin.H, 0, len(thumbUploadFails))
-	for _, f := range thumbUploadFails {
-		failItems = append(failItems, gin.H{"path": f.Path, "msg": f.Msg})
+	paths := make([]string, 0, len(thumbUploadFails))
+	for p := range thumbUploadFails {
+		paths = append(paths, p)
 	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		failItems = append(failItems, gin.H{"path": p, "msg": thumbUploadFails[p]})
+	}
+	total := thumbUploadTotal
+	done := thumbUploadDone
+	failed := thumbUploadFailed
+	exists := thumbUploadExists
+	attempts := thumbUploadAttempts
+	thumbUploadMu.Unlock()
 	common.SuccessResp(c, gin.H{
-		"active":     thumbUploadActive,
+		"active":     queued+running > 0,
 		"paused":     thumbUploadPaused.Load(),
-		"queued":     len(thumbUploadQueue),
+		"queued":     queued,
 		"remaining":  remaining,
-		"total":      thumbUploadTotal,
-		"done":       thumbUploadDone,
-		"failed":     thumbUploadFailed,
-		"exists":     thumbUploadExists,
-		"fails":      len(thumbUploadFails),
-		"attempts":   thumbUploadAttemptsTotal(),
+		"total":      total,
+		"done":       done,
+		"failed":     failed,
+		"exists":     exists,
+		"fails":      len(failItems),
+		"attempts":   attempts,
 		"fail_items": failItems,
 	})
-}
-
-// thumbUploadAttemptsTotal 当前累计尝试次数（含自动重试）
-func thumbUploadAttemptsTotal() int {
-	n := 0
-	for _, a := range thumbUploadAttempts {
-		n += a
-	}
-	return n
 }
 
 // collectUploadTargets 收集有本地缩略图的视频路径（dir 为空表示全部）
@@ -1578,7 +1570,7 @@ func collectUploadTargets(dir string) []string {
 	return targets
 }
 
-// ---- 缩略图上传队列（批量 50 / 间隔 5s / 路径级去重 / 失败自动重试）----
+// ---- 缩略图上传队列（tache；路径级去重 / 失败自动重试 / 速率窗口）----
 
 const (
 	thumbUploadBatchSize   = 50
@@ -1588,227 +1580,286 @@ const (
 )
 
 var (
+	thumbUploadManagerMu sync.Mutex
+	thumbUploadManager   *tache.Manager[*thumbUploadTask]
+	thumbUploadEnqueueMu sync.Mutex
+
 	thumbUploadMu       sync.Mutex
-	thumbUploadQueue    []string
-	thumbUploadTotal    int // 本轮唯一路径总数（手动重试会累加）
+	thumbUploadTotal    int
 	thumbUploadDone     int
 	thumbUploadFailed   int
 	thumbUploadExists   int
-	thumbUploadActive   bool
-	thumbUploadFails    []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
-	thumbUploadAttempts = map[string]int{}
-	thumbUploadStatus   = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
-	thumbUploadPaused   atomic.Bool           // 用户手动暂停上传队列（保留队列）
-	thumbUploadStopped  atomic.Bool           // 删除队列：取消进行中批次并清空队列
+	thumbUploadAttempts int
+	thumbUploadFails    = map[string]string{}
+	thumbUploadSeen     = map[string]bool{}
+	thumbUploadPaused   atomic.Bool
+	thumbUploadEpoch    atomic.Int64
+
+	thumbUploadThrottleMu    sync.Mutex
+	thumbUploadThrottleStart time.Time
+	thumbUploadThrottleCount int
 )
 
-// thumbUploadFailItem 上传失败记录（含原因）
-type thumbUploadFailItem struct {
-	Path string `json:"path"`
-	Msg  string `json:"msg"`
+type thumbUploadTask struct {
+	tache.Base
+	Path      string
+	Result    string
+	FailMsg   string
+	retryable bool
+	epoch     int64
+	manager   *tache.Manager[*thumbUploadTask]
 }
 
-// thumbUploadEnqueue 加入上传队列并启动后台 worker；
-// 队列空闲时视为开始新一轮上传，重置本轮计数与状态；运行中追加时按路径去重。
-func thumbUploadEnqueue(paths []string) {
-	if len(paths) == 0 {
+func (t *thumbUploadTask) Retryable() bool {
+	return t.retryable
+}
+
+func (t *thumbUploadTask) OnBeforeRetry() {
+	timer := time.NewTimer(thumbUploadInterval)
+	defer timer.Stop()
+	select {
+	case <-t.Ctx().Done():
 		return
+	case <-timer.C:
 	}
-	thumbUploadMu.Lock()
-	thumbUploadStopped.Store(false)
-	if !thumbUploadActive {
-		thumbUploadTotal = 0
-		thumbUploadDone = 0
-		thumbUploadFailed = 0
-		thumbUploadExists = 0
-		thumbUploadFails = nil
-		thumbUploadAttempts = map[string]int{}
-		thumbUploadStatus = map[string]string{}
-	}
-	// 去重：跳过已在队列中或已处理的路径（避免运行中重复点上传导致重复入队）
-	inQueue := map[string]bool{}
-	for _, q := range thumbUploadQueue {
-		inQueue[q] = true
-	}
-	added := 0
-	for _, p := range paths {
-		if thumbUploadStatus[p] != "" || inQueue[p] {
-			continue
+	for thumbUploadPaused.Load() || anyStorageBlocked() {
+		timer := time.NewTimer(thumbUploadPauseCheck)
+		select {
+		case <-t.Ctx().Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
-		thumbUploadQueue = append(thumbUploadQueue, p)
-		inQueue[p] = true
-		added++
-	}
-	thumbUploadTotal += added
-	needStart := !thumbUploadActive
-	thumbUploadMu.Unlock()
-	if needStart {
-		go thumbUploadWorker()
 	}
 }
 
-func thumbUploadWorker() {
+func thumbUploadThrottle(ctx context.Context) error {
 	for {
-		thumbUploadMu.Lock()
-		if thumbUploadStopped.Load() {
-			thumbUploadQueue = nil
-			thumbUploadActive = false
-			thumbUploadStopped.Store(false)
-			thumbUploadMu.Unlock()
-			return
+		thumbUploadThrottleMu.Lock()
+		now := time.Now()
+		if thumbUploadThrottleStart.IsZero() || now.Sub(thumbUploadThrottleStart) >= thumbUploadInterval {
+			thumbUploadThrottleStart = now
+			thumbUploadThrottleCount = 0
 		}
-		if len(thumbUploadQueue) == 0 {
-			thumbUploadActive = false
-			thumbUploadMu.Unlock()
-			return
+		if thumbUploadThrottleCount < thumbUploadBatchSize {
+			thumbUploadThrottleCount++
+			thumbUploadThrottleMu.Unlock()
+			return nil
 		}
-		thumbUploadMu.Unlock()
-
-		// 暂停或 115 风控中：完全停手（保留队列），等待解除后再继续，避免继续打 115
-		if thumbUploadPaused.Load() || anyStorageBlocked() {
-			time.Sleep(thumbUploadPauseCheck)
-			continue
+		wait := thumbUploadInterval - now.Sub(thumbUploadThrottleStart)
+		thumbUploadThrottleMu.Unlock()
+		if wait < 10*time.Millisecond {
+			wait = 10 * time.Millisecond
 		}
-
-		thumbUploadMu.Lock()
-		if thumbUploadStopped.Load() {
-			thumbUploadQueue = nil
-			thumbUploadActive = false
-			thumbUploadStopped.Store(false)
-			thumbUploadMu.Unlock()
-			return
-		}
-		n := min(thumbUploadBatchSize, len(thumbUploadQueue))
-		batch := append([]string(nil), thumbUploadQueue[:n]...)
-		thumbUploadQueue = thumbUploadQueue[n:]
-		thumbUploadActive = true
-		thumbUploadMu.Unlock()
-
-		thumbUploadBatch(batch)
-		time.Sleep(thumbUploadInterval)
-	}
-}
-
-func thumbUploadBatch(batch []string) {
-	ctx := context.Background()
-	byDir := map[string][]string{}
-	for _, p := range batch {
-		d := stdpath.Dir(p)
-		byDir[d] = append(byDir[d], p)
-	}
-	for d, ps := range byDir {
-		// 目录 _thumbnails 清单（去重，1 API/目录带缓存）；
-		// 风控时清单可能加载失败（空），按动态降批（20/5s）继续尝试上传
-		folder := thumbFolderNameForPath(d)
-		names := loadRemoteThumbListing(ctx, d, folderNameOnly{folder})
-		for _, p := range ps {
-			if thumbUploadStopped.Load() {
-				return // 队列已删除：丢弃剩余
-			}
-			if names[remoteThumbName(p)] {
-				// 网盘清单已确认存在：记录网盘索引（本地保留，本地优先展示）
-				thumbCloudRecord(p)
-				thumbUploadFinalize(p, "exists")
-				continue
-			}
-			data, err := os.ReadFile(thumbCachePath(thumbKindVideo, p))
-			if err != nil {
-				// 本地文件缺失：无重试意义，直接进失败清单
-				thumbUploadFailNow(p, "本地缩略图文件缺失")
-				continue
-			}
-			if err := uploadThumbManual(ctx, p, data); err != nil {
-				thumbUploadFailRetry(p, err.Error())
-				continue
-			}
-			// 更新目录清单缓存，后续批次/轮次去重跳过
-			thumbListingMarkUploaded(d, remoteThumbName(p))
-			// 确认上传成功，记录网盘索引；本地保留用于本地优先展示
-			thumbCloudRecord(p)
-			if thumbUploadStopped.Load() {
-				return
-			}
-			thumbUploadFinalize(p, "done")
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
 
-// thumbUploadFinalize 记录路径的本轮最终状态（去重计数，不会重复累计）
-func thumbUploadFinalize(p, status string) {
-	thumbUploadMu.Lock()
-	if thumbUploadStatus[p] == "" {
-		thumbUploadStatus[p] = status
-		switch status {
-		case "done":
-			thumbUploadDone++
+func (t *thumbUploadTask) Run() error {
+	t.Result = ""
+	t.FailMsg = ""
+	t.retryable = true
+
+	for thumbUploadPaused.Load() || anyStorageBlocked() {
+		timer := time.NewTimer(thumbUploadPauseCheck)
+		select {
+		case <-t.Ctx().Done():
+			timer.Stop()
+			return t.Ctx().Err()
+		case <-timer.C:
+		}
+	}
+	if err := thumbUploadThrottle(t.Ctx()); err != nil {
+		return err
+	}
+
+	dir := stdpath.Dir(t.Path)
+	folder := thumbFolderNameForPath(dir)
+	names := loadRemoteThumbListing(t.Ctx(), dir, folderNameOnly{folder})
+	name := remoteThumbName(t.Path)
+	if names[name] {
+		thumbCloudRecord(t.Path)
+		t.Result = "exists"
+		return nil
+	}
+
+	data, err := os.ReadFile(thumbCachePath(thumbKindVideo, t.Path))
+	if err != nil {
+		t.retryable = false
+		t.FailMsg = "本地缩略图文件缺失"
+		return fmt.Errorf("%s", t.FailMsg)
+	}
+	if err := uploadThumbManual(t.Ctx(), t.Path, data); err != nil {
+		t.FailMsg = err.Error()
+		return err
+	}
+	thumbListingMarkUploaded(dir, name)
+	thumbCloudRecord(t.Path)
+	t.Result = "done"
+	return nil
+}
+
+func thumbUploadTerminalAttempts(t *thumbUploadTask) int {
+	retry, _ := t.GetRetry()
+	return retry + 1
+}
+
+func (t *thumbUploadTask) OnSucceeded() {
+	if t.epoch == thumbUploadEpoch.Load() {
+		thumbUploadMu.Lock()
+		thumbUploadAttempts += thumbUploadTerminalAttempts(t)
+		switch t.Result {
 		case "exists":
 			thumbUploadExists++
-		case "failed":
-			thumbUploadFailed++
+		default:
+			thumbUploadDone++
+		}
+		delete(thumbUploadFails, t.Path)
+		thumbUploadMu.Unlock()
+	}
+	if t.manager != nil {
+		t.manager.Remove(t.GetID())
+	}
+}
+
+func (t *thumbUploadTask) OnFailed() {
+	if t.epoch == thumbUploadEpoch.Load() {
+		thumbUploadMu.Lock()
+		thumbUploadAttempts += thumbUploadTerminalAttempts(t)
+		thumbUploadFailed++
+		msg := t.FailMsg
+		if msg == "" && t.GetErr() != nil {
+			msg = t.GetErr().Error()
+		}
+		if msg == "" {
+			msg = "上传失败"
+		}
+		thumbUploadFails[t.Path] = msg
+		thumbUploadMu.Unlock()
+	}
+	if t.manager != nil {
+		t.manager.Remove(t.GetID())
+	}
+}
+
+func newThumbUploadManager(running bool) *tache.Manager[*thumbUploadTask] {
+	return tache.NewManager[*thumbUploadTask](
+		tache.WithWorks(1),
+		tache.WithMaxRetry(thumbUploadMaxAttempts-1),
+		tache.WithRunning(running),
+		tache.WithLogger(thumbTacheLogger),
+	)
+}
+
+func thumbUploadManagerGet() *tache.Manager[*thumbUploadTask] {
+	thumbUploadManagerMu.Lock()
+	defer thumbUploadManagerMu.Unlock()
+	if thumbUploadManager == nil {
+		thumbUploadManager = newThumbUploadManager(!thumbUploadPaused.Load())
+	}
+	return thumbUploadManager
+}
+
+func thumbUploadManagerSnapshot() []*thumbUploadTask {
+	return thumbUploadManagerGet().GetAll()
+}
+
+func thumbUploadResetRoundLocked() {
+	thumbUploadTotal = 0
+	thumbUploadDone = 0
+	thumbUploadFailed = 0
+	thumbUploadExists = 0
+	thumbUploadAttempts = 0
+	thumbUploadFails = map[string]string{}
+	thumbUploadSeen = map[string]bool{}
+}
+
+// thumbUploadEnqueue adds tasks to the current tache upload round. When newRound is true and the
+// manager is idle, historical counters are reset; manual retry passes false to preserve the round.
+func thumbUploadEnqueueInternal(paths []string, newRound bool) (added, total int) {
+	if len(paths) == 0 {
+		thumbUploadMu.Lock()
+		total = thumbUploadTotal
+		thumbUploadMu.Unlock()
+		return 0, total
+	}
+	thumbUploadEnqueueMu.Lock()
+	defer thumbUploadEnqueueMu.Unlock()
+	manager := thumbUploadManagerGet()
+	if newRound && len(manager.GetAll()) == 0 {
+		thumbUploadMu.Lock()
+		thumbUploadResetRoundLocked()
+		thumbUploadMu.Unlock()
+	}
+	epoch := thumbUploadEpoch.Load()
+	for _, p := range paths {
+		thumbUploadMu.Lock()
+		if thumbUploadSeen[p] {
+			thumbUploadMu.Unlock()
+			continue
+		}
+		thumbUploadSeen[p] = true
+		thumbUploadTotal++
+		thumbUploadMu.Unlock()
+		task := &thumbUploadTask{Path: p, retryable: true, epoch: epoch, manager: manager}
+		manager.Add(task)
+		added++
+	}
+	thumbUploadMu.Lock()
+	total = thumbUploadTotal
+	thumbUploadMu.Unlock()
+	return added, total
+}
+
+func thumbUploadEnqueue(paths []string) (added, total int) {
+	return thumbUploadEnqueueInternal(paths, true)
+}
+
+func thumbUploadStateCounts(tasks []*thumbUploadTask) (queued, running int) {
+	for _, t := range tasks {
+		switch t.GetState() {
+		case tache.StatePending, tache.StateWaitingRetry, tache.StateBeforeRetry:
+			queued++
+		case tache.StateRunning, tache.StateErrored, tache.StateFailing, tache.StateCanceling:
+			running++
 		}
 	}
-	thumbUploadMu.Unlock()
-}
-
-// thumbUploadFailNow 直接判定失败（不可重试）：进失败清单
-func thumbUploadFailNow(p, msg string) {
-	thumbUploadFinalize(p, "failed")
-	thumbUploadMu.Lock()
-	if !slices.ContainsFunc(thumbUploadFails, func(f thumbUploadFailItem) bool { return f.Path == p }) {
-		thumbUploadFails = append(thumbUploadFails, thumbUploadFailItem{Path: p, Msg: msg})
-	}
-	thumbUploadMu.Unlock()
-}
-
-// thumbUploadFailRetry 记录一次上传失败：未超过自动重试次数则重新入队（批间隔天然退避），
-// 超过后判定为最终失败并进入失败清单。
-func thumbUploadFailRetry(p, msg string) {
-	if thumbUploadStopped.Load() {
-		return // 队列已删除：不再重试
-	}
-	thumbUploadMu.Lock()
-	thumbUploadAttempts[p]++
-	if thumbUploadAttempts[p] < thumbUploadMaxAttempts {
-		thumbUploadQueue = append(thumbUploadQueue, p)
-		thumbUploadMu.Unlock()
-		return
-	}
-	thumbUploadMu.Unlock()
-	thumbUploadFailNow(p, msg)
+	return queued, running
 }
 
 // ThumbUploadRetry POST /api/admin/thumb/upload_retry
 // 将上传失败清单重新加入上传队列（失败超过自动重试次数后由用户手动触发）
 func ThumbUploadRetry(c *gin.Context) {
 	thumbUploadMu.Lock()
-	thumbUploadStopped.Store(false)
-	fails := append([]thumbUploadFailItem(nil), thumbUploadFails...)
-	thumbUploadFails = nil
-	// 回退失败计数并重置这些路径的最终状态/尝试次数，允许重新计
-	thumbUploadFailed -= len(fails)
+	paths := make([]string, 0, len(thumbUploadFails))
+	for p := range thumbUploadFails {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	thumbUploadFailed -= len(paths)
 	if thumbUploadFailed < 0 {
 		thumbUploadFailed = 0
 	}
-	for _, f := range fails {
-		thumbUploadQueue = append(thumbUploadQueue, f.Path)
+	for _, p := range paths {
+		delete(thumbUploadFails, p)
+		delete(thumbUploadSeen, p)
 	}
-	thumbUploadTotal += len(fails)
-	for _, f := range fails {
-		delete(thumbUploadStatus, f.Path)
-		delete(thumbUploadAttempts, f.Path)
-	}
-	needStart := !thumbUploadActive
 	thumbUploadMu.Unlock()
-	if needStart {
-		go thumbUploadWorker()
-	}
-	common.SuccessResp(c, gin.H{"retried": len(fails), "total": thumbUploadTotal})
+	added, total := thumbUploadEnqueueInternal(paths, false)
+	common.SuccessResp(c, gin.H{"retried": added, "total": total})
 }
 
 // ThumbUploadPause POST /api/admin/thumb/upload/pause
 // 暂停上传队列：worker 停止处理（保留队列），可恢复。
 func ThumbUploadPause(c *gin.Context) {
 	thumbUploadPaused.Store(true)
+	thumbUploadManagerGet().Pause()
 	common.SuccessResp(c, gin.H{"paused": true})
 }
 
@@ -1816,25 +1867,32 @@ func ThumbUploadPause(c *gin.Context) {
 // 恢复上传队列。
 func ThumbUploadResume(c *gin.Context) {
 	thumbUploadPaused.Store(false)
+	thumbUploadManagerGet().Start()
 	common.SuccessResp(c, gin.H{"paused": false})
 }
 
 // ThumbUploadClear POST /api/admin/thumb/upload/clear
 // 删除上传队列：清空队列并取消进行中批次（相当于停止上传），重置本轮计数。
 func ThumbUploadClear(c *gin.Context) {
-	thumbUploadStopped.Store(true)
+	thumbUploadEpoch.Add(1)
+	thumbUploadManagerMu.Lock()
+	old := thumbUploadManager
+	dropped := 0
+	if old != nil {
+		queued, _ := thumbUploadStateCounts(old.GetAll())
+		dropped = queued
+		old.Pause()
+		old.CancelAll()
+	}
+	thumbUploadManager = newThumbUploadManager(!thumbUploadPaused.Load())
+	thumbUploadManagerMu.Unlock()
 	thumbUploadMu.Lock()
-	dropped := len(thumbUploadQueue)
-	thumbUploadQueue = nil
-	thumbUploadActive = false
-	thumbUploadTotal = 0
-	thumbUploadDone = 0
-	thumbUploadFailed = 0
-	thumbUploadExists = 0
-	thumbUploadFails = nil
-	thumbUploadAttempts = map[string]int{}
-	thumbUploadStatus = map[string]string{}
+	thumbUploadResetRoundLocked()
 	thumbUploadMu.Unlock()
+	thumbUploadThrottleMu.Lock()
+	thumbUploadThrottleStart = time.Time{}
+	thumbUploadThrottleCount = 0
+	thumbUploadThrottleMu.Unlock()
 	common.SuccessResp(c, gin.H{"dropped": dropped})
 }
 

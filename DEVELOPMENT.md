@@ -102,7 +102,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 
 ### 4.3 核心子系统的"心智模型"
 - **缩略图**（`mediathumb.go` + `thumbadmin.go`）：
-  - 队列：`prewarmCh`（cap 2048）+ `thumb_concurrency` 个 worker，`prewarmDone`（sync.Map）去重；队列满时不创建无限延迟协程。
+  - 队列：生成与上传都由 `github.com/OpenListTeam/tache` 管理。生成 manager 使用 `thumb_concurrency` 个 worker、保留 2048 任务安全上限和 `prewarmDone` 去重；上传 manager 单 worker、每个文件独立 task、最多 3 次尝试并带 5s 重试退避/50 次每 5s 速率窗口。暂停/恢复直接 Pause/Start manager，清空通过取消旧 manager 并原子替换新 manager，避免手写 channel/worker 状态机。
   - 生成：`generateVideoThumb` → 本地片段抽帧 / 远程 Range 抽帧；同一路径通过 `singleflight` 去重。
   - 读取：严格校验 `206 Content-Range`，所有响应按请求长度限制；HTTP Client/Transport 按静态代理复用。
   - ffmpeg/ffprobe：直接使用驱动 `Link.URL` 和 `Link.Header`，不使用外部 Host 拼接 `/d`。
