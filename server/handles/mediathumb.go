@@ -1138,33 +1138,35 @@ func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset
 	return n, nil
 }
 
+func extractVideoFrameLocalAt(ctx context.Context, localPath, ss string) ([]byte, error) {
+	srcBuf := bytes.NewBuffer(nil)
+	var stderr thumbLimitedBuffer
+	kwargs := ffmpeg.KwArgs{"noaccurate_seek": ""}
+	if ss != "" {
+		kwargs["ss"] = ss
+	}
+	stream := ffmpeg.Input(localPath, kwargs).
+		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
+		GlobalArgs("-loglevel", "error").Silent(true).
+		WithOutput(srcBuf, &stderr)
+	setStreamContext(stream, ctx)
+	if err := stream.Run(); err != nil {
+		return nil, err
+	}
+	if srcBuf.Len() == 0 {
+		return nil, fmt.Errorf("empty output")
+	}
+	return srcBuf.Bytes(), nil
+}
+
 // extractVideoFrame 从本地视频文件抽帧（-ss 3 失败回退 0s）
 func extractVideoFrame(ctx context.Context, localPath string) ([]byte, error) {
-	extract := func(ss string) ([]byte, error) {
-		srcBuf := bytes.NewBuffer(nil)
-		kwargs := ffmpeg.KwArgs{"noaccurate_seek": ""}
-		if ss != "" {
-			kwargs["ss"] = ss
-		}
-		stream := ffmpeg.Input(localPath, kwargs).
-			Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
-			GlobalArgs("-loglevel", "error").Silent(true).
-			WithOutput(srcBuf, os.Stdout)
-		setStreamContext(stream, ctx)
-		if err := stream.Run(); err != nil {
-			return nil, err
-		}
-		if srcBuf.Len() == 0 {
-			return nil, fmt.Errorf("empty output")
-		}
-		return srcBuf.Bytes(), nil
-	}
 	var last []byte
 	var lastErr error
 	// 依次尝试多个取帧点：跳过空白帧（片头黑屏/纯色转场等），
 	// 避免抽到单帧空白被误判"生成结果为空白图"。
 	for _, ss := range []string{"3", "", "10", "30", "60"} {
-		data, err := extract(ss)
+		data, err := extractVideoFrameLocalAt(ctx, localPath, ss)
 		if err != nil {
 			lastErr = err
 			continue

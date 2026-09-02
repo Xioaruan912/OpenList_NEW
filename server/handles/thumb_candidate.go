@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	stdpath "path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,7 @@ const (
 	thumbCandidateCacheMax    = 64
 	thumbCandidateFrameGap    = 350 * time.Millisecond
 	thumbCandidate115FrameGap = 2 * time.Second
+	thumbCandidate115HeadSize = 32 * 1024 * 1024
 )
 
 var (
@@ -166,6 +168,53 @@ func thumbCandidate115Mount(rawPath string) string {
 	return info.MountPath
 }
 
+// thumbCandidate115HeadFrames makes one bounded initial Range read and performs the 3x3 seeks on
+// the local fragment. 115 frequently allows the head bytes while rejecting later deep Range seeks;
+// doing the dense early candidates locally both reduces vendor requests and gives the user a much
+// better chance of receiving a useful grid. If the MP4 has moov-at-tail or the head is otherwise
+// not independently decodable, the caller simply falls back to the existing remote seek path.
+func thumbCandidate115HeadFrames(ctx context.Context, rawPath string, link *model.Link, size int64, proxy string) ([]thumbCandidateFrame, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	limit := int64(thumbCandidate115HeadSize)
+	if size < limit {
+		limit = size
+	}
+	tmpFile, err := newThumbTempPath(thumbKindVideo, rawPath, ".candidate-head.mp4")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmpFile)
+	if _, err := downloadRange(ctx, link, tmpFile, 0, limit, proxy); err != nil {
+		return nil, err
+	}
+
+	positions := []string{"2", "3", "4", "5", "6", "7", "8", "9", "10"}
+	frames := make([]thumbCandidateFrame, 0, len(positions))
+	consecutiveDecodeErrors := 0
+	for i, seconds := range positions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		data, err := extractVideoFrameLocalAt(ctx, tmpFile, seconds)
+		if err != nil {
+			consecutiveDecodeErrors++
+			if consecutiveDecodeErrors >= 3 {
+				break
+			}
+			continue
+		}
+		consecutiveDecodeErrors = 0
+		png, err := encodeThumb(data)
+		if err != nil || isBlankThumb(png) {
+			continue
+		}
+		frames = append(frames, thumbCandidateFrame{index: i + 1, at: seconds, png: png})
+	}
+	return frames, nil
+}
+
 func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, 150*time.Second)
 	defer cancel()
@@ -207,97 +256,143 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 	}
 	defer link.Close()
 	thumbRememberObject(thumbKindVideo, rawPath, obj)
-	remoteURL, remoteHeader, remoteProxy, sourceCleanup, err := thumbFFmpegSource(
-		ctx, rawPath, link, obj.GetSize(), thumbProxyForPath(rawPath),
-	)
-	if err != nil {
-		return err
-	}
-	defer sourceCleanup()
-
-	var positions []string
-	if obj.GetSize() > thumbProbeMinSize {
-		if duration := probeVideoDuration(ctx, rawPath); duration > 0 {
-			for i := 1; i <= videoContactSheetColumns*videoContactSheetRows; i++ {
-				positions = append(positions, fmt.Sprintf("%.1f", duration*float64(i)/10.0))
-			}
-		}
-	}
-	if len(positions) == 0 {
-		positions = []string{"3", "10", "30", "60", "120", "300", "600", "1800", "3600"}
-	}
 	job.mu.Lock()
 	job.State = "running"
-	job.Total = len(positions)
+	job.Total = videoContactSheetColumns * videoContactSheetRows
 	job.mu.Unlock()
 
-	framesAtPosition := make([][]byte, len(positions))
-	frames := make([]thumbCandidateFrame, 0, len(positions))
+	framesAtPosition := make([][]byte, videoContactSheetColumns*videoContactSheetRows)
+	frames := make([]thumbCandidateFrame, 0, len(framesAtPosition))
 	recommendedIndex := 0
 	bestScore := 0.0
 	riskBlocked, truncated := false, false
-	softRetryUsed := false
-	for i, seconds := range positions {
-		if err := ctx.Err(); err != nil {
-			return err
+	storeFrame := func(frame thumbCandidateFrame) {
+		if frame.index < 1 || frame.index > len(framesAtPosition) || len(frame.png) == 0 {
+			return
 		}
-		if i > 0 {
-			timer := time.NewTimer(frameGap)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
+		idx := frame.index - 1
+		if framesAtPosition[idx] != nil {
+			return
 		}
-		if blocked, _ := isStorageBlocked(rawPath); blocked {
-			riskBlocked, truncated = true, true
-			break
-		}
-		data, frameErr := extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
-		// One soft 403 retry per candidate job is enough to recover a transient CDN denial without
-		// turning a user-triggered 3x3 into an aggressive retry loop against 115.
-		if frameErr != nil && isThumbRemoteDeniedError(frameErr) && !softRetryUsed {
-			softRetryUsed = true
-			timer := time.NewTimer(time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-			data, frameErr = extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
-		}
-		job.mu.Lock()
-		job.Done = i + 1
-		job.mu.Unlock()
-		if frameErr != nil {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if storageMount != "" && isThumbCandidateRiskError(frameErr) {
-				truncated = true
-				riskBlocked = true
-				driver115pkg.MarkStorageError(storageMount, frameErr)
-				break
-			}
-			// Codec/seek/soft-403 failures are frame-local. Keep scanning the remaining positions so a
-			// single bad offset cannot collapse the whole 3x3 to one image.
-			log.Debugf("thumb candidate frame skipped path=%s at=%ss: %v", rawPath, seconds, frameErr)
-			continue
-		}
-		png, encodeErr := encodeThumb(data)
-		if encodeErr != nil || isBlankThumb(png) {
-			continue
-		}
-		framesAtPosition[i] = png
-		score := scoreVideoThumb(png)
-		frames = append(frames, thumbCandidateFrame{index: i + 1, at: seconds, png: png})
+		framesAtPosition[idx] = frame.png
+		frames = append(frames, frame)
+		score := scoreVideoThumb(frame.png)
 		if recommendedIndex == 0 || score > bestScore {
-			recommendedIndex, bestScore = i+1, score
+			recommendedIndex, bestScore = frame.index, score
 		}
 	}
 
+	// 115 first tries one bounded head read. Soft 403 here only disables this optimization; it does
+	// not block the mount and the remote per-slot fallback still runs below.
+	if storageMount != "" {
+		localFrames, localErr := thumbCandidate115HeadFrames(ctx, rawPath, link, obj.GetSize(), thumbProxyForPath(rawPath))
+		if localErr != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if isThumbCandidateRiskError(localErr) {
+				riskBlocked, truncated = true, true
+				driver115pkg.MarkStorageError(storageMount, localErr)
+			}
+		} else {
+			for _, frame := range localFrames {
+				storeFrame(frame)
+			}
+		}
+	}
+
+	var positions []string
+	if !riskBlocked && len(frames) < len(framesAtPosition) {
+		if obj.GetSize() > thumbProbeMinSize {
+			if duration := probeVideoDuration(ctx, rawPath); duration > 0 {
+				for i := 1; i <= videoContactSheetColumns*videoContactSheetRows; i++ {
+					positions = append(positions, fmt.Sprintf("%.1f", duration*float64(i)/10.0))
+				}
+			}
+		}
+		if len(positions) == 0 {
+			positions = []string{"3", "10", "30", "60", "120", "300", "600", "1800", "3600"}
+		}
+	}
+
+	softRetryUsed := false
+	if !riskBlocked && len(frames) < len(framesAtPosition) {
+		remoteURL, remoteHeader, remoteProxy, sourceCleanup, sourceErr := thumbFFmpegSource(
+			ctx, rawPath, link, obj.GetSize(), thumbProxyForPath(rawPath),
+		)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		defer sourceCleanup()
+
+		for i, seconds := range positions {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if framesAtPosition[i] != nil {
+				job.mu.Lock()
+				job.Done = i + 1
+				job.mu.Unlock()
+				continue
+			}
+			if i > 0 {
+				timer := time.NewTimer(frameGap)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+			}
+			if blocked, _ := isStorageBlocked(rawPath); blocked {
+				riskBlocked, truncated = true, true
+				break
+			}
+			data, frameErr := extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
+			// One soft 403 retry per candidate job is enough to recover a transient CDN denial without
+			// turning a user-triggered 3x3 into an aggressive retry loop against 115.
+			if frameErr != nil && isThumbRemoteDeniedError(frameErr) && !softRetryUsed {
+				softRetryUsed = true
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+				data, frameErr = extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
+			}
+			job.mu.Lock()
+			job.Done = i + 1
+			job.mu.Unlock()
+			if frameErr != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if storageMount != "" && isThumbCandidateRiskError(frameErr) {
+					truncated = true
+					riskBlocked = true
+					driver115pkg.MarkStorageError(storageMount, frameErr)
+					break
+				}
+				// Codec/seek/soft-403 failures are frame-local. Keep scanning the remaining positions so a
+				// single bad offset cannot collapse the whole 3x3 to one image.
+				log.Debugf("thumb candidate frame skipped path=%s at=%ss: %v", rawPath, seconds, frameErr)
+				continue
+			}
+			png, encodeErr := encodeThumb(data)
+			if encodeErr != nil || isBlankThumb(png) {
+				continue
+			}
+			storeFrame(thumbCandidateFrame{index: i + 1, at: seconds, png: png})
+		}
+	} else if len(frames) == len(framesAtPosition) {
+		job.mu.Lock()
+		job.Done = len(framesAtPosition)
+		job.mu.Unlock()
+	}
+
+	sort.Slice(frames, func(i, j int) bool { return frames[i].index < frames[j].index })
 	var sheet []byte
 	if len(frames) > 0 {
 		sheet, err = buildVideoContactSheet(framesAtPosition)
