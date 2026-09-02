@@ -11,7 +11,6 @@ import {
   BsCloudUploadFill,
   BsSearch,
   BsBucket,
-  BsHddNetwork,
   BsArrowLeftRight,
   BsImages,
   BsBoxArrowUpRight,
@@ -91,7 +90,10 @@ export const side_menu_items: SideMenuItem[] = [
       },
       {
         title: "manage.sidemenu.ftp",
-        icon: BsHddNetwork,
+        // Reuse a stable icon that is already part of this bundle. An older
+        // cached manage chunk referenced a removed icon import and caused the
+        // whole manage menu to fail at runtime.
+        icon: BsBucket,
         to: "/@manage/settings/ftp",
         component: () => <CommonSettings group={Group.FTP} />,
       },

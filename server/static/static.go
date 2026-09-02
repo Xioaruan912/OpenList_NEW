@@ -215,6 +215,13 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 			c.Status(405)
 			return
 		}
+		// The HTML shell contains the hashed asset names for the current frontend
+		// build. Never let browsers heuristically cache it: otherwise an old shell
+		// can keep loading a months-long cached JS chunk even after the server has
+		// deployed a fixed bundle.
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
 		c.Header("Content-Type", "text/html")
 		c.Status(200)
 		if strings.HasPrefix(c.Request.URL.Path, "/@manage") {
