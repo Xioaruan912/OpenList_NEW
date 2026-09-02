@@ -107,7 +107,8 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
   - 读取：严格校验 `206 Content-Range`，所有响应按请求长度限制；HTTP Client/Transport 按静态代理复用。
   - ffmpeg/ffprobe：直接使用驱动 `Link.URL` 和 `Link.Header`，不使用外部 Host 拼接 `/d`。
   - 空白检测 `isBlankThumb`（纯色图当失败，不缓存）。
-  - 索引：`data/thumb_cache/index.jsonl`；`thumbRecord`/`readThumbIndex`/`writeThumbIndex`。
+  - 元数据：数据库 `thumbnail_records` 保存已生成/已上传/排除状态、对象指纹、缓存键与远程文件名；旧 `index.jsonl` / `cloud.jsonl` / `excluded.jsonl` 首次启动自动导入并改名为 `.migrated*` 备份。
+  - 缓存键：新对象使用内容指纹（storage + object ID/path + size + mtime + hash）而不是路径 MD5；升级前的旧缓存保留原键直到对象内容发生变化，避免升级时全量重建。同路径替换会自动失效旧 PNG、云端状态、失败标记、候选帧、moov 与时长缓存。
   - 风控：`isStorageBlocked`（115 health 5 分钟窗口）。
 - **静态出站代理**：默认直连；需要时只读取 `conf.Conf.ProxyAddress`。不要在运行中修改 115 的共享 Resty Client；多出口负载均衡应由外部基础设施完成。
 - **115 登录**（`driver115.go` + `drivers/115/qrcode.go`）：二维码 → 轮询 → 写 Cookie → 文件夹选择器。

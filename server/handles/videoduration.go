@@ -51,6 +51,13 @@ func clearVideoDurationProbe(rawPath string) {
 	videoDurMu.Unlock()
 }
 
+func videoDurationCacheKey(rawPath string) string {
+	if fingerprint := thumbKnownFingerprint(thumbKindVideo, rawPath); validThumbFingerprint(fingerprint) {
+		return fingerprint
+	}
+	return rawPath
+}
+
 func cacheVideoDurationResult(rawPath string, duration float64, ok bool) {
 	videoDurMu.Lock()
 	defer videoDurMu.Unlock()
@@ -71,24 +78,25 @@ func probeVideoDuration(ctx context.Context, rawPath string) float64 {
 	if _, err := ffprobeBin(); err != nil {
 		return 0
 	}
+	cacheKey := videoDurationCacheKey(rawPath)
 	videoDurMu.Lock()
-	if e, ok := videoDurCache[rawPath]; ok {
+	if e, ok := videoDurCache[cacheKey]; ok {
 		if time.Since(e.at) < videoDurCacheTTL {
 			videoDurMu.Unlock()
 			return e.dur
 		}
 	}
-	if videoDurProbe[rawPath] {
+	if videoDurProbe[cacheKey] {
 		videoDurMu.Unlock()
 		return 0
 	}
-	videoDurProbe[rawPath] = true
+	videoDurProbe[cacheKey] = true
 	videoDurMu.Unlock()
 
 	select {
 	case videoDurSem <- struct{}{}:
 	case <-ctx.Done():
-		clearVideoDurationProbe(rawPath)
+		clearVideoDurationProbe(cacheKey)
 		return 0
 	}
 	defer func() { <-videoDurSem }()
@@ -101,7 +109,7 @@ func probeVideoDuration(ctx context.Context, rawPath string) float64 {
 		if link != nil {
 			_ = link.Close()
 		}
-		cacheVideoDurationResult(rawPath, 0, false)
+		cacheVideoDurationResult(cacheKey, 0, false)
 		return 0
 	}
 	defer link.Close()
@@ -118,15 +126,15 @@ func probeVideoDuration(ctx context.Context, rawPath string) float64 {
 	cmd := exec.CommandContext(cmdCtx, videoDurPath, args...)
 	out, err := cmd.Output()
 	if err != nil {
-		cacheVideoDurationResult(rawPath, 0, false)
+		cacheVideoDurationResult(cacheKey, 0, false)
 		return 0
 	}
 	dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 	if parseErr != nil || dur <= 0 {
-		cacheVideoDurationResult(rawPath, 0, false)
+		cacheVideoDurationResult(cacheKey, 0, false)
 		return 0
 	}
-	cacheVideoDurationResult(rawPath, dur, true)
+	cacheVideoDurationResult(cacheKey, dur, true)
 	return dur
 }
 
@@ -135,9 +143,10 @@ func videoDuration(ctx context.Context, rawPath string) float64 {
 	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
 		rawPath = "/" + rawPath
 	}
+	cacheKey := videoDurationCacheKey(rawPath)
 	videoDurMu.Lock()
-	e, ok := videoDurCache[rawPath]
-	probing := videoDurProbe[rawPath]
+	e, ok := videoDurCache[cacheKey]
+	probing := videoDurProbe[cacheKey]
 	videoDurMu.Unlock()
 	if ok && time.Since(e.at) < videoDurCacheTTL {
 		return e.dur

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
@@ -81,7 +83,11 @@ var (
 )
 
 func generateThumbOnce(kind, rawPath string, generate func() ([]byte, error)) ([]byte, error) {
-	value, err, _ := thumbGenerateGroup.Do(kind+"\x00"+rawPath, func() (interface{}, error) {
+	key := kind + "\x00" + rawPath
+	if fingerprint := thumbKnownFingerprint(kind, rawPath); validThumbFingerprint(fingerprint) {
+		key += "\x00" + fingerprint
+	}
+	value, err, _ := thumbGenerateGroup.Do(key, func() (interface{}, error) {
 		return generate()
 	})
 	if err != nil {
@@ -400,7 +406,179 @@ func thumbHash(rawPath string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func thumbPathKey(kind, rawPath string) string {
+	h := sha256.Sum256([]byte(kind + "\x00" + rawPath))
+	return hex.EncodeToString(h[:])
+}
+
+const thumbFingerprintVersion = "thumb-v1"
+
+// thumbObjectFingerprint identifies the current object version without using the display path as
+// the primary cache identity. Driver object ID/hash/size/mtime make a same-path replacement produce
+// a different key; the path is only a last-resort fallback for drivers without an object identity.
+func thumbObjectFingerprint(rawPath string, obj model.Obj) string {
+	storageID := uint(0)
+	mountPath := ""
+	driverName := ""
+	if storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{}); err == nil && storage.GetStorage() != nil {
+		storageID = storage.GetStorage().ID
+		mountPath = storage.GetStorage().MountPath
+		driverName = storage.GetStorage().Driver
+	}
+	objectID := obj.GetID()
+	if objectID == "" {
+		objectID = obj.GetPath()
+	}
+	if objectID == "" {
+		objectID = rawPath
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%s\x00%d\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s",
+		thumbFingerprintVersion,
+		storageID,
+		mountPath,
+		driverName,
+		objectID,
+		obj.GetSize(),
+		obj.ModTime().UTC().UnixNano(),
+		obj.GetHash().String(),
+	)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func thumbRecordIdentity(kind, rawPath, fingerprint string, obj model.Obj) model.ThumbnailRecord {
+	return model.ThumbnailRecord{
+		PathKey:     thumbPathKey(kind, rawPath),
+		Kind:        kind,
+		Path:        rawPath,
+		Fingerprint: fingerprint,
+		ObjectID:    obj.GetID(),
+		Size:        obj.GetSize(),
+		Modified:    obj.ModTime().UTC().UnixNano(),
+	}
+}
+
+func thumbRemoteNameForFingerprint(rawPath, fingerprint string) string {
+	base := stdpath.Base(rawPath)
+	name := strings.TrimSuffix(base, stdpath.Ext(base))
+	name = sanitize115Name(name)
+	suffix := fingerprint
+	if len(suffix) > 12 {
+		suffix = suffix[:12]
+	}
+	return name + "_" + suffix + ".png"
+}
+
+// thumbRememberObject persists the current object fingerprint. If the object behind the same path
+// changed, the old local/cloud state is invalidated so stale thumbnails can never be served as the
+// current file's thumbnail.
+func thumbRememberObject(kind, rawPath string, obj model.Obj) string {
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	fingerprint := thumbObjectFingerprint(rawPath, obj)
+	if db.GetDb() == nil {
+		return fingerprint
+	}
+	// Import legacy path-based metadata before creating any fingerprint record. Otherwise the
+	// first directory listing after upgrade could create a new cache key before the old index is
+	// adopted, causing an unnecessary regeneration storm.
+	if !thumbEnsureDBMigration() {
+		return fingerprint
+	}
+	record := thumbRecordIdentity(kind, rawPath, fingerprint, obj)
+	current, currentErr := db.GetThumbnailRecord(record.PathKey)
+	if currentErr == nil {
+		record.CacheKey = current.CacheKey
+		record.RemoteName = current.RemoteName
+		// First observation after JSONL migration: adopt the fingerprint but keep the legacy
+		// cache/remote names. This avoids a one-time regeneration storm. Future content changes
+		// switch both keys to the content fingerprint and invalidate stale state.
+		if current.Fingerprint != "" && current.Fingerprint != fingerprint {
+			record.CacheKey = fingerprint
+			record.RemoteName = thumbRemoteNameForFingerprint(rawPath, fingerprint)
+		}
+	} else {
+		record.CacheKey = fingerprint
+		record.RemoteName = thumbRemoteNameForFingerprint(rawPath, fingerprint)
+	}
+	changed, err := db.UpsertThumbnailIdentity(&record)
+	if err != nil {
+		log.Debugf("thumb fingerprint persist failed %s: %v", rawPath, err)
+		return fingerprint
+	}
+	if changed {
+		_ = db.SetThumbnailIndexed(record, false)
+		_ = db.SetThumbnailCloud(record, false)
+		prewarmDone.Delete(rawPath)
+		remoteThumbMissClear(rawPath)
+		remoteThumbCacheDelete(rawPath)
+		thumbCandidateCacheDelete(rawPath)
+		_ = os.Remove(thumbFailPath(kind, rawPath))
+		log.Infof("thumb fingerprint changed, invalidate stale cache: %s", rawPath)
+	}
+	return fingerprint
+}
+
+func thumbKnownFingerprint(kind, rawPath string) string {
+	if db.GetDb() == nil || !thumbEnsureDBMigration() {
+		return ""
+	}
+	record, err := db.GetThumbnailRecord(thumbPathKey(kind, rawPath))
+	if err != nil {
+		return ""
+	}
+	return record.Fingerprint
+}
+
+func thumbMoveRecord(kind, oldPath, newPath string) {
+	if !thumbEnsureDBMigration() || oldPath == "" || newPath == "" || oldPath == newPath {
+		return
+	}
+	moved, err := db.MoveThumbnailRecord(
+		kind,
+		thumbPathKey(kind, oldPath),
+		thumbPathKey(kind, newPath),
+		newPath,
+	)
+	if err != nil {
+		log.Warnf("thumb DB path migration failed %s -> %s: %v", oldPath, newPath, err)
+		return
+	}
+	if moved {
+		thumbCloudMu.Lock()
+		thumbCloudSet = nil
+		thumbCloudMu.Unlock()
+	}
+}
+
+func validThumbFingerprint(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validThumbCacheKey(value string) bool {
+	if len(value) != md5.Size*2 && len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
 func thumbCachePath(kind, rawPath string) string {
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		if record, err := db.GetThumbnailRecord(thumbPathKey(kind, rawPath)); err == nil {
+			if validThumbCacheKey(record.CacheKey) {
+				return filepath.Join(thumbDir(), fmt.Sprintf("%s-%s.png", kind, strings.ToLower(record.CacheKey)))
+			}
+			if validThumbFingerprint(record.Fingerprint) {
+				return filepath.Join(thumbDir(), fmt.Sprintf("%s-%s.png", kind, strings.ToLower(record.Fingerprint)))
+			}
+		}
+	}
 	return filepath.Join(thumbDir(), fmt.Sprintf("%s-%s.png", kind, thumbHash(rawPath)))
 }
 
@@ -976,6 +1154,8 @@ func encodeThumb(mjpeg []byte) ([]byte, error) {
 // 缩略图路径索引：生成成功时记录路径，供管理页按目录统计已有缩略图
 var (
 	thumbIndexMu sync.Mutex
+	thumbDBMu    sync.Mutex
+	thumbDBReady bool
 )
 
 const thumbIndexFile = "index.jsonl"
@@ -984,11 +1164,147 @@ func thumbIndexPath() string {
 	return filepath.Join(thumbDir(), thumbIndexFile)
 }
 
-// thumbRecord 记录一条缩略图成功记录（append，含路径）
+func readLegacyThumbJSONL(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var m struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
+			if _, ok := seen[m.Path]; ok {
+				continue
+			}
+			seen[m.Path] = struct{}{}
+			paths = append(paths, m.Path)
+		}
+	}
+	return paths
+}
+
+func readLegacyThumbLines(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var paths []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		paths = append(paths, line)
+	}
+	return paths
+}
+
+func archiveLegacyThumbMetadata(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	backup := path + ".migrated"
+	if _, err := os.Stat(backup); err == nil {
+		backup = fmt.Sprintf("%s.migrated-%d", path, time.Now().UnixNano())
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(path, backup)
+}
+
+// thumbEnsureDBMigration lazily imports the legacy JSONL indexes into the database.
+// Existing path-MD5 cache/remote names are retained as compatibility keys. The first time an
+// object fingerprint later changes, the record switches to fingerprint-based keys.
+func thumbEnsureDBMigration() bool {
+	if db.GetDb() == nil {
+		return false
+	}
+	thumbDBMu.Lock()
+	defer thumbDBMu.Unlock()
+	if thumbDBReady {
+		return true
+	}
+	for _, p := range readLegacyThumbJSONL(thumbIndexPath()) {
+		record := model.ThumbnailRecord{
+			PathKey:  thumbPathKey(thumbKindVideo, p),
+			Kind:     thumbKindVideo,
+			Path:     p,
+			CacheKey: thumbHash(p),
+		}
+		if err := db.SetThumbnailIndexed(record, true); err != nil {
+			log.Warnf("thumb DB migration index failed: %v", err)
+			return false
+		}
+	}
+	for _, p := range readLegacyThumbJSONL(thumbCloudIndexPath()) {
+		record := model.ThumbnailRecord{
+			PathKey:    thumbPathKey(thumbKindVideo, p),
+			Kind:       thumbKindVideo,
+			Path:       p,
+			CacheKey:   thumbHash(p),
+			RemoteName: legacyRemoteThumbName(p),
+		}
+		if err := db.SetThumbnailCloud(record, true); err != nil {
+			log.Warnf("thumb DB migration cloud index failed: %v", err)
+			return false
+		}
+	}
+	for _, p := range readLegacyThumbLines(filepath.Join(thumbDir(), "excluded.jsonl")) {
+		record := model.ThumbnailRecord{
+			PathKey: thumbPathKey(thumbKindVideo, p),
+			Kind:    thumbKindVideo,
+			Path:    p,
+		}
+		if err := db.SetThumbnailExcluded(record, true); err != nil {
+			log.Warnf("thumb DB migration excluded index failed: %v", err)
+			return false
+		}
+	}
+	// Keep a filesystem backup for rollback, but stop using JSONL as the primary index.
+	for _, p := range []string{thumbIndexPath(), thumbCloudIndexPath(), filepath.Join(thumbDir(), "excluded.jsonl")} {
+		if err := archiveLegacyThumbMetadata(p); err != nil {
+			log.Warnf("thumb DB migration backup failed for %s: %v", p, err)
+			return false
+		}
+	}
+	thumbDBReady = true
+	return true
+}
+
+// thumbRecord records a successful video thumbnail in the database.
 func thumbRecord(rawPath string) {
 	if rawPath == "" {
 		return
 	}
+	if thumbEnsureDBMigration() {
+		record := model.ThumbnailRecord{
+			PathKey: thumbPathKey(thumbKindVideo, rawPath),
+			Kind:    thumbKindVideo,
+			Path:    rawPath,
+		}
+		if err := db.SetThumbnailIndexed(record, true); err == nil {
+			thumbAggMu.Lock()
+			thumbAggAt = time.Time{}
+			thumbAggMu.Unlock()
+			return
+		}
+	}
+	// DB unavailable during very early startup/tests: preserve the legacy append fallback.
 	line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
 		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
 	thumbIndexMu.Lock()
@@ -1016,52 +1332,32 @@ func thumbRecord(rawPath string) {
 
 // thumbRewriteIndex 重写索引：只保留仍有效（本地缓存存在或已上传到网盘）的条目
 func thumbRewriteIndex() {
-	thumbIndexMu.Lock()
-	defer thumbIndexMu.Unlock()
 	lines := readThumbIndex()
 	cloud := readThumbCloudIndex()
-	var b strings.Builder
+	var keep []string
 	for _, p := range lines {
-		h := thumbHash(p)
-		if _, err := os.Stat(filepath.Join(thumbDir(), "video-"+h+".png")); err == nil {
-			b.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+		if _, err := os.Stat(thumbCachePath(thumbKindVideo, p)); err == nil {
+			keep = append(keep, p)
 		} else if cloud[p] {
 			// 本地已删除（上传到网盘后），网盘仍持有缩略图：保留索引
-			b.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+			keep = append(keep, p)
 		}
 	}
-	_ = writeFileAtomic(thumbIndexPath(), []byte(b.String()), 0o666)
+	_ = writeThumbIndex(keep)
 }
 
-// readThumbIndex 读取索引中的路径列表（去重，保留先后顺序）
+// readThumbIndex reads the database index; JSONL is only a migration fallback.
 func readThumbIndex() []string {
-	data, err := os.ReadFile(thumbIndexPath())
-	if err != nil {
-		return nil
-	}
-	var paths []string
-	seen := map[string]struct{}{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var m struct {
-			Path string `json:"path"`
-		}
-		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
-			if _, ok := seen[m.Path]; ok {
-				continue
-			}
-			seen[m.Path] = struct{}{}
-			paths = append(paths, m.Path)
+	if thumbEnsureDBMigration() {
+		if paths, err := db.ListIndexedThumbnailPaths(thumbKindVideo); err == nil {
+			return paths
 		}
 	}
-	return paths
+	return readLegacyThumbJSONL(thumbIndexPath())
 }
 
-// ---------- 网盘缩略图索引（cloud.jsonl）----------
-// 记录已成功上传到网盘 _thumbnails 的路径；用于统计"网盘+本地"并集与索引重写时保留网盘条目。
+// ---------- 网盘缩略图状态 ----------
+// 数据库记录已成功上传到网盘 _thumbnails 的路径；cloud.jsonl 仅作为旧版本迁移输入/回退。
 
 var (
 	thumbCloudMu  sync.Mutex
@@ -1079,25 +1375,49 @@ func thumbCloudRecord(rawPath string) {
 	if rawPath == "" {
 		return
 	}
-	thumbCloudMu.Lock()
-	if thumbCloudSet == nil {
-		thumbCloudSet = readThumbCloudIndex()
+	recorded := false
+	if thumbEnsureDBMigration() {
+		record := model.ThumbnailRecord{
+			PathKey:    thumbPathKey(thumbKindVideo, rawPath),
+			Kind:       thumbKindVideo,
+			Path:       rawPath,
+			RemoteName: remoteThumbName(rawPath),
+		}
+		if err := db.SetThumbnailCloud(record, true); err == nil {
+			thumbCloudMu.Lock()
+			if thumbCloudSet == nil {
+				thumbCloudSet = map[string]bool{}
+			}
+			if thumbCloudSet[rawPath] {
+				thumbCloudMu.Unlock()
+				return
+			}
+			thumbCloudSet[rawPath] = true
+			thumbCloudMu.Unlock()
+			recorded = true
+		}
 	}
-	if thumbCloudSet[rawPath] {
+	if !recorded {
+		thumbCloudMu.Lock()
+		if thumbCloudSet == nil {
+			thumbCloudSet = readThumbCloudIndex()
+		}
+		if thumbCloudSet[rawPath] {
+			thumbCloudMu.Unlock()
+			return
+		}
+		thumbCloudSet[rawPath] = true
+		line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
+			strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
+		f, err := os.OpenFile(thumbCloudIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+		if err != nil {
+			thumbCloudMu.Unlock()
+			return
+		}
+		_, _ = f.WriteString(line)
+		_ = f.Close()
 		thumbCloudMu.Unlock()
-		return
 	}
-	thumbCloudSet[rawPath] = true
-	line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
-		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
-	f, err := os.OpenFile(thumbCloudIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
-	if err != nil {
-		thumbCloudMu.Unlock()
-		return
-	}
-	_, _ = f.WriteString(line)
-	_ = f.Close()
-	thumbCloudMu.Unlock()
 
 	// 网盘上传成功：增量更新网盘计数，顶部统计立即可见（无需等 10 分钟网络重算）。
 	// 仅当网盘计数已计算过才递增，避免从未计算时从 0 起跳导致与真实值漂移；
@@ -1118,21 +1438,18 @@ func thumbCloudRecord(rawPath string) {
 
 // readThumbCloudIndex 读取网盘已上传缩略图的路径集合
 func readThumbCloudIndex() map[string]bool {
-	data, err := os.ReadFile(thumbCloudIndexPath())
-	if err != nil {
-		return map[string]bool{}
-	}
 	out := map[string]bool{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	if thumbEnsureDBMigration() {
+		if paths, err := db.ListCloudThumbnailPaths(thumbKindVideo); err == nil {
+			for _, p := range paths {
+				out[p] = true
+			}
+			return out
 		}
-		var m struct {
-			Path string `json:"path"`
-		}
-		if json.Unmarshal([]byte(line), &m) == nil && m.Path != "" {
-			out[m.Path] = true
+	}
+	for _, p := range readLegacyThumbJSONL(thumbCloudIndexPath()) {
+		if p != "" {
+			out[p] = true
 		}
 	}
 	return out
@@ -1149,8 +1466,8 @@ func thumbCloudCount() int {
 }
 
 // thumbCloudStats 统计网盘 _thumbnails 实际缩略图总数，以及"本地存在且网盘清单也有"的重叠数。
-// 以实际目录清单为准（loadRemoteThumbListing 带缓存），而非仅 cloud.jsonl 上传记录，
-// 覆盖此前上传/手动上传而未写入 cloud.jsonl 的文件。聚合结果缓存，避免高频轮询反复列目录。
+// 以实际目录清单为准（loadRemoteThumbListing 带缓存），而非仅数据库上传记录，
+// 覆盖此前上传/手动上传而未写入本地状态的文件。聚合结果缓存，避免高频轮询反复列目录。
 func thumbCloudStats(ctx context.Context) (cloudCount, overlap int) {
 	thumbCloudStatsMu.Lock()
 	if time.Since(thumbCloudStatsAt) < thumbCloudStatsTTL {
@@ -1269,8 +1586,13 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		serveThumbPlaceholder(c)
 		return
 	}
+	// Generation may have resolved the object identity for a direct request. Re-read the cache
+	// path so a newly established content fingerprint is used for the write.
+	cachePath = thumbCachePath(kind, rawPath)
 	_ = writeFileAtomic(cachePath, png, 0o666)
-	thumbRecord(rawPath)
+	if kind == thumbKindVideo {
+		thumbRecord(rawPath)
+	}
 	serveThumbPNG(c, png)
 }
 
@@ -1322,8 +1644,12 @@ const moovCacheTTL = 24 * time.Hour
 
 // moovAtTail 探测 moov 元数据是否位于文件尾部（下载末尾 64KB 查找 moov 标记）
 func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath string) (bool, error) {
+	cacheKey := rawPath
+	if fingerprint := thumbKnownFingerprint(thumbKindVideo, rawPath); validThumbFingerprint(fingerprint) {
+		cacheKey = fingerprint
+	}
 	moovCacheMu.Lock()
-	if e, ok := moovCache[rawPath]; ok && time.Since(e.at) < moovCacheTTL {
+	if e, ok := moovCache[cacheKey]; ok && time.Since(e.at) < moovCacheTTL {
 		moovCacheMu.Unlock()
 		return e.atTail, nil
 	}
@@ -1342,7 +1668,7 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath strin
 	}
 	atTail := bytes.Contains(data, []byte("moov"))
 	moovCacheMu.Lock()
-	moovCache[rawPath] = moovCacheEntry{atTail: atTail, at: time.Now()}
+	moovCache[cacheKey] = moovCacheEntry{atTail: atTail, at: time.Now()}
 	if len(moovCache) > 20000 {
 		for k, v := range moovCache {
 			if time.Since(v.at) > moovCacheTTL {
@@ -1384,6 +1710,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, useProxy bool)
 		return nil, err
 	}
 	defer link.Close()
+	thumbRememberObject(thumbKindVideo, rawPath, obj)
 	proxy := thumbProxyForPath(rawPath)
 	if !useProxy {
 		proxy = ""
@@ -1528,7 +1855,7 @@ func prewarmStart() {
 var autoUploadOnce sync.Once
 
 // autoUploadStart 启动自动上传循环（幂等）；开启后定期扫描本地未上传缩略图并入队。
-// 扫描只用本地缓存索引（index.jsonl + cloud.jsonl），不发 115 请求，防风控。
+// 扫描只用数据库中的本地/网盘缩略图状态，不发 115 请求，防风控。
 func autoUploadStart() {
 	autoUploadOnce.Do(func() {
 		go autoUploadWorker()
@@ -1740,6 +2067,7 @@ func processTask(task thumbPrewarmTask) {
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
+	cachePath = thumbCachePath(task.kind, task.rawPath)
 	// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
 	if addition := remoteThumbStore(task.rawPath); addition != nil {
 		uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1865,9 +2193,7 @@ func thumbDeleteReset(paths []string) {
 			continue
 		}
 		prewarmDone.Delete(p)
-		remoteThumbCacheMu.Lock()
-		delete(remoteThumbCache, p)
-		remoteThumbCacheMu.Unlock()
+		remoteThumbCacheDelete(p)
 		if d := stdpath.Dir(p); d != "" && d != "." {
 			dirs[d] = struct{}{}
 		}
@@ -1887,12 +2213,13 @@ func thumbStatsInvalidate() {
 	thumbAggMu.Unlock()
 }
 
-// thumbCloudRemove 从网盘索引(cloud.jsonl)移除指定路径（删除缩略图后同步，
+// thumbCloudRemove 从数据库网盘状态移除指定路径（删除缩略图后同步，
 // 避免自动上传/计数仍认为已上传）
 func thumbCloudRemove(paths []string) {
 	if len(paths) == 0 {
 		return
 	}
+	useDB := thumbEnsureDBMigration()
 	thumbCloudMu.Lock()
 	if thumbCloudSet == nil {
 		thumbCloudSet = readThumbCloudIndex()
@@ -1901,10 +2228,17 @@ func thumbCloudRemove(paths []string) {
 	for _, p := range paths {
 		if p != "" && thumbCloudSet[p] {
 			delete(thumbCloudSet, p)
+			if useDB {
+				_ = db.SetThumbnailCloud(model.ThumbnailRecord{
+					PathKey: thumbPathKey(thumbKindVideo, p),
+					Kind:    thumbKindVideo,
+					Path:    p,
+				}, false)
+			}
 			removed = true
 		}
 	}
-	if removed {
+	if removed && !useDB {
 		lines := make([]string, 0, len(thumbCloudSet))
 		for p := range thumbCloudSet {
 			lines = append(lines, fmt.Sprintf(`{"path":%s,"at":%q}`,
@@ -1958,7 +2292,9 @@ func prewarmDir(c *gin.Context, parent string, objs []model.Obj) {
 		if utils.GetFileType(obj.GetName()) != conf.VIDEO {
 			continue
 		}
-		prewarmEnqueue(thumbKindVideo, parent+"/"+obj.GetName())
+		rawPath := parent + "/" + obj.GetName()
+		thumbRememberObject(thumbKindVideo, rawPath, obj)
+		prewarmEnqueue(thumbKindVideo, rawPath)
 	}
 }
 
@@ -2034,12 +2370,26 @@ func sanitize115Name(name string) string {
 	return name
 }
 
-func remoteThumbName(rawPath string) string {
+func legacyRemoteThumbName(rawPath string) string {
 	h := md5.Sum([]byte(rawPath))
 	base := stdpath.Base(rawPath)
 	name := strings.TrimSuffix(base, stdpath.Ext(base))
 	name = sanitize115Name(name)
 	return name + "_" + hex.EncodeToString(h[:4]) + ".png"
+}
+
+func remoteThumbName(rawPath string) string {
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		if record, err := db.GetThumbnailRecord(thumbPathKey(thumbKindVideo, rawPath)); err == nil {
+			if record.RemoteName != "" {
+				return record.RemoteName
+			}
+			if validThumbFingerprint(record.Fingerprint) {
+				return thumbRemoteNameForFingerprint(rawPath, record.Fingerprint)
+			}
+		}
+	}
+	return legacyRemoteThumbName(rawPath)
 }
 
 // remoteThumbMiss 远程缩略图"不存在"的内存负缓存，避免每次请求都查询 115
@@ -2150,6 +2500,15 @@ func remoteThumbCacheGet(rawPath string) ([]byte, bool) {
 		return nil, false
 	}
 	return e.data, true
+}
+
+func remoteThumbCacheDelete(rawPath string) {
+	remoteThumbCacheMu.Lock()
+	defer remoteThumbCacheMu.Unlock()
+	if old, ok := remoteThumbCache[rawPath]; ok {
+		remoteThumbCacheSize -= len(old.data)
+		delete(remoteThumbCache, rawPath)
+	}
 }
 
 func remoteThumbCacheSet(rawPath string, data []byte) {
@@ -2333,6 +2692,7 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	}()
 	remoteThumbMissClear(rawPath)
 	remoteThumbCacheSet(rawPath, png)
+	diskPath = thumbCachePath(thumbKindVideo, rawPath)
 	_ = writeFileAtomic(diskPath, png, 0o666)
 	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
@@ -2353,6 +2713,7 @@ func AudioThumb(c *gin.Context) {
 			return nil, err
 		}
 		defer link.Close()
+		thumbRememberObject(thumbKindAudio, rawPath, obj)
 		size := obj.GetSize()
 		if size > maxSize {
 			return nil, errThumbTooLarge
@@ -2378,6 +2739,7 @@ func generateImageThumb(ctx context.Context, rawPath string) ([]byte, error) {
 		return nil, err
 	}
 	defer link.Close()
+	thumbRememberObject(thumbKindImage, rawPath, obj)
 	size := obj.GetSize()
 	if size > maxSize {
 		return nil, errThumbTooLarge
@@ -2399,6 +2761,9 @@ func generateCoverThumb(ctx context.Context, rawPath string) ([]byte, error) {
 	// 缩略图文件夹自身不作为封面候选
 	if stdpath.Base(rawPath) == thumbFolderNameForPath(rawPath) {
 		return nil, errThumbNoCover
+	}
+	if obj, err := fs.Get(ctx, rawPath, &fs.GetArgs{NoLog: true}); err == nil && obj.IsDir() {
+		thumbRememberObject(thumbKindCover, rawPath, obj)
 	}
 	maxSize := int64(setting.GetInt(conf.ThumbImageMaxSize, 20*1024*1024))
 	names := strings.Split(setting.GetStr(conf.ThumbCoverNames, "folder.jpg,cover.jpg,thumb.jpg,folder.png,cover.png,thumb.png"), ",")
@@ -2526,7 +2891,7 @@ func thumbCleanupOnceRun() {
 			}
 			continue
 		}
-		// index.jsonl/cloud.jsonl/excluded.jsonl and any future metadata are not cache artifacts.
+		// Legacy migration backups and any future metadata are not cache artifacts.
 		if !isThumbCacheArtifact(name) {
 			continue
 		}
@@ -2557,8 +2922,28 @@ func thumbCleanupOnceRun() {
 // thumbURL 构造指向缩略图接口的 URL
 func thumbURL(c *gin.Context, prefix, parent string, obj model.Obj) string {
 	fullPath := parent + "/" + obj.GetName()
+	kind := ""
+	switch prefix {
+	case "vt":
+		kind = thumbKindVideo
+	case "at":
+		kind = thumbKindAudio
+	case "it":
+		kind = thumbKindImage
+	case "ct":
+		kind = thumbKindCover
+	}
+	fingerprint := ""
+	if kind != "" {
+		fingerprint = thumbRememberObject(kind, fullPath, obj)
+	}
 	thumbURL := common.GetApiUrl(c) + "/" + prefix + utils.EncodePath(fullPath, true)
 	thumbURL += "?sign=" + sign.SignPath(fullPath)
+	if validThumbFingerprint(fingerprint) {
+		// Browser/CDN cache busting follows the content fingerprint even when the server is still
+		// serving a migrated legacy cache filename for the same object version.
+		thumbURL += "&v=" + fingerprint
+	}
 	return thumbURL
 }
 

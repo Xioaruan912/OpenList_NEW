@@ -276,3 +276,30 @@ func TestThumbCacheArtifactFilterProtectsMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestThumbObjectFingerprintTracksContentVersionNotDisplayPath(t *testing.T) {
+	modified := time.Unix(1_700_000_000, 0)
+	base := &model.Object{ID: "object-123", Path: "/driver/a.mp4", Name: "a.mp4", Size: 1024, Modified: modified}
+	fingerprint := thumbObjectFingerprint("/__fingerprint_test__/a.mp4", base)
+	if !validThumbFingerprint(fingerprint) {
+		t.Fatalf("invalid fingerprint %q", fingerprint)
+	}
+
+	moved := *base
+	moved.Name = "renamed.mp4"
+	if got := thumbObjectFingerprint("/__fingerprint_test__/renamed.mp4", &moved); got != fingerprint {
+		t.Fatalf("same object ID/version should survive a display-path rename: %s != %s", got, fingerprint)
+	}
+
+	replaced := *base
+	replaced.ID = "object-456"
+	if got := thumbObjectFingerprint("/__fingerprint_test__/a.mp4", &replaced); got == fingerprint {
+		t.Fatal("same-path replacement with a new object ID must change fingerprint")
+	}
+
+	modifiedAgain := *base
+	modifiedAgain.Modified = modified.Add(time.Second)
+	if got := thumbObjectFingerprint("/__fingerprint_test__/a.mp4", &modifiedAgain); got == fingerprint {
+		t.Fatal("same object ID with a new modification time must change fingerprint")
+	}
+}

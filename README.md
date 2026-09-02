@@ -180,10 +180,9 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 
 | 内容 | 路径 | 说明 |
 |---|---|---|
-| **数据库** | `data/data.db` | 管理员账号、存储配置（含 115 Cookie）、分享、任务、设置 |
+| **数据库** | `data/data.db` | 管理员账号、存储配置（含 115 Cookie）、分享、任务、设置，以及缩略图索引/网盘状态/排除状态/内容指纹 |
 | **缩略图缓存** | `data/thumb_cache/` | 生成的缩略图（可设置容量上限） |
-| **缩略图索引** | `data/thumb_cache/index.jsonl` | 已生成缩略图清单 |
-| **排除列表** | `data/thumb_cache/excluded.jsonl` | 手动排除的视频 |
+| **旧索引迁移备份** | `data/thumb_cache/*.migrated*` | 升级时从旧 JSONL 自动迁移到数据库后保留的回滚备份，可留存或人工清理 |
 | **运行配置** | `data/config.json` | 端口等 |
 
 ```bash

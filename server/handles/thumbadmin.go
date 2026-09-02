@@ -82,7 +82,9 @@ func ThumbGenerate(c *gin.Context) {
 				continue
 			}
 			if utils.GetFileType(obj.GetName()) == conf.VIDEO {
-				videos = append(videos, dir+"/"+obj.GetName())
+				rawPath := dir + "/" + obj.GetName()
+				thumbRememberObject(thumbKindVideo, rawPath, obj)
+				videos = append(videos, rawPath)
 			}
 		}
 		if len(videos) == 0 {
@@ -797,8 +799,9 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 			} else if utils.GetFileType(obj.GetName()) == conf.VIDEO {
 				cur.Videos++
 				rawPath := dir + "/" + obj.GetName()
+				thumbRememberObject(thumbKindVideo, rawPath, obj)
 				inCloud := names[remoteThumbName(rawPath)]
-				// 云清单拉取失败（风控/超时返回空）时，回退到 cloud.jsonl（已记录上传的），
+				// 云清单拉取失败（风控/超时返回空）时，回退到数据库中的已上传状态，
 				// 避免目录明明有缩略图却显示 0/缺 N
 				if len(names) == 0 && !inCloud {
 					inCloud = cloud[rawPath]
@@ -979,6 +982,7 @@ func ThumbDir(c *gin.Context) {
 			continue
 		}
 		rawPath := path + "/" + obj.GetName()
+		thumbRememberObject(thumbKindVideo, rawPath, obj)
 		if len(files) >= 1000 {
 			break
 		}
@@ -1003,23 +1007,38 @@ type ThumbExcludeReq struct {
 	Exclude bool     `json:"exclude"` // true=排除（不生成缩略图），false=恢复
 }
 
-// readThumbExcluded 读取被排除的视频路径集合
+// readThumbExcluded reads the durable exclusion set from the database.
 func readThumbExcluded() map[string]bool {
 	m := map[string]bool{}
-	data, err := os.ReadFile(filepath.Join(thumbDir(), "excluded.jsonl"))
-	if err != nil {
-		return m
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			m[line] = true
+	if thumbEnsureDBMigration() {
+		if paths, err := db.ListExcludedThumbnailPaths(thumbKindVideo); err == nil {
+			for _, p := range paths {
+				m[p] = true
+			}
+			return m
 		}
+	}
+	for _, p := range readLegacyThumbLines(filepath.Join(thumbDir(), "excluded.jsonl")) {
+		m[p] = true
 	}
 	return m
 }
 
 func writeThumbExcluded(paths []string) error {
+	if thumbEnsureDBMigration() {
+		records := make([]model.ThumbnailRecord, 0, len(paths))
+		for _, p := range paths {
+			if p == "" {
+				continue
+			}
+			records = append(records, model.ThumbnailRecord{
+				PathKey: thumbPathKey(thumbKindVideo, p),
+				Kind:    thumbKindVideo,
+				Path:    p,
+			})
+		}
+		return db.ReplaceExcludedThumbnailPaths(thumbKindVideo, records)
+	}
 	var sb strings.Builder
 	for _, p := range paths {
 		sb.WriteString(p)
@@ -1028,7 +1047,7 @@ func writeThumbExcluded(paths []string) error {
 	return writeFileAtomic(filepath.Join(thumbDir(), "excluded.jsonl"), []byte(sb.String()), 0o666)
 }
 
-// ThumbExclude 排除/恢复指定视频的缩略图生成（持久化到 excluded.jsonl）
+// ThumbExclude 排除/恢复指定视频的缩略图生成（持久化到数据库）
 func ThumbExclude(c *gin.Context) {
 	var req ThumbExcludeReq
 	if err := c.ShouldBind(&req); err != nil {
@@ -1149,7 +1168,7 @@ func ThumbClear(c *gin.Context) {
 }
 
 // ThumbClearAll POST /api/admin/thumb/clear_all
-// 清空全部缩略图缓存与索引（含未索引的孤儿缓存文件），保留排除列表 excluded.jsonl；
+// 清空全部缩略图缓存与索引（含未索引的孤儿缓存文件），保留数据库中的排除列表；
 // 纯本地操作，不依赖网盘，任何情况下都可执行
 func ThumbClearAll(c *gin.Context) {
 	dir := thumbDir()
@@ -1168,6 +1187,12 @@ func ThumbClearAll(c *gin.Context) {
 		}
 		if name == "index.jsonl" || name == "cloud.jsonl" {
 			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+	if thumbEnsureDBMigration() {
+		if err := db.ClearThumbnailIndexState(thumbKindVideo); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
 		}
 	}
 	thumbCloudMu.Lock()
@@ -1237,14 +1262,17 @@ func ThumbMigrate(c *gin.Context) {
 			newPath = newP + rel
 			for _, kind := range kinds {
 				oldC := thumbCachePath(kind, p)
+				thumbMoveRecord(kind, p, newPath)
 				newC := thumbCachePath(kind, newPath)
-				if _, err := os.Stat(oldC); err == nil {
-					if _, err := os.Stat(newC); err != nil {
-						if os.Rename(oldC, newC) == nil {
-							migrated++
+				if oldC != newC {
+					if _, err := os.Stat(oldC); err == nil {
+						if _, err := os.Stat(newC); err != nil {
+							if os.Rename(oldC, newC) == nil {
+								migrated++
+							}
+						} else {
+							_ = os.Remove(oldC)
 						}
-					} else {
-						_ = os.Remove(oldC)
 					}
 				}
 				oldF := thumbFailPath(kind, p)
@@ -1268,25 +1296,17 @@ func ThumbMigrate(c *gin.Context) {
 		return
 	}
 	// 同步迁移排除列表中的路径前缀
-	for _, file := range []string{"excluded.jsonl"} {
-		p := filepath.Join(thumbDir(), file)
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		var sb strings.Builder
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
+	excluded := readThumbExcluded()
+	if len(excluded) > 0 {
+		migratedExcluded := make([]string, 0, len(excluded))
+		for p := range excluded {
+			if strings.HasPrefix(p, oldP) {
+				p = newP + strings.TrimPrefix(p, oldP)
 			}
-			if strings.HasPrefix(line, oldP) {
-				line = newP + strings.TrimPrefix(line, oldP)
-			}
-			sb.WriteString(line)
-			sb.WriteString("\n")
+			migratedExcluded = append(migratedExcluded, p)
 		}
-		_ = writeFileAtomic(p, []byte(sb.String()), 0o666)
+		sort.Strings(migratedExcluded)
+		_ = writeThumbExcluded(migratedExcluded)
 	}
 	// 清空目录扫描缓存
 	thumbDirsMu.Lock()
@@ -1298,8 +1318,34 @@ func ThumbMigrate(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"migrated": migrated, "indexed": len(newLines)})
 }
 
-// writeThumbIndex 重写缩略图索引文件
+// writeThumbIndex replaces the durable video-thumbnail index in the database.
+// The JSONL writer remains only as a fallback when DB initialization is unavailable.
 func writeThumbIndex(paths []string) error {
+	if thumbEnsureDBMigration() {
+		records := make([]model.ThumbnailRecord, 0, len(paths))
+		for _, p := range paths {
+			if p == "" {
+				continue
+			}
+			record := model.ThumbnailRecord{
+				PathKey:  thumbPathKey(thumbKindVideo, p),
+				Kind:     thumbKindVideo,
+				Path:     p,
+				CacheKey: thumbHash(p),
+			}
+			if current, err := db.GetThumbnailRecord(record.PathKey); err == nil {
+				record.CacheKey = current.CacheKey
+				record.RemoteName = current.RemoteName
+				record.Fingerprint = current.Fingerprint
+				record.ObjectID = current.ObjectID
+				record.Size = current.Size
+				record.Modified = current.Modified
+				record.Cloud = current.Cloud
+			}
+			records = append(records, record)
+		}
+		return db.ReplaceIndexedThumbnailPaths(thumbKindVideo, records)
+	}
 	thumbIndexMu.Lock()
 	defer thumbIndexMu.Unlock()
 	var sb strings.Builder
@@ -1361,15 +1407,18 @@ func autoMigrateThumbIndex(realDirs map[string]bool) int {
 		moved := false
 		for _, kind := range kinds {
 			oldC := thumbCachePath(kind, p)
+			thumbMoveRecord(kind, p, newPath)
 			newC := thumbCachePath(kind, newPath)
-			if _, err := os.Stat(oldC); err == nil {
-				if _, err := os.Stat(newC); err != nil {
-					if os.Rename(oldC, newC) == nil {
-						migrated++
-						moved = true
+			if oldC != newC {
+				if _, err := os.Stat(oldC); err == nil {
+					if _, err := os.Stat(newC); err != nil {
+						if os.Rename(oldC, newC) == nil {
+							migrated++
+							moved = true
+						}
+					} else {
+						_ = os.Remove(oldC)
 					}
-				} else {
-					_ = os.Remove(oldC)
 				}
 			}
 			oldF := thumbFailPath(kind, p)
@@ -1874,6 +1923,9 @@ func ThumbView(c *gin.Context) {
 		common.ErrorStrResp(c, "invalid path", 400)
 		return
 	}
+	if obj, err := fs.Get(c.Request.Context(), path, &fs.GetArgs{NoLog: true}); err == nil && !obj.IsDir() {
+		thumbRememberObject(thumbKindVideo, path, obj)
+	}
 	serve := func(data []byte) {
 		c.Header("Cache-Control", "public, max-age=86400")
 		c.Data(200, "image/png", data)
@@ -1896,6 +1948,7 @@ func ThumbView(c *gin.Context) {
 		common.ErrorStrResp(c, "该视频无法生成缩略图（生成结果为空白图）", 422)
 		return
 	}
+	cachePath = thumbCachePath(thumbKindVideo, path)
 	_ = writeFileAtomic(cachePath, png, 0o666)
 	thumbRecord(path)
 	serve(png)
@@ -1953,6 +2006,12 @@ func thumbCandidateCacheGet(rawPath string) (thumbCandidateCacheEntry, bool) {
 		return thumbCandidateCacheEntry{}, false
 	}
 	return entry, true
+}
+
+func thumbCandidateCacheDelete(rawPath string) {
+	thumbCandidateCacheMu.Lock()
+	delete(thumbCandidateCache, rawPath)
+	thumbCandidateCacheMu.Unlock()
 }
 
 func thumbCandidateCacheSet(rawPath string, entry thumbCandidateCacheEntry) {
@@ -2096,6 +2155,7 @@ func ThumbCandidates(c *gin.Context) {
 		return
 	}
 	defer link.Close()
+	thumbRememberObject(thumbKindVideo, rawPath, obj)
 	remoteURL := link.URL
 	proxy := thumbProxyForPath(rawPath)
 
@@ -2215,6 +2275,9 @@ func ThumbApplyCandidate(c *gin.Context) {
 	if blocked, _ := isStorageBlocked(rawPath); blocked {
 		common.ErrorStrResp(c, "115 网盘正在风控保护中，暂时不要保存缩略图，请稍后再试", 429)
 		return
+	}
+	if obj, err := fs.Get(ctx, rawPath, &fs.GetArgs{NoLog: true}); err == nil && !obj.IsDir() {
+		thumbRememberObject(thumbKindVideo, rawPath, obj)
 	}
 	cachePath := thumbCachePath(thumbKindVideo, rawPath)
 	if err := writeFileAtomic(cachePath, png, 0o666); err != nil {

@@ -12,7 +12,7 @@
 - [x] 移除应用内代理节点池、健康探测、GOST 安装、流量统计和自动切换；保留静态 `proxy_address`
 
 ## 待处理
-- [ ] 将缩略图 JSONL 索引迁移到数据库，并使用内容指纹替代路径 MD5
+- [x] 将缩略图 JSONL 索引迁移到数据库，并使用内容指纹替代路径 MD5
 - [ ] 用 tache 任务管理器替换手写预热/上传队列
 - [ ] 增加内部回环 Range Gateway，统一不提供 URL 的 RangeReader 驱动与 ffmpeg 输入
 

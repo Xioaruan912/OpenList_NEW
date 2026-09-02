@@ -380,6 +380,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	thumb, _ := model.GetThumb(obj)
 	var duration float64
 	if !obj.IsDir() && utils.GetFileType(obj.GetName()) == conf.VIDEO {
+		thumbRememberObject(thumbKindVideo, reqPath, obj)
 		duration = videoDuration(c.Request.Context(), reqPath)
 	}
 	if obj.IsDir() {
