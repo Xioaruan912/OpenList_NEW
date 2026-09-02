@@ -149,7 +149,10 @@ func thumbCandidateResponse(rawPath string, entry thumbCandidateCacheEntry, cach
 	}
 }
 
-func isThumbCandidateRiskError(err error) bool { return isThumbRemoteRiskError(err) }
+// Candidate extraction only escalates an error to storage-wide risk for explicit hard-risk
+// signals. A single 403/forbidden/pmt on a deep Range is file/timepoint scoped on 115 and must not
+// stop the remaining 3x3 positions or poison the mount for five minutes.
+func isThumbCandidateRiskError(err error) bool { return isThumbRemoteHardRiskError(err) }
 
 func thumbCandidate115Mount(rawPath string) string {
 	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
@@ -233,6 +236,7 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 	recommendedIndex := 0
 	bestScore := 0.0
 	riskBlocked, truncated := false, false
+	softRetryUsed := false
 	for i, seconds := range positions {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -251,6 +255,19 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 			break
 		}
 		data, frameErr := extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
+		// One soft 403 retry per candidate job is enough to recover a transient CDN denial without
+		// turning a user-triggered 3x3 into an aggressive retry loop against 115.
+		if frameErr != nil && isThumbRemoteDeniedError(frameErr) && !softRetryUsed {
+			softRetryUsed = true
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			data, frameErr = extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, seconds)
+		}
 		job.mu.Lock()
 		job.Done = i + 1
 		job.mu.Unlock()
@@ -258,15 +275,16 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if storageMount == "" {
-				continue
-			}
-			truncated = true
-			if isThumbCandidateRiskError(frameErr) {
+			if storageMount != "" && isThumbCandidateRiskError(frameErr) {
+				truncated = true
 				riskBlocked = true
 				driver115pkg.MarkStorageError(storageMount, frameErr)
+				break
 			}
-			break
+			// Codec/seek/soft-403 failures are frame-local. Keep scanning the remaining positions so a
+			// single bad offset cannot collapse the whole 3x3 to one image.
+			log.Debugf("thumb candidate frame skipped path=%s at=%ss: %v", rawPath, seconds, frameErr)
+			continue
 		}
 		png, encodeErr := encodeThumb(data)
 		if encodeErr != nil || isBlankThumb(png) {

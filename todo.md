@@ -33,6 +33,7 @@
 - [x] 3×3 支持多任务排队（最多 16 个，单路执行）与显式取消；普通生成繁忙时等待资源，不再要求用户先暂停队列
 - [x] 前端拆为 `api.ts` + `types.ts` + `useCandidateController.ts` + 独立 UI components，`Thumb.tsx` 只负责页面编排
 - [x] 3×3 任务摘要接口不携带 base64 图片，控制面轮询保持轻量；完整图片仅在查看具体 job 时返回
+- [x] 3×3 将 115 单帧 `403/forbidden/pmt` 与全局硬风控拆分：单帧失败继续后续取帧，只有明确 405/429/blocked/服务器开小差才停止整组并标记 blocked
 - [x] Tree partial 状态使用 DB 已知计数作为下限，避免远端扫描超时时目录缓存数短暂跳低
 
 ## 本轮 Thumb 管理页 UI 调整

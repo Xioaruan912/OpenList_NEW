@@ -167,7 +167,16 @@ func TestThumbRemoteRiskClassification(t *testing.T) {
 		t.Fatal("sentinel risk error should be permanent")
 	}
 	if !isThumbRemoteRiskError(errors.New("HTTP 403 Forbidden")) {
-		t.Fatal("HTTP 403 should be classified as risk")
+		t.Fatal("HTTP 403 should remain a broad no-blind-retry error")
+	}
+	if isThumbRemoteHardRiskError(errors.New("HTTP 403 Forbidden")) {
+		t.Fatal("a single HTTP 403 must not be classified as storage-wide hard risk")
+	}
+	if !isThumbRemoteDeniedError(errors.New("HTTP 403 Forbidden")) {
+		t.Fatal("HTTP 403 should be classified as a soft frame denial")
+	}
+	if !isThumbRemoteHardRiskError(errors.New("HTTP 405 blocked")) {
+		t.Fatal("HTTP 405/blocked should be classified as storage-wide hard risk")
 	}
 	if isThumbRemoteRiskError(errors.New("exit status 1")) {
 		t.Fatal("generic ffmpeg failure should not be classified as risk")

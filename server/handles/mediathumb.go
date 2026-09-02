@@ -78,10 +78,11 @@ var (
 	thumbRemoteOrphanSeen      sync.Map // remote full path -> first observation time
 	thumbRemoteReconcileCursor atomic.Uint64
 
-	errThumbTooLarge   = errors.New("file too large for thumbnail")
-	errThumbNoCover    = errors.New("no cover art or cover file found")
-	errThumbBlank      = errors.New("blank thumbnail")
-	errThumbRemoteRisk = errors.New("remote frame extraction blocked")
+	errThumbTooLarge     = errors.New("file too large for thumbnail")
+	errThumbNoCover      = errors.New("no cover art or cover file found")
+	errThumbBlank        = errors.New("blank thumbnail")
+	errThumbRemoteDenied = errors.New("remote frame extraction denied")
+	errThumbRemoteRisk   = errors.New("remote frame extraction blocked")
 
 	thumbGenerateGroup singleflight.Group
 )
@@ -219,6 +220,9 @@ func isPermanentThumbError(err error) bool {
 	if errors.Is(err, errThumbRemoteRisk) {
 		return true
 	}
+	if errors.Is(err, errThumbRemoteDenied) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{"403", "405", "pmt", "forbidden", "access denied", "proxy authentication", "unable to extract any video frame"} {
 		if strings.Contains(msg, s) {
@@ -241,6 +245,8 @@ func thumbFailReason(err error) string {
 		return "无封面/无法抽帧"
 	case errors.Is(err, errThumbRemoteRisk):
 		return "115 风控拦截"
+	case errors.Is(err, errThumbRemoteDenied):
+		return "115 单次取帧被拒绝"
 	case strings.Contains(msg, "403") || strings.Contains(msg, "pmt") || strings.Contains(msg, "access denied"):
 		return "115 拦截访问（无法取帧）"
 	case strings.Contains(msg, "405"):
@@ -1213,9 +1219,9 @@ func (b *thumbLimitedBuffer) String() string {
 	return b.buf.String()
 }
 
-func isThumbRemoteRiskText(text string) bool {
+func isThumbRemoteHardRiskText(text string) bool {
 	lower := strings.ToLower(text)
-	for _, marker := range []string{"403", "405", "forbidden", "blocked", "pmt"} {
+	for _, marker := range []string{"405", "429", "blocked", "服务器开小差", "too many requests", "rate limit", "risk control"} {
 		if strings.Contains(lower, marker) {
 			return true
 		}
@@ -1223,8 +1229,33 @@ func isThumbRemoteRiskText(text string) bool {
 	return false
 }
 
+func isThumbRemoteDeniedText(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"403", "forbidden", "pmt", "access denied"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isThumbRemoteRiskText retains the broad "do not blindly retry this request" classification used
+// by the normal thumbnail pipeline. Candidate generation uses the stricter hard-risk classifier so
+// a single deep-Range 403 from 115 does not poison the whole storage health state.
+func isThumbRemoteRiskText(text string) bool {
+	return isThumbRemoteHardRiskText(text) || isThumbRemoteDeniedText(text)
+}
+
+func isThumbRemoteHardRiskError(err error) bool {
+	return err != nil && (errors.Is(err, errThumbRemoteRisk) || isThumbRemoteHardRiskText(err.Error()))
+}
+
+func isThumbRemoteDeniedError(err error) bool {
+	return err != nil && (errors.Is(err, errThumbRemoteDenied) || isThumbRemoteDeniedText(err.Error()))
+}
+
 func isThumbRemoteRiskError(err error) bool {
-	return err != nil && (errors.Is(err, errThumbRemoteRisk) || isThumbRemoteRiskText(err.Error()))
+	return err != nil && (isThumbRemoteHardRiskError(err) || isThumbRemoteDeniedError(err))
 }
 
 func ffmpegHTTPHeaders(header http.Header) string {
@@ -1272,9 +1303,15 @@ func extractVideoFrameAt(ctx context.Context, sourceURL string, header http.Head
 		WithOutput(srcBuf, &stderr)
 	setStreamContext(stream, ctx)
 	if err := stream.Run(); err != nil {
-		if isThumbRemoteRiskText(stderr.String()) || isThumbRemoteRiskText(err.Error()) {
-			// 不把远程 URL、签名或请求头带回上层，只返回固定风控错误。
+		stderrText := stderr.String()
+		if isThumbRemoteHardRiskText(stderrText) || isThumbRemoteHardRiskText(err.Error()) {
+			// 不把远程 URL、签名或请求头带回上层，只返回固定硬风控错误。
 			return nil, errThumbRemoteRisk
+		}
+		if isThumbRemoteDeniedText(stderrText) || isThumbRemoteDeniedText(err.Error()) {
+			// 115 的深偏移 Range 可能只拒绝当前时间点（常见为 403/pmt）。这不是全局风控，
+			// 上层候选任务可以跳过该帧继续尝试其它时间点。
+			return nil, errThumbRemoteDenied
 		}
 		return nil, err
 	}
@@ -1925,8 +1962,11 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath strin
 	proxy := thumbProxyForPath(rawPath)
 	data, err := downloadRangeBytes(ctx, link, size-tailLen, tailLen, proxy)
 	if err != nil {
-		if isThumbRemoteRiskError(err) {
+		if isThumbRemoteHardRiskError(err) {
 			return false, errThumbRemoteRisk
+		}
+		if isThumbRemoteDeniedError(err) {
+			return false, errThumbRemoteDenied
 		}
 		return false, nil
 	}
