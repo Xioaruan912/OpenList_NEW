@@ -27,6 +27,11 @@
         main_color: undefined,
       }
       window.__dynamic_base__ = window.OPENLIST_CONFIG.cdn || ""
+      // Compatibility for a previously shipped manage bundle that referenced
+      // this icon as a global after its import was removed. Keep this tiny
+      // no-op component so browsers with that stale cached chunk can recover
+      // on the next document load instead of crashing before the menu renders.
+      window.BsHddNetwork ??= () => null
     </script>
   </head>
   <body>
