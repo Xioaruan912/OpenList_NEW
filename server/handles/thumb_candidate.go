@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	stdpath "path"
 	"sort"
@@ -84,6 +85,7 @@ const (
 	thumbCandidateFrameGap    = 350 * time.Millisecond
 	thumbCandidate115FrameGap = 2 * time.Second
 	thumbCandidate115HeadSize = 32 * 1024 * 1024
+	thumbCandidate115TailSize = 8 * 1024 * 1024
 )
 
 var (
@@ -168,36 +170,34 @@ func thumbCandidate115Mount(rawPath string) string {
 	return info.MountPath
 }
 
-// thumbCandidate115HeadFrames makes one bounded initial Range read and performs the 3x3 seeks on
-// the local fragment. 115 frequently allows the head bytes while rejecting later deep Range seeks;
-// doing the dense early candidates locally both reduces vendor requests and gives the user a much
-// better chance of receiving a useful grid. If the MP4 has moov-at-tail or the head is otherwise
-// not independently decodable, the caller simply falls back to the existing remote seek path.
-func thumbCandidate115HeadFrames(ctx context.Context, rawPath string, link *model.Link, size int64, proxy string) ([]thumbCandidateFrame, error) {
-	if size <= 0 {
-		return nil, nil
-	}
-	limit := int64(thumbCandidate115HeadSize)
-	if size < limit {
-		limit = size
-	}
-	tmpFile, err := newThumbTempPath(thumbKindVideo, rawPath, ".candidate-head.mp4")
+func thumbCandidateWriteRange(ctx context.Context, link *model.Link, file *os.File, offset, limit int64, proxy string) error {
+	rc, err := openThumbRange(ctx, link, offset, limit, proxy, 90*time.Second)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer os.Remove(tmpFile)
-	if _, err := downloadRange(ctx, link, tmpFile, 0, limit, proxy); err != nil {
-		return nil, err
+	defer rc.Close()
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return err
 	}
+	n, err := io.Copy(file, io.LimitReader(rc, limit))
+	if err != nil {
+		return err
+	}
+	if n != limit {
+		return fmt.Errorf("short candidate range read: got %d bytes, want %d: %w", n, limit, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
 
+func thumbCandidateFramesFromLocal(ctx context.Context, localPath string) []thumbCandidateFrame {
 	positions := []string{"2", "3", "4", "5", "6", "7", "8", "9", "10"}
 	frames := make([]thumbCandidateFrame, 0, len(positions))
 	consecutiveDecodeErrors := 0
 	for i, seconds := range positions {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		if ctx.Err() != nil {
+			break
 		}
-		data, err := extractVideoFrameLocalAt(ctx, tmpFile, seconds)
+		data, err := extractVideoFrameLocalAt(ctx, localPath, seconds)
 		if err != nil {
 			consecutiveDecodeErrors++
 			if consecutiveDecodeErrors >= 3 {
@@ -212,6 +212,83 @@ func thumbCandidate115HeadFrames(ctx context.Context, rawPath string, link *mode
 		}
 		frames = append(frames, thumbCandidateFrame{index: i + 1, at: seconds, png: png})
 	}
+	return frames
+}
+
+func mergeThumbCandidateFrames(dst []thumbCandidateFrame, src []thumbCandidateFrame) []thumbCandidateFrame {
+	seen := make(map[int]bool, len(dst)+len(src))
+	for _, frame := range dst {
+		seen[frame.index] = true
+	}
+	for _, frame := range src {
+		if !seen[frame.index] {
+			dst = append(dst, frame)
+			seen[frame.index] = true
+		}
+	}
+	return dst
+}
+
+// thumbCandidate115HeadFrames builds a sparse local MP4 from bounded head/tail Range reads and
+// performs the dense 2~10s candidate seeks locally. Keeping the original logical file size means a
+// moov atom fetched from the tail still points at the original early-media offsets in the head;
+// the un-fetched middle remains sparse holes and is never needed for these early candidate frames.
+// This turns nine deep remote seeks into at most two bounded 115 Range reads plus local ffmpeg work.
+func thumbCandidate115HeadFrames(ctx context.Context, rawPath string, link *model.Link, size int64, proxy string) ([]thumbCandidateFrame, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	limit := int64(thumbCandidate115HeadSize)
+	if size < limit {
+		limit = size
+	}
+	tmpFile, err := newThumbTempPath(thumbKindVideo, rawPath, ".candidate-head.mp4")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmpFile)
+	file, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o666)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if err := thumbCandidateWriteRange(ctx, link, file, 0, limit, proxy); err != nil {
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		return nil, err
+	}
+	frames := thumbCandidateFramesFromLocal(ctx, tmpFile)
+	if len(frames) == videoContactSheetColumns*videoContactSheetRows || size <= limit {
+		return frames, nil
+	}
+
+	// The head did not decode fully. Preserve it, extend the file sparsely to the original logical
+	// size, then place a small tail window at its original byte offset so moov-at-tail files become
+	// seekable without downloading the middle of the video.
+	tailLimit := int64(thumbCandidate115TailSize)
+	if size-limit < tailLimit {
+		tailLimit = size - limit
+	}
+	if tailLimit <= 0 {
+		return frames, nil
+	}
+	if err := file.Truncate(size); err != nil {
+		return frames, nil
+	}
+	tailOffset := size - tailLimit
+	if err := thumbCandidateWriteRange(ctx, link, file, tailOffset, tailLimit, proxy); err != nil {
+		if isThumbRemoteHardRiskError(err) {
+			return frames, err
+		}
+		// Tail access is an optimization. A soft 403/pmt only means this file cannot use the sparse
+		// local path; preserve any head frames and let the remote missing-slot fallback continue.
+		return frames, nil
+	}
+	if err := file.Sync(); err != nil {
+		return frames, nil
+	}
+	frames = mergeThumbCandidateFrames(frames, thumbCandidateFramesFromLocal(ctx, tmpFile))
 	return frames, nil
 }
 
@@ -286,6 +363,9 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 	// not block the mount and the remote per-slot fallback still runs below.
 	if storageMount != "" {
 		localFrames, localErr := thumbCandidate115HeadFrames(ctx, rawPath, link, obj.GetSize(), thumbProxyForPath(rawPath))
+		for _, frame := range localFrames {
+			storeFrame(frame)
+		}
 		if localErr != nil {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -293,10 +373,6 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 			if isThumbCandidateRiskError(localErr) {
 				riskBlocked, truncated = true, true
 				driver115pkg.MarkStorageError(storageMount, localErr)
-			}
-		} else {
-			for _, frame := range localFrames {
-				storeFrame(frame)
 			}
 		}
 	}

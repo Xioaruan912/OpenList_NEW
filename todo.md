@@ -34,7 +34,7 @@
 - [x] 前端拆为 `api.ts` + `types.ts` + `useCandidateController.ts` + 独立 UI components，`Thumb.tsx` 只负责页面编排
 - [x] 3×3 任务摘要接口不携带 base64 图片，控制面轮询保持轻量；完整图片仅在查看具体 job 时返回
 - [x] 3×3 将 115 单帧 `403/forbidden/pmt` 与全局硬风控拆分：单帧失败继续后续取帧，只有明确 405/429/blocked/服务器开小差才停止整组并标记 blocked
-- [x] 115 3×3 优先单次下载最多 32MiB 头部片段并本地抽 9 帧，缺失槽位才回退远程 seek，降低 Range 风控并提升九宫格完整率
+- [x] 115 3×3 优先构造稀疏本地 MP4（头 32MiB + 必要时尾 8MiB 原偏移）并本地抽 9 帧，兼容 moov-at-tail；缺失槽位才回退远程 seek
 - [x] Tree partial 状态使用 DB 已知计数作为下限，避免远端扫描超时时目录缓存数短暂跳低
 
 ## 本轮 Thumb 管理页 UI 调整
