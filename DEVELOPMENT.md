@@ -101,7 +101,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 4. 按第 2 节"构建/部署/验证"部署并实测（含 Playwright）。
 
 ### 4.3 核心子系统的"心智模型"
-- **缩略图**（`mediathumb.go` + `thumbadmin.go`）：
+- **缩略图**：按数据面 / 任务面 / 控制面 / UI 四层维护。`mediathumb.go` 负责 ffmpeg、Range、缓存与内容身份等稳定数据面；`thumb_candidate.go` 是 3×3 候选数据面；`thumb_candidate_tasks.go` / `thumb_upload_tasks.go` 是任务面；`thumb_tree.go` 独立目录树 reconcile；`thumb_status.go` 负责低频统计与生成队列控制；`thumb_runtime.go` 提供高频轻量控制面；`thumbadmin.go` 只保留管理 CRUD、目录详情、排除/迁移和上传目标选择等编排。前端 `pages/manage/thumb/` 使用独立 API client、types、controller 与展示组件，`Thumb.tsx` 只做页面编排。
   - 队列：生成与上传都由 `github.com/OpenListTeam/tache` 管理，并通过原生 `task_items` 持久化；服务重启时 Running 自动恢复为 Pending，暂停/恢复直接 Pause/Start manager，清空会同步清除持久化数据，避免任务重启后复活。生成 manager 使用 `thumb_concurrency` 个 worker、保留 2048 任务安全上限和 `prewarmDone` 去重。
   - 上传限速：上传 manager 允许跨存储并行，但按 storage 独立限速/风控。115 默认单上传、10 次/5s；OneDrive 默认并发 2、40 次/5s；Local 默认并发 4。一个 115 挂载受限不会冻结其它存储上传。
   - 生成：`generateVideoThumb` → 本地片段抽帧 / 远程 Range 抽帧；同一路径通过 `singleflight` 去重。
@@ -115,7 +115,9 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
   - 失败重试：失败按 risk/auth/timeout/not_found/blank/range/media/policy/transient 分类并写入 `retry_after`；到期后自动允许重新入队，不再统一依赖 7 天 `.fail` TTL。
   - 状态轮询：`/api/admin/thumb/status` 不同步枚举远程 `_thumbnails` 目录；过期时先返回数据库/本地缓存已知统计，并在后台刷新远程真实计数，避免管理页 10s 轮询被 115 API 卡住。
   - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile。每个挂载有独立 30s 预算（整轮最多 2min），慢 115 不会饿死后续挂载；只有扫描完整的挂载才参与删除已确认不存在的旧路径记录。
-  - 候选九宫格：`/admin/thumb/candidates` 只创建后台 job；前端轮询 `/candidates/status` 显示 1/9~9/9 进度，可调用 `/candidates/cancel` 取消，不再用一个最长 150s 的 HTTP 请求撑住页面。
+  - 候选九宫格：`/admin/thumb/candidates` 只创建后台 job。最多 16 个活动任务、后台严格单路执行，并保留最多 32 个最近任务摘要/结果（30 分钟 TTL）；同一路径复用进行中任务。关闭预览弹窗或离开 Thumb 页面只会 detach UI，不会取消服务端任务；用户回来后可从“3×3 后台任务”继续看进度/结果，只有显式“取消任务”才 cancel。候选会等待普通生成任务让出资源，而不是要求用户先手动暂停生成队列。
+  - 控制面：`/api/admin/thumb/runtime` 每 2s 可安全轮询，只读取内存中的生成队列、上传队列、3×3 job、Tree reconcile 状态；不扫描磁盘、不访问网盘、不调用 ffmpeg。较重的缓存统计/metrics 仍由 `/status` 低频刷新，避免“为了显示进度反而制造 115 请求”。
+  - 前端结构：`thumb/api.ts` 集中路由；`types.ts` 定义契约；`useCandidateController.ts` 管理 3×3 生命周期；`components/` 内分别维护 Overview、Generation/Upload Queue、Candidate Task Center、Candidate Modal、Tree、Directory Detail、Failure Log、Stale Path Migration。新增 UI 不应重新堆回 `Thumb.tsx`。
   - 可观测性：Thumb 状态页显示缓存命中率、生成平均/P95、Range URL/RangeReader/Loopback Gateway 次数和按失败类别统计。
   - 风控：`isStorageBlocked`（115 health 5 分钟窗口）。
 - **静态出站代理**：默认直连；需要时只读取 `conf.Conf.ProxyAddress`。不要在运行中修改 115 的共享 Resty Client；多出口负载均衡应由外部基础设施完成。
