@@ -19,9 +19,7 @@
 | **115 扫码登录** | 添加存储页扫码登录 115，免手动抓 Cookie，支持多设备/多根挂载/可视化选文件夹 |
 | **视频缩略图** | ffmpeg 自动为视频生成缩略图；长视频生成 3×3 内容拼图；音频取专辑封面；图片/目录缩略图 |
 | **缩略图管理后台** | 目录树、批量生成/排除/清空、失败重试、**上传到网盘 `_thumbnails`**、**点击文件名查看缩略图**、**暂停/恢复/清空生成队列**，全部可视化 |
-| **多出口防风控代理** | 缩略图下载可走自建代理节点分散出口 IP；节点一键部署、**真实连通性健康检查**、自动风控切换 |
-| **全局代理策略** | 在「代理管理」页控制 115 访问侧出站代理（off/手动/auto）：**auto 检测到 115 风控时自动走健康节点，正常时直连** |
-| **代理节点健康检查** | 通过节点实测 访问目标站/下载/上传，失败节点标记【不可用】并从选择中排除 |
+| **安全媒体读取** | 严格校验 HTTP Range、限制读取字节、复用连接池，并让 ffmpeg/ffprobe 直接使用驱动 URL 与 Header |
 | **一键安装** | 根目录 `install.sh` 全新 VPS 一条命令部署（自动编译前后端 + systemd 托管） |
 
 ---
@@ -69,7 +67,6 @@ journalctl -u openlist --no-pager | grep -i password
 ├── server/          # 后端 HTTP 层（gin 路由与 handlers）
 ├── internal/        # 后端核心（配置、数据库、存储驱动、缩略图逻辑）
 ├── drivers/         # 网盘驱动（115 等）
-├── scripts/proxy/   # 代理节点一键部署脚本（proxy_deploy.sh / trafficd.py）
 ├── public/dist/     # 前端构建产物（go:embed 嵌入；源码见 frontend/，构建时生成）
 ├── main.go          # 入口
 └── install.sh       # VPS 一键安装
@@ -115,8 +112,7 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 
 | 前端路由 | 文件 | 说明 |
 |---|---|---|
-| `@manage/thumb` | `frontend/src/pages/manage/thumb/Thumb.tsx` | 缩略图管理（生成/目录树/代理选择） |
-| `@manage/proxy` | `frontend/src/pages/manage/proxy/Proxy.tsx` | 代理节点管理（增删改、安装命令、监控） |
+| `@manage/thumb` | `frontend/src/pages/manage/thumb/Thumb.tsx` | 缩略图管理（生成、目录树、候选画面） |
 | `@manage/storages` | `frontend/src/pages/manage/storages/Storages.tsx` | 存储管理（含 115 扫码登录、缩略图状态） |
 | `@manage` | `frontend/src/pages/manage/sidemenu_items.tsx` | 侧边栏菜单 |
 
@@ -135,36 +131,14 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 ### 2. 视频缩略图
 
 - 视频自动生成缩略图（网格视图直接显示画面）；**长视频（>90s）从 10%~90% 抽 9 帧合成 3×3 内容拼图**
-- 存储模式（`thumb_store`）：`local` 存服务器 `data/thumb_cache/`；`remote` 上传到网盘视频同级 `_thumbnails/` 文件夹（不占服务器磁盘）
+- 存储模式（`thumb_store`）：`local` 存服务器 `data/thumb_cache/`；`remote` 上传到网盘视频同级 `_thumbnails/`，服务器保留受 TTL/容量约束的热缓存
 - moov 在尾部的非快速启动视频自动回退 ffmpeg 远程 Range 抽帧
 - 缩略图管理后台提供目录树、批量生成/重建/排除/清空、失败重试、挂载迁移
 - 常见问题与调优见文末 FAQ
 
-### 3. 多出口防风控代理
+### 3. 静态出站代理
 
-115 网盘对单个出口 IP 的请求频率敏感，本功能让缩略图下载与 115 访问分散到多个自建代理节点，降低风控触发概率。
-
-**部署链路：节点配置 → 复制安装命令 → VPS 一键部署 → OpenList 监控 + 使用**
-
-1. 「代理管理」页**新增节点**（名称/协议 http 或 ss/地址/端口/密码；`ss` 节点按 SOCKS5 连接）
-2. 点节点上的「**安装命令**」按钮，复制生成的命令
-3. 在节点 VPS 上以 root 执行该命令，自动部署 `gost` 代理 + `trafficd` 流量探针（systemd 托管，重启自启）：
-   ```bash
-   curl -fsSL http://<OpenList地址>/api/proxy/install.sh | bash -s -- --type http --port 1080 --password 你的密码
-   ```
-   > 安装脚本由 OpenList 服务直接下发（`/api/proxy/install.sh`，免登录），不依赖 GitHub 可达性。
-4. 约 10 秒后节点显示「**探针在线**」，同时 OpenList 会**通过节点实测 访问目标站/下载/上传**做真实连通性检查：失败节点标红【不可用】并从自动选择中排除，连通恢复正常自动解除
-5. 「缩略图」页选择代理模式（控制**缩略图下载/抽帧**）：
-   - **关闭**：走存储代理 / 全局 `proxy_address`（默认）
-   - **自动切换**：自动选择最近最少使用的健康节点；节点连续失败 ≥3 次自动标记**风控**并切换，30 分钟后自动恢复
-   - **手动指定**：固定走指定节点，不可用时自动回退健康节点
-6. 「代理管理」页顶部的**全局代理策略**（控制 **115 访问侧**——列表/搜索/上传等驱动请求）：
-   - **关闭**：直连（默认）
-   - **自动（仅风控时走代理）**：检测到任一 115 挂载风控时自动切到健康节点，正常时直连（反应式，30s 轮询）
-   - **手动指定**：始终走指定节点
-   - `/d` 下载与在线播放保持 302 直连 CDN（快，不经过代理节点）
-
-> 流量统计口径：管理后台显示的累计/速率**只统计经该节点的缩略图下载流量**（OpenList 侧计数），非 VPS 整机流量。
+应用内代理节点池、健康探测和自动切换已经移除。默认直连；确有网络需求时可配置 OpenList 原有的全局 `proxy_address`。115 API、缩略图 Range 下载以及 ffmpeg/ffprobe 在任务期间使用同一个静态配置，运行中不会修改共享 HTTP Client。代理不会关闭账号级限流，也不会被当作 115 风控恢复手段。
 
 ---
 
@@ -199,22 +173,6 @@ pnpm dev        # Vite dev server，API 走 .env.development 指向的后端
 | `/api/admin/thumb/clear` | POST | 清空目录缩略图 |
 | `/api/admin/thumb/exclude` | POST | 排除/恢复视频 |
 | `/api/admin/thumb/migrate` | POST | 挂载路径迁移 |
-
-### 代理
-
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/api/proxy/install.sh` | GET | 下发部署脚本（免登录） |
-| `/api/admin/proxy/list` | GET | 节点列表 |
-| `/api/admin/proxy/create` `/update` `/delete` | POST | 节点增删改 |
-| `/api/admin/proxy/install` | GET | 生成一键安装命令 |
-| `/api/admin/proxy/traffic` | GET | 节点 + 流量统计 + 探针状态 + 连通性健康 |
-| `/api/admin/proxy/policy` | GET/POST | 全局代理策略（off/auto/manual + 节点） |
-| `/api/admin/proxy/recover` | POST | 解除风控 |
-| `/api/admin/proxy/enable` | POST | 启用/停用 |
-| `/api/admin/thumb/proxy` | GET/POST | 缩略图代理模式（off/auto/manual） |
-
----
 
 ## 数据备份与迁移
 
@@ -272,13 +230,8 @@ systemctl start openlist
 </details>
 
 <details>
-<summary><b>代理节点显示风控中 / 不可用？</b></summary>
-连续失败 ≥3 次会自动标记风控并切换健康节点，30 分钟后自动恢复；「不可用」表示节点真实连通性检查失败（如 gost 认证失败、超时），请检查节点密码与网络，连通恢复正常后自动解除。
-</details>
-
-<details>
 <summary><b>115 提示风控（405/WAF 拦截）？</b></summary>
-这是 115 对当前出口 IP 的风控。可在「代理管理」页开启「全局代理策略」为 auto，检测到风控后自动切换到代理节点访问，正常时恢复直连。
+停止批量生成或上传，等待冷却后再重试；同时降低 `limit_rate` 与 `thumb_concurrency`。若提示登录超时、`user not login` 或 `no auth`，应重新登录，而不是更换网络出口。
 </details>
 
 <details>

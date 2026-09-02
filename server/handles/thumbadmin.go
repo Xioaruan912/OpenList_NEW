@@ -23,7 +23,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
-	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
@@ -51,7 +50,6 @@ func ThumbGenerate(c *gin.Context) {
 		common.ErrorStrResp(c, "115 网盘风控中，缩略图需下载视频生成，请稍后再试（风控通常 10-30 分钟）", 429)
 		return
 	}
-	apiURL := common.GetApiUrl(c)
 	queued := 0
 	removed := 0
 	failedDirs := 0
@@ -113,7 +111,7 @@ func ThumbGenerate(c *gin.Context) {
 			}
 			// 本地与网盘都缺失的视频：清除 done 标记以便重新入队（含之前失败/中断的）
 			prewarmDone.Delete(rawPath)
-			prewarmEnqueue(thumbKindVideo, rawPath, apiURL)
+			prewarmEnqueue(thumbKindVideo, rawPath)
 			queued++
 		}
 	}
@@ -177,12 +175,12 @@ func ThumbStatus(c *gin.Context) {
 		thumbAggMu.Unlock()
 	}
 	status := gin.H{
-		"cache_dir":    thumbDir(),
-		"cached_files": cachedFiles,
-		"local_files":  localFiles,
-		"cloud_files":  cloudFiles,
-		"fail_markers": failCount,
-		"cache_size":   totalSize,
+		"cache_dir":       thumbDir(),
+		"cached_files":    cachedFiles,
+		"local_files":     localFiles,
+		"cloud_files":     cloudFiles,
+		"fail_markers":    failCount,
+		"cache_size":      totalSize,
 		"prewarm_enabled": setting.GetStr(conf.ThumbPrewarm, "true") == "true",
 		"queue_paused":    thumbQueuePaused.Load(),
 		"auto_upload":     setting.GetStr(conf.ThumbAutoUpload, "false") == "true",
@@ -373,6 +371,15 @@ func currentMountPaths() []string {
 	return mounts
 }
 
+func anyStorageBlocked() bool {
+	for _, mount := range currentMountPaths() {
+		if driver115pkg.IsStorageBlocked(mount) {
+			return true
+		}
+	}
+	return false
+}
+
 // pathBelongsToMounts 判断路径是否属于任一当前挂载路径
 func pathBelongsToMounts(p string, mounts []string) bool {
 	for _, m := range mounts {
@@ -416,7 +423,6 @@ func ThumbRetryFails(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	apiURL := common.GetApiUrl(c)
 	fails := listThumbFails()
 	retried := 0
 	cleared := 0
@@ -451,7 +457,7 @@ func ThumbRetryFails(c *gin.Context) {
 		}
 		_ = os.Remove(failFile)
 		cleared++
-		prewarmEnqueue(f.Kind, f.Path, apiURL)
+		prewarmEnqueue(f.Kind, f.Path)
 		retried++
 	}
 	common.SuccessResp(c, gin.H{"retried": retried, "cleared": cleared, "skipped": skipped})
@@ -882,28 +888,28 @@ func buildThumbTree(ctx context.Context) ([]*thumbTreeNode, string) {
 					break
 				}
 			}
-		if child == nil {
-			child = &thumbTreeNode{Path: path, Name: part, Cached: cnt, Local: localByDir[dir], Cloud: cloudByDir[dir]}
-			cur.Children = append(cur.Children, child)
+			if child == nil {
+				child = &thumbTreeNode{Path: path, Name: part, Cached: cnt, Local: localByDir[dir], Cloud: cloudByDir[dir]}
+				cur.Children = append(cur.Children, child)
+			}
+			cur = child
 		}
-		cur = child
 	}
-}
-// 汇总子树计数：Videos/Cached 改为含子目录的累计值，
-// 与"点击生成（递归）"处理的数量一致，避免"缺 N"与实际入队数对不上
-var sumSubtree func(n *thumbTreeNode) (vids, cached, local, cloud int)
-sumSubtree = func(n *thumbTreeNode) (int, int, int, int) {
-	v, c, l, cl := n.Videos, n.Cached, n.Local, n.Cloud
-	for _, ch := range n.Children {
-		cv, cc, cl2, ccl := sumSubtree(ch)
-		v += cv
-		c += cc
-		l += cl2
-		cl += ccl
+	// 汇总子树计数：Videos/Cached 改为含子目录的累计值，
+	// 与"点击生成（递归）"处理的数量一致，避免"缺 N"与实际入队数对不上
+	var sumSubtree func(n *thumbTreeNode) (vids, cached, local, cloud int)
+	sumSubtree = func(n *thumbTreeNode) (int, int, int, int) {
+		v, c, l, cl := n.Videos, n.Cached, n.Local, n.Cloud
+		for _, ch := range n.Children {
+			cv, cc, cl2, ccl := sumSubtree(ch)
+			v += cv
+			c += cc
+			l += cl2
+			cl += ccl
+		}
+		n.Videos, n.Cached, n.Local, n.Cloud = v, c, l, cl
+		return v, c, l, cl
 	}
-	n.Videos, n.Cached, n.Local, n.Cloud = v, c, l, cl
-	return v, c, l, cl
-}
 	for _, m := range root.Children {
 		sumSubtree(m)
 	}
@@ -1019,7 +1025,7 @@ func writeThumbExcluded(paths []string) error {
 		sb.WriteString(p)
 		sb.WriteString("\n")
 	}
-	return os.WriteFile(filepath.Join(thumbDir(), "excluded.jsonl"), []byte(sb.String()), 0o666)
+	return writeFileAtomic(filepath.Join(thumbDir(), "excluded.jsonl"), []byte(sb.String()), 0o666)
 }
 
 // ThumbExclude 排除/恢复指定视频的缩略图生成（持久化到 excluded.jsonl）
@@ -1139,7 +1145,7 @@ func ThumbClear(c *gin.Context) {
 		data []ThumbDirsEntry
 	}{}
 	thumbDirsMu.Unlock()
-		common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
+	common.SuccessResp(c, gin.H{"removed": removed, "path": path, "remote_skipped": remoteSkipped})
 }
 
 // ThumbClearAll POST /api/admin/thumb/clear_all
@@ -1280,7 +1286,7 @@ func ThumbMigrate(c *gin.Context) {
 			sb.WriteString(line)
 			sb.WriteString("\n")
 		}
-		_ = os.WriteFile(p, []byte(sb.String()), 0o666)
+		_ = writeFileAtomic(p, []byte(sb.String()), 0o666)
 	}
 	// 清空目录扫描缓存
 	thumbDirsMu.Lock()
@@ -1294,11 +1300,13 @@ func ThumbMigrate(c *gin.Context) {
 
 // writeThumbIndex 重写缩略图索引文件
 func writeThumbIndex(paths []string) error {
+	thumbIndexMu.Lock()
+	defer thumbIndexMu.Unlock()
 	var sb strings.Builder
 	for _, p := range paths {
 		sb.WriteString(`{"path":` + strconv.Quote(p) + `,"at":""}` + "\n")
 	}
-	return os.WriteFile(thumbIndexPath(), []byte(sb.String()), 0o666)
+	return writeFileAtomic(thumbIndexPath(), []byte(sb.String()), 0o666)
 }
 
 // thumbIndexMigrateMu 保护缩略图索引/缓存文件的迁移类操作（自动迁移与手动迁移）
@@ -1423,7 +1431,7 @@ type ThumbUploadReq struct {
 
 // ThumbUpload POST /api/admin/thumb/upload
 // 将指定目录下已生成的本地缩略图并行上传到该目录的缩略图文件夹（_thumbnails）。
-// 上传走 115 驱动客户端（自动使用"上传代理"，与缩略图下载代理分离）；与后台生成互不阻塞。
+// 上传走 115 驱动客户端；如配置静态 proxy_address，则与其它 115 请求使用同一静态出站配置。
 func ThumbUpload(c *gin.Context) {
 	var req ThumbUploadReq
 	if err := c.ShouldBind(&req); err != nil {
@@ -1451,7 +1459,7 @@ func ThumbUpload(c *gin.Context) {
 // ThumbUploadAll POST /api/admin/thumb/upload_all
 // 一键上传：把所有已有本地缩略图的视频加入上传队列（批量 50 / 间隔 5s / 去重）。
 func ThumbUploadAll(c *gin.Context) {
-	if globalAnyStorageBlocked() {
+	if anyStorageBlocked() {
 		common.ErrorStrResp(c, "115 网盘风控中，上传已暂停，请稍后再试", 429)
 		return
 	}
@@ -1531,18 +1539,18 @@ const (
 )
 
 var (
-	thumbUploadMu        sync.Mutex
-	thumbUploadQueue     []string
-	thumbUploadTotal     int // 本轮唯一路径总数（手动重试会累加）
-	thumbUploadDone      int
-	thumbUploadFailed    int
-	thumbUploadExists    int
-	thumbUploadActive    bool
-	thumbUploadFails     []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
-	thumbUploadAttempts  = map[string]int{}
-	thumbUploadStatus    = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
-	thumbUploadPaused    atomic.Bool           // 用户手动暂停上传队列（保留队列）
-	thumbUploadStopped   atomic.Bool           // 删除队列：取消进行中批次并清空队列
+	thumbUploadMu       sync.Mutex
+	thumbUploadQueue    []string
+	thumbUploadTotal    int // 本轮唯一路径总数（手动重试会累加）
+	thumbUploadDone     int
+	thumbUploadFailed   int
+	thumbUploadExists   int
+	thumbUploadActive   bool
+	thumbUploadFails    []thumbUploadFailItem // 超过自动重试次数的失败路径（供手动重试）
+	thumbUploadAttempts = map[string]int{}
+	thumbUploadStatus   = map[string]string{} // 本轮路径最终状态：done/exists/failed（去重计数）
+	thumbUploadPaused   atomic.Bool           // 用户手动暂停上传队列（保留队列）
+	thumbUploadStopped  atomic.Bool           // 删除队列：取消进行中批次并清空队列
 )
 
 // thumbUploadFailItem 上传失败记录（含原因）
@@ -1608,7 +1616,7 @@ func thumbUploadWorker() {
 		thumbUploadMu.Unlock()
 
 		// 暂停或 115 风控中：完全停手（保留队列），等待解除后再继续，避免继续打 115
-		if thumbUploadPaused.Load() || globalAnyStorageBlocked() {
+		if thumbUploadPaused.Load() || anyStorageBlocked() {
 			time.Sleep(thumbUploadPauseCheck)
 			continue
 		}
@@ -1858,7 +1866,7 @@ func ThumbDeleteFolder(c *gin.Context) {
 }
 
 // ThumbView GET /api/admin/thumb/view?path=
-// 返回指定视频的缩略图 PNG（优先读本地缓存；缺失时生成并缓存，走代理→直连回退）。
+// 返回指定视频的缩略图 PNG（优先读本地缓存；缺失时生成并缓存；静态代理异常出白图时回退直连）。
 // 供管理页"点击文件查看缩略图"使用，无需下载签名。
 func ThumbView(c *gin.Context) {
 	path := c.Query("path")
@@ -1877,7 +1885,9 @@ func ThumbView(c *gin.Context) {
 			return
 		}
 	}
-	png, err := generateVideoThumb(c.Request.Context(), path, common.GetApiUrl(c))
+	png, err := generateThumbOnce(thumbKindVideo, path, func() ([]byte, error) {
+		return generateVideoThumb(c.Request.Context(), path)
+	})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
@@ -1886,21 +1896,123 @@ func ThumbView(c *gin.Context) {
 		common.ErrorStrResp(c, "该视频无法生成缩略图（生成结果为空白图）", 422)
 		return
 	}
-	_ = os.WriteFile(cachePath, png, 0o666)
+	_ = writeFileAtomic(cachePath, png, 0o666)
 	thumbRecord(path)
 	serve(png)
 }
 
 // ThumbCandidatesReq POST /api/admin/thumb/candidates
 type ThumbCandidatesReq struct {
-	Path string `json:"path"`
+	Path    string `json:"path"`
+	Refresh bool   `json:"refresh"` // 跳过候选缓存，强制重新取帧
 }
 
 // ThumbCandidate 候选缩略图（base64 PNG）
 type ThumbCandidate struct {
 	Index int    `json:"index"`
-	At    string `json:"at"` // 取帧时间点（秒）
+	At    string `json:"at"`  // 取帧时间点（秒）
 	Png   string `json:"png"` // base64 PNG
+}
+
+type thumbCandidateFrame struct {
+	index int
+	at    string
+	png   []byte
+}
+
+type thumbCandidateCacheEntry struct {
+	at               time.Time
+	frames           []thumbCandidateFrame
+	sheet            []byte
+	recommendedIndex int
+	riskBlocked      bool
+	truncated        bool
+}
+
+const (
+	thumbCandidateCacheTTL    = 10 * time.Minute
+	thumbCandidateCacheMax    = 32
+	thumbCandidateFrameGap    = 350 * time.Millisecond
+	thumbCandidate115FrameGap = 2 * time.Second
+)
+
+var (
+	thumbCandidateCacheMu sync.Mutex
+	thumbCandidateCache   = make(map[string]thumbCandidateCacheEntry)
+)
+
+func thumbCandidateCacheGet(rawPath string) (thumbCandidateCacheEntry, bool) {
+	thumbCandidateCacheMu.Lock()
+	defer thumbCandidateCacheMu.Unlock()
+	entry, ok := thumbCandidateCache[rawPath]
+	if !ok {
+		return thumbCandidateCacheEntry{}, false
+	}
+	if time.Since(entry.at) >= thumbCandidateCacheTTL {
+		delete(thumbCandidateCache, rawPath)
+		return thumbCandidateCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func thumbCandidateCacheSet(rawPath string, entry thumbCandidateCacheEntry) {
+	thumbCandidateCacheMu.Lock()
+	defer thumbCandidateCacheMu.Unlock()
+	thumbCandidateCache[rawPath] = entry
+	for len(thumbCandidateCache) > thumbCandidateCacheMax {
+		oldestPath := ""
+		var oldestAt time.Time
+		for path, candidate := range thumbCandidateCache {
+			if oldestPath == "" || candidate.at.Before(oldestAt) {
+				oldestPath = path
+				oldestAt = candidate.at
+			}
+		}
+		if oldestPath == "" {
+			break
+		}
+		delete(thumbCandidateCache, oldestPath)
+	}
+}
+
+func thumbCandidateResponse(rawPath string, entry thumbCandidateCacheEntry, cached bool) gin.H {
+	candidates := make([]ThumbCandidate, 0, len(entry.frames))
+	for _, frame := range entry.frames {
+		candidates = append(candidates, ThumbCandidate{
+			Index: frame.index,
+			At:    frame.at,
+			Png:   base64.StdEncoding.EncodeToString(frame.png),
+		})
+	}
+	sheet := ""
+	if len(entry.sheet) > 0 {
+		sheet = base64.StdEncoding.EncodeToString(entry.sheet)
+	}
+	return gin.H{
+		"path":              rawPath,
+		"candidates":        candidates,
+		"sheet":             sheet,
+		"recommended_index": entry.recommendedIndex,
+		"cached":            cached,
+		"risk_blocked":      entry.riskBlocked,
+		"truncated":         entry.truncated,
+	}
+}
+
+func isThumbCandidateRiskError(err error) bool {
+	return isThumbRemoteRiskError(err)
+}
+
+func thumbCandidate115Mount(rawPath string) string {
+	storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
+	if err != nil || storage == nil || storage.GetStorage() == nil {
+		return ""
+	}
+	info := storage.GetStorage()
+	if info.Driver != "115 Cloud" && info.Driver != "115 Share" {
+		return ""
+	}
+	return info.MountPath
 }
 
 // ThumbCandidates POST /api/admin/thumb/candidates
@@ -1920,11 +2032,45 @@ func ThumbCandidates(c *gin.Context) {
 		common.ErrorStrResp(c, "invalid path", 400)
 		return
 	}
+
+	// 已生成的候选在短时间内复用，避免用户反复打开弹窗时重复访问 115。
+	if !req.Refresh {
+		if entry, ok := thumbCandidateCacheGet(rawPath); ok {
+			common.SuccessResp(c, thumbCandidateResponse(rawPath, entry, true))
+			return
+		}
+	}
 	if blocked, _ := isStorageBlocked(rawPath); blocked {
 		common.ErrorStrResp(c, "存储风控中，暂不能生成候选缩略图", 423)
 		return
 	}
-	if !thumbAcquire(false) {
+
+	// 候选生成严格单路，并且不与预热 worker 叠加。TryLock 失败时快速返回，
+	// 不让请求排队等待，也不让 115 在短时间内收到更多取帧请求。
+	select {
+	case thumbCandidateGate <- struct{}{}:
+	case <-c.Request.Context().Done():
+		return
+	default:
+		common.ErrorStrResp(c, "已有候选缩略图正在生成，请稍后再试", 429)
+		return
+	}
+	defer func() { <-thumbCandidateGate }()
+	thumbCandidateActive.Store(true)
+	if !thumbGenerationAdmission.TryLock() {
+		thumbCandidateActive.Store(false)
+		common.ErrorStrResp(c, "缩略图队列正在生成，请先暂停队列后再试", 409)
+		return
+	}
+	defer func() {
+		thumbCandidateActive.Store(false)
+		thumbGenerationAdmission.Unlock()
+	}()
+	if atomic.LoadInt32(&thumbActiveWorkers) > 0 {
+		common.ErrorStrResp(c, "缩略图队列正在生成，请先暂停队列后再试", 409)
+		return
+	}
+	if !thumbAcquire(c.Request.Context(), 2*time.Second) {
 		common.ErrorStrResp(c, "生成并发已满，请稍后再试", 429)
 		return
 	}
@@ -1932,45 +2078,113 @@ func ThumbCandidates(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 150*time.Second)
 	defer cancel()
+	storageMount := thumbCandidate115Mount(rawPath)
+	frameGap := thumbCandidateFrameGap
+	if storageMount != "" {
+		frameGap = thumbCandidate115FrameGap
+	}
 	link, obj, err := fs.Link(ctx, rawPath, model.LinkArgs{Header: thumbLinkHeader()})
 	if err != nil {
-		common.ErrorResp(c, err, 500)
+		if isThumbCandidateRiskError(err) {
+			if storageMount != "" {
+				driver115pkg.MarkStorageError(storageMount, err)
+			}
+			common.ErrorStrResp(c, "115 风控拦截，已暂停候选取帧", 423)
+		} else {
+			common.ErrorResp(c, err, 500)
+		}
 		return
 	}
 	defer link.Close()
-	remoteURL := common.GetApiUrl(c) + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
+	remoteURL := link.URL
+	proxy := thumbProxyForPath(rawPath)
+
 	var positions []string
 	if size := obj.GetSize(); size > thumbProbeMinSize {
-		if dur := probeVideoDuration(ctx, rawPath, common.GetApiUrl(c)); dur > 0 {
-			// 按时长 10%~90% 均匀取 9 帧
-			for i := 1; i <= 9; i++ {
+		if dur := probeVideoDuration(ctx, rawPath); dur > 0 {
+			// 按时长 10%~90% 均匀取 9 帧，避开片头片尾常见黑屏。
+			for i := 1; i <= videoContactSheetColumns*videoContactSheetRows; i++ {
 				positions = append(positions, fmt.Sprintf("%.1f", dur*float64(i)/10.0))
 			}
 		}
 	}
 	if len(positions) == 0 {
-		// 未知时长：固定时间点兜底
+		// 未知时长：固定时间点兜底。仍然串行，并在每帧前检查风控状态。
 		positions = []string{"3", "10", "30", "60", "120", "300", "600", "1800", "3600"}
 	}
-	var cands []ThumbCandidate
+
+	framesAtPosition := make([][]byte, len(positions))
+	frames := make([]thumbCandidateFrame, 0, len(positions))
+	recommendedIndex := 0
+	bestScore := 0.0
+	riskBlocked := false
+	truncated := false
 	for i, ss := range positions {
+		if i > 0 {
+			timer := time.NewTimer(frameGap)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				truncated = true
+				break
+			case <-timer.C:
+			}
+			if truncated {
+				break
+			}
+		}
 		if ctx.Err() != nil {
+			truncated = true
 			break
 		}
-		data, err := extractVideoFrameAt(ctx, remoteURL, link.Header, ss)
+		if blocked, _ := isStorageBlocked(rawPath); blocked {
+			riskBlocked = true
+			truncated = true
+			break
+		}
+		data, err := extractVideoFrameAt(ctx, remoteURL, link.Header, proxy, ss)
 		if err != nil {
-			continue
+			if storageMount == "" {
+				continue
+			}
+			truncated = true
+			if isThumbCandidateRiskError(err) {
+				riskBlocked = true
+				driver115pkg.MarkStorageError(storageMount, err)
+			}
+			break
 		}
 		png, err := encodeThumb(data)
 		if err != nil || isBlankThumb(png) {
 			continue
 		}
-		cands = append(cands, ThumbCandidate{Index: i + 1, At: ss, Png: base64.StdEncoding.EncodeToString(png)})
-		if len(cands) >= 9 {
-			break
+		framesAtPosition[i] = png
+		score := scoreVideoThumb(png)
+		frames = append(frames, thumbCandidateFrame{index: i + 1, at: ss, png: png})
+		if recommendedIndex == 0 || score > bestScore {
+			recommendedIndex = i + 1
+			bestScore = score
 		}
 	}
-	common.SuccessResp(c, gin.H{"path": rawPath, "candidates": cands})
+
+	var sheet []byte
+	if len(frames) > 0 {
+		sheet, err = buildVideoContactSheet(framesAtPosition)
+		if err != nil {
+			log.Warnf("thumb candidate contact sheet failed %s: %v", rawPath, err)
+			sheet = nil
+		}
+	}
+	entry := thumbCandidateCacheEntry{
+		at:               time.Now(),
+		frames:           frames,
+		sheet:            sheet,
+		recommendedIndex: recommendedIndex,
+		riskBlocked:      riskBlocked,
+		truncated:        truncated,
+	}
+	thumbCandidateCacheSet(rawPath, entry)
+	common.SuccessResp(c, thumbCandidateResponse(rawPath, entry, false))
 }
 
 // ThumbApplyCandidateReq POST /api/admin/thumb/apply_candidate
@@ -1998,8 +2212,12 @@ func ThumbApplyCandidate(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		common.ErrorStrResp(c, "115 网盘正在风控保护中，暂时不要保存缩略图，请稍后再试", 429)
+		return
+	}
 	cachePath := thumbCachePath(thumbKindVideo, rawPath)
-	if err := os.WriteFile(cachePath, png, 0o666); err != nil {
+	if err := writeFileAtomic(cachePath, png, 0o666); err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}

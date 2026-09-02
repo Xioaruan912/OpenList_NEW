@@ -144,7 +144,7 @@ const Logs = () => {
                   w="$full"
                   background="$background"
                 >
-                  <HStack spacing="$2" alignItems="center">
+                  <HStack spacing="$2" alignItems="center" wrap="wrap">
                     <Tag colorScheme={levelColor[it.level]} size="sm">
                       {levelText[it.level] || it.level}
                     </Tag>
@@ -154,7 +154,7 @@ const Logs = () => {
                     <Text fontSize="$xs" color="$neutral9">
                       {it.mount}
                     </Text>
-                    <Text fontSize="$xs" color="$neutral9" ml="auto">
+                    <Text fontSize="$xs" color="$neutral9" ml={{ "@initial": "0", "@md": "auto" }}>
                       {fmtTime(it.at)}
                     </Text>
                   </HStack>

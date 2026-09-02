@@ -98,7 +98,7 @@ AssertStaticBinary() {
 
 # Build the forked frontend from source (frontend/) instead of downloading
 # the upstream release, so the embedded web UI contains all fork features
-# (115 qrcode login, thumbnails, proxy nodes).
+# (115 qrcode login and thumbnails).
 BuildLocalFrontend() {
   local root
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

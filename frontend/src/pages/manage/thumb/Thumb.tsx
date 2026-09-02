@@ -13,7 +13,6 @@ import {
   Progress,
   ProgressIndicator,
   ProgressLabel,
-  Select,
   Tag,
   Text,
   VStack,
@@ -23,7 +22,6 @@ import {
 import { createSignal, createEffect, For, Show, onCleanup } from "solid-js"
 import { useManageTitle } from "~/hooks"
 import { handleResp, handleRespWithoutNotify, notify, r } from "~/utils"
-import { SelectOptions } from "~/components"
 
 type ThumbStatus = {
   cached_files: number
@@ -44,6 +42,21 @@ type ThumbStatus = {
   mounts?: string[]
 }
 
+type ThumbCandidate = {
+  index: number
+  at: string
+  png: string
+}
+
+type ThumbCandidatesData = {
+  candidates?: ThumbCandidate[]
+  sheet?: string
+  recommended_index?: number
+  cached?: boolean
+  risk_blocked?: boolean
+  truncated?: boolean
+}
+
 type TreeNode = {
   path: string
   name: string
@@ -52,47 +65,6 @@ type TreeNode = {
   cloud?: number
   videos?: number
   children?: TreeNode[]
-}
-
-type ProxyNode = {
-  id: number
-  name: string
-  type: string
-  host: string
-  port: number
-  status: string
-  fail_count: number
-  risk_until?: string
-  total_rx: number
-  total_tx: number
-  is_risk: boolean
-  rx_rate: number
-  tx_rate: number
-  conns: number
-  window_rx: number
-  window_tx: number
-}
-
-type ThumbProxyConfig = {
-  mode: string
-  node_id: number
-  effective?: { id: number; name: string; address: string; status: string }
-  nodes: ProxyNode[]
-  global_proxy_address: string
-}
-
-const fmtBytes = (n: number) => {
-  if (!n || n <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  let i = Math.floor(Math.log(n) / Math.log(1024))
-  if (i >= units.length) i = units.length - 1
-  return (n / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + " " + units[i]
-}
-
-const nodeStatusText = (n: ProxyNode) => {
-  if (n.is_risk) return "风控中"
-  if (n.status === "disabled") return "已停用"
-  return "正常"
 }
 
 const Thumb = () => {
@@ -118,16 +90,21 @@ const Thumb = () => {
   const [mounts, setMounts] = createSignal<string[]>([])
   const [oldP, setOldP] = createSignal("")
   const [newP, setNewP] = createSignal("")
-  const [pxCfg, setPxCfg] = createSignal<ThumbProxyConfig>()
-  const [pxLoading, setPxLoading] = createSignal(false)
   const [viewPath, setViewPath] = createSignal("")
   const [viewUrl, setViewUrl] = createSignal("")
   const [viewLoading, setViewLoading] = createSignal(false)
-  const [cands, setCands] = createSignal<{ index: number; at: string; png: string }[]>([])
+  const [cands, setCands] = createSignal<ThumbCandidate[]>([])
   const [candLoading, setCandLoading] = createSignal(false)
+  const [candSheet, setCandSheet] = createSignal("")
+  const [recommendedIndex, setRecommendedIndex] = createSignal(0)
+  const [candCached, setCandCached] = createSignal(false)
+  const [candRiskBlocked, setCandRiskBlocked] = createSignal(false)
+  const [candTruncated, setCandTruncated] = createSignal(false)
   const [applying, setApplying] = createSignal(false)
   const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
+  let candidateRequestId = 0
+  let candidateRequestActive = false
   let firstStatusLoaded = false
   const [uploadLive, setUploadLive] = createSignal(false) // 本次会话是否有上传运行（控制轮询）
   const upDefault = {
@@ -213,11 +190,6 @@ const Thumb = () => {
       firstStatusLoaded = true
       setKnownFails(new Set(items.map((i) => i.path)))
     })
-  }
-
-  const loadProxy = async () => {
-    const resp = await r.get("/admin/thumb/proxy")
-    handleResp(resp, (d) => setPxCfg(d as ThumbProxyConfig))
   }
 
   // 自动生成 / 自动上传开关：保存设置并刷新状态
@@ -489,11 +461,24 @@ const Thumb = () => {
     }
   }
 
+  const resetCandidateState = () => {
+    candidateRequestId += 1
+    setCands([])
+    setCandSheet("")
+    setRecommendedIndex(0)
+    setCandCached(false)
+    setCandRiskBlocked(false)
+    setCandTruncated(false)
+    setCandLoading(false)
+    setApplying(false)
+  }
+
   const viewThumb = async (pp: string) => {
+    if (viewUrl()) URL.revokeObjectURL(viewUrl())
+    setViewUrl("")
     setViewPath(pp)
     setViewLoading(true)
-    setCands([])
-    setApplying(false)
+    resetCandidateState()
     try {
       const resp = await r.get("/admin/thumb/view", {
         params: { path: pp },
@@ -517,37 +502,87 @@ const Thumb = () => {
     if (viewUrl()) URL.revokeObjectURL(viewUrl())
     setViewUrl("")
     setViewPath("")
-    setCands([])
-    setApplying(false)
+    setViewLoading(false)
+    resetCandidateState()
   }
 
-  // 生成候选缩略图（9 个）供手动挑选
-  const loadCandidates = async (pp: string) => {
+  // 生成候选缩略图（严格串行，后端返回 3×3 九宫格和推荐画面）
+  const loadCandidates = async (pp: string, refresh = false) => {
+    if (candidateRequestActive) return
+    candidateRequestActive = true
+    const previousCandidates = cands()
+    const requestId = ++candidateRequestId
     setCandLoading(true)
+    if (!refresh) {
+      setCandSheet("")
+      setRecommendedIndex(0)
+      setCandCached(false)
+      setCandRiskBlocked(false)
+      setCandTruncated(false)
+      setCands([])
+    }
     try {
-      const resp = await r.post("/admin/thumb/candidates", { path: pp })
+      const resp = await r.post("/admin/thumb/candidates", { path: pp, refresh })
+      if (requestId !== candidateRequestId || viewPath() !== pp) return
       handleResp(resp, (d) => {
-        const data = d as { candidates?: { index: number; at: string; png: string }[] }
-        setCands(data.candidates || [])
-        if (!data.candidates?.length) notify.error("未能生成候选缩略图")
+        if (requestId !== candidateRequestId || viewPath() !== pp) return
+        const data = d as ThumbCandidatesData
+        const candidates = data.candidates || []
+        if (refresh && !candidates.length && previousCandidates.length) {
+          notify.warning("重新生成未取得新画面，已保留上次候选")
+          return
+        }
+        setCands(candidates)
+        setCandSheet(data.sheet || "")
+        setRecommendedIndex(data.recommended_index || 0)
+        setCandCached(!!data.cached)
+        setCandRiskBlocked(!!data.risk_blocked)
+        setCandTruncated(!!data.truncated)
+        if (!candidates.length) {
+          if (data.risk_blocked || data.truncated) {
+            notify.warning("为避免触发 115 风控，候选生成已停止，暂无可用画面")
+          } else {
+            notify.error("未能生成候选缩略图")
+          }
+        } else if (data.risk_blocked || data.truncated) {
+          notify.warning(`已取得 ${candidates.length} 个画面，后续取帧已停止以避免触发 115 风控`)
+        }
       })
+    } catch {
+      if (requestId !== candidateRequestId || viewPath() !== pp) return
+      notify.error(refresh && previousCandidates.length ? "重新生成失败，已保留上次候选" : "生成候选缩略图失败")
     } finally {
-      setCandLoading(false)
+      if (requestId === candidateRequestId && viewPath() === pp) {
+        setCandLoading(false)
+      }
+      candidateRequestActive = false
     }
   }
 
-  // 保留所选候选缩略图
-  const applyCandidate = async (pp: string, png: string) => {
+  const openCandidates = (pp: string) => {
+    if (candidateRequestActive) return
+    if (viewUrl()) URL.revokeObjectURL(viewUrl())
+    setViewPath(pp)
+    setViewUrl("")
+    setViewLoading(false)
+    resetCandidateState()
+    void loadCandidates(pp)
+  }
+  // 保留所选候选缩略图；同一接口也用于保存九宫格
+  const applyCandidate = async (pp: string, png: string, successMessage = "已应用所选缩略图") => {
     setApplying(true)
-    const resp = await r.post("/admin/thumb/apply_candidate", { path: pp, png })
-    handleResp(resp, () => {
-      notify.success("已应用所选缩略图")
-      closeView()
-      if (sel()) loadDir(sel())
-      loadTree()
-      load()
-    })
-    setApplying(false)
+    try {
+      const resp = await r.post("/admin/thumb/apply_candidate", { path: pp, png })
+      handleResp(resp, () => {
+        notify.success(successMessage)
+        closeView()
+        if (sel()) loadDir(sel())
+        loadTree()
+        load()
+      })
+    } finally {
+      setApplying(false)
+    }
   }
 
   const retryAll = async () => {
@@ -745,31 +780,6 @@ const Thumb = () => {
     })
   }
 
-  const saveProxy = async (mode: string, nodeID: number) => {
-    setPxLoading(true)
-    try {
-      const resp = await r.post("/admin/thumb/proxy", { mode, node_id: nodeID })
-      handleResp(resp, (d) => {
-        setPxCfg(d as ThumbProxyConfig)
-        notify.success("已保存缩略图代理配置")
-      })
-    } finally {
-      setPxLoading(false)
-    }
-  }
-
-  // 切换到手动指定：无有效节点时自动选第一个可用节点，没有节点则提示先去代理管理页添加
-  const selectManual = () => {
-    const usable = (pxCfg()?.nodes || []).filter((n) => n.status !== "disabled")
-    if (!usable.length) {
-      notify.warning("暂无可用代理节点，请先在「代理管理」页添加节点")
-      return
-    }
-    const cur = pxCfg()?.node_id || 0
-    const pick = usable.some((n) => n.id === cur) ? cur : usable[0].id
-    saveProxy("manual", pick)
-  }
-
   const toggle = (pp: string) =>
     setExp((ss) => {
       const z = new Set(ss)
@@ -806,6 +816,7 @@ const Thumb = () => {
         w="$full"
         p="$2"
         rounded="$md"
+        wrap="wrap"
         _hover={{ bgColor: useColorModeValue("$neutral2", "$neutral3")() }}
         background={
           sel() === nn.path
@@ -885,7 +896,6 @@ const Thumb = () => {
 
   // 先加载目录树（填充后端聚合统计），再刷新状态，保证顶部与树数字一致
   void loadTree().then(() => load())
-  loadProxy()
   // 挂载时拉一次上传状态，恢复"正在上传 N"（若服务端有运行中则启动快轮询）
   void pollUploadStatus()
   // 10s 计时器仅刷新缩略图状态；upload_status 只在有上传运行时轮询，避免无意义的持续请求
@@ -903,8 +913,10 @@ const Thumb = () => {
     }
   })
   onCleanup(() => {
+    candidateRequestId += 1
     clearInterval(timer)
     if (fastTimer) clearInterval(fastTimer)
+    if (viewUrl()) URL.revokeObjectURL(viewUrl())
   })
 
   return (
@@ -965,118 +977,6 @@ const Thumb = () => {
           </VStack>
         </Box>
        </HStack>
-
-      {/* 代理节点选择 */}
-      <Box mt="$2" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
-        <HStack spacing="$2" alignItems="center" wrap="wrap">
-          <Text fontWeight="$medium">缩略图代理</Text>
-          <Tag
-            colorScheme={
-              !pxCfg() || pxCfg().mode === "off" ? "neutral" : pxCfg().mode === "manual" ? "info" : "success"
-            }
-          >
-            {!pxCfg() || pxCfg().mode === "off"
-              ? "未启用"
-              : pxCfg().mode === "manual"
-                ? "手动指定"
-                : "自动切换"}
-          </Tag>
-          <Show when={pxCfg()?.effective}>
-            <Tag colorScheme="success">
-              生效：{pxCfg()!.effective!.name}（{pxCfg()!.effective!.address}）
-            </Tag>
-          </Show>
-          <Show when={!pxCfg()?.effective && pxCfg() && pxCfg().mode !== "off"}>
-            <Tag colorScheme="warning">暂无可用节点</Tag>
-          </Show>
-        </HStack>
-        <HStack
-          spacing="$2"
-          alignItems="center"
-          wrap="wrap"
-          mt="$2"
-        >
-          <Text fontSize="$sm">模式</Text>
-          <Button
-            size="xs"
-            colorScheme={pxCfg()?.mode === "off" ? "accent" : "neutral"}
-            onClick={() => saveProxy("off", 0)}
-          >
-            关闭（走全局代理）
-          </Button>
-          <Button
-            size="xs"
-            colorScheme={pxCfg()?.mode === "auto" ? "accent" : "neutral"}
-            onClick={() => saveProxy("auto", pxCfg()?.node_id || 0)}
-          >
-            自动切换
-          </Button>
-          <Button
-            size="xs"
-            colorScheme={pxCfg()?.mode === "manual" ? "accent" : "neutral"}
-            onClick={selectManual}
-          >
-            手动指定
-          </Button>
-          <Show when={pxCfg()?.mode === "manual"}>
-            <Text fontSize="$sm" ml="$2">
-              节点
-            </Text>
-            <Box w="$full" maxW="260px">
-              <Select
-                id="thumb-proxy-node"
-                value={String(pxCfg()?.node_id || "")}
-                onChange={(v) => saveProxy("manual", parseInt(v))}
-              >
-                <SelectOptions
-                  options={(pxCfg()?.nodes || [])
-                    .filter((n) => n.status !== "disabled")
-                    .map((n) => ({
-                      key: String(n.id),
-                      label: `${n.name}（${n.host}:${n.port}）`,
-                    }))}
-                />
-              </Select>
-            </Box>
-          </Show>
-          <Show when={pxCfg()?.global_proxy_address}>
-            <Text fontSize="$sm" color="$neutral9">
-              全局代理：{pxCfg()!.global_proxy_address}
-            </Text>
-          </Show>
-        </HStack>
-        <Show when={(pxCfg()?.nodes || []).length > 0}>
-          <Box mt="$2" maxH="260px" overflowY="auto" rounded="$md" border="1px solid $neutral6" p="$1">
-            <For each={pxCfg()!.nodes}>
-              {(n) => (
-                <HStack
-                  spacing="$2"
-                  alignItems="center"
-                  p="$2"
-                  rounded="$sm"
-                  _hover={{ bgColor: useColorModeValue("$neutral2", "$neutral3")() }}
-                >
-                  <Box css={{ flex: "1 1 auto", "word-break": "break-all", "font-size": "$sm" }}>
-                    {n.name}（{n.host}:{n.port}）
-                  </Box>
-                  <Tag colorScheme={n.is_risk ? "danger" : n.status === "disabled" ? "neutral" : "success"}>
-                    {nodeStatusText(n)}
-                  </Tag>
-                  <Show when={n.is_risk}>
-                    <Tag colorScheme="warning">{Math.max(0, Math.ceil((new Date(n.risk_until!).getTime() - Date.now()) / 60000))} 分钟后自动恢复</Tag>
-                  </Show>
-                  <Text fontSize="$xs" color="$neutral9">
-                    收 {fmtBytes(n.window_rx)} · 发 {fmtBytes(n.window_tx)} · 速率 {fmtBytes(n.rx_rate)}/s · 连接 {n.conns}
-                  </Text>
-                  <Tag colorScheme="neutral">
-                    累计 {fmtBytes(n.total_rx)} / {fmtBytes(n.total_tx)}
-                  </Tag>
-                </HStack>
-              )}
-            </For>
-          </Box>
-        </Show>
-      </Box>
 
       {/* 生成状态与控制 */}
       <Box mt="$2" rounded="$lg" border="1px solid $neutral6" p="$2" w="$full">
@@ -1358,6 +1258,7 @@ const Thumb = () => {
                   direction="row"
                   spacing="$2"
                   alignItems="center"
+                  wrap="wrap"
                   p="$2"
                   rounded="$sm"
                   _hover={{ bgColor: useColorModeValue("$neutral2", "$neutral3")() }}
@@ -1378,8 +1279,12 @@ const Thumb = () => {
                           flex: "1 1 auto",
                           "word-break": "break-all",
                           "font-size": "$sm",
-                          opacity: "0.45",
+                          opacity: checked()[q] ? "1" : "0.5",
+                          cursor: "pointer",
                         }}
+                        title="无缩略图，点击选择画面"
+                        onClick={() => openCandidates(q)}
+                        _hover={{ color: "$info9" }}
                       >
                         {q.replace(sel(), "").replace(/^\//, "")}
                       </Box>
@@ -1404,6 +1309,16 @@ const Thumb = () => {
                     <Tag colorScheme="neutral" size="sm">
                       无缩略图
                     </Tag>
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        colorScheme="info"
+                        loading={candLoading() && viewPath() === q}
+                        disabled={candLoading()}
+                        onClick={() => openCandidates(q)}
+                      >
+                        选择画面
+                      </Button>
                   </Show>
                   <Show when={failedMap()[q]}>
                     <Tag colorScheme="danger" size="sm" title={failedMap()[q] || "生成失败"}>
@@ -1557,15 +1472,71 @@ const Thumb = () => {
                 size="xs"
                 colorScheme="info"
                 loading={candLoading()}
-                disabled={!viewPath()}
-                onClick={() => loadCandidates(viewPath())}
+                disabled={!viewPath() || candLoading()}
+                onClick={() => loadCandidates(viewPath(), cands().length > 0 || candCached())}
               >
-                换缩略图（生成候选）
+                {cands().length || candCached() ? "重新生成候选" : "生成候选九宫格"}
               </Button>
+              <Show when={candCached()}>
+                <Tag colorScheme="neutral" size="sm">
+                  已使用缓存
+                </Tag>
+              </Show>
               <Text fontSize="$xs" color="$neutral9">
-                不喜欢自动生成的缩略图？生成多个候选画面手动挑选
+                115 安全模式：候选帧单路生成，检测到风控会立即停止
               </Text>
             </HStack>
+            <Show when={candSheet()}>
+              <Box
+                mt="$3"
+                rounded="$md"
+                border="1px solid $neutral6"
+                p="$2"
+                background={useColorModeValue("$neutral1", "$neutral2")()}
+              >
+                <Text fontSize="$sm" fontWeight="$medium">候选九宫格</Text>
+                <img
+                  src={`data:image/png;base64,${candSheet()}`}
+                  alt="候选九宫格"
+                  css={{ width: "100%", maxHeight: "30vh", objectFit: "contain", background: "#101010", display: "block", marginTop: "6px" }}
+                />
+                <HStack mt="$2" spacing="$2" wrap="wrap">
+                  <Button
+                    size="xs"
+                    colorScheme="success"
+                    loading={applying()}
+                    disabled={candLoading()}
+                    onClick={() => applyCandidate(viewPath(), candSheet(), "已应用九宫格缩略图")}
+                  >
+                    保存九宫格
+                  </Button>
+                  <Show when={recommendedIndex() > 0 && cands().some((cd) => cd.index === recommendedIndex())}>
+                    <Button
+                      size="xs"
+                      colorScheme="accent"
+                      loading={applying()}
+                      disabled={candLoading()}
+                      onClick={() => {
+                        const recommended = cands().find((cd) => cd.index === recommendedIndex())
+                        if (recommended) void applyCandidate(viewPath(), recommended.png, "已应用推荐缩略图")
+                      }}
+                    >
+                      采用推荐画面
+                    </Button>
+                  </Show>
+                  <Text fontSize="$xs" color="$neutral9">
+                    已取得 {cands().length}/9 帧
+                  </Text>
+                </HStack>
+                <Show when={candRiskBlocked() || candTruncated()}>
+                  <Text mt="$1" fontSize="$xs" color="$warning9">
+                    {candRiskBlocked()
+                      ? "检测到 115 风控迹象，已停止后续取帧；请勿立即重复生成。"
+                      : "候选生成未完整结束，已显示当前已取得的画面。"}
+                  </Text>
+                </Show>
+              </Box>
+            </Show>
             <Show when={cands().length}>
               <Grid
                 mt="$3"
@@ -1587,15 +1558,21 @@ const Thumb = () => {
                         css={{ width: "100%", borderRadius: "6px", display: "block" }}
                       />
                       <HStack mt="$1" spacing="$1" justifyContent="space-between" alignItems="center">
-                        <Text fontSize="$xs" color="$neutral9">
-                          {Number(cd.at) >= 60
-                            ? `${Math.floor(Number(cd.at) / 60)}m${Math.round(Number(cd.at) % 60)}s`
-                            : `${cd.at}s`}
-                        </Text>
+                        <HStack spacing="$1" alignItems="center">
+                          <Text fontSize="$xs" color="$neutral9">
+                            {Number(cd.at) >= 60
+                              ? `${Math.floor(Number(cd.at) / 60)}m${Math.round(Number(cd.at) % 60)}s`
+                              : `${cd.at}s`}
+                          </Text>
+                          <Show when={cd.index === recommendedIndex()}>
+                            <Tag colorScheme="success" size="sm">推荐</Tag>
+                          </Show>
+                        </HStack>
                         <Button
                           size="xs"
                           colorScheme="success"
                           loading={applying()}
+                          disabled={candLoading()}
                           onClick={() => applyCandidate(viewPath(), cd.png)}
                         >
                           保留此图

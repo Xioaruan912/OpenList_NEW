@@ -263,7 +263,7 @@ func toObjsResp(c *gin.Context, objs []model.Obj, parent string, encrypt bool) [
 		}
 		if !obj.IsDir() && utils.GetFileType(obj.GetName()) == conf.VIDEO {
 			fullPath := parent + "/" + obj.GetName()
-			objResp.Duration = videoDuration(c.Request.Context(), fullPath, common.GetApiUrl(c))
+			objResp.Duration = videoDuration(c.Request.Context(), fullPath)
 		}
 		resp = append(resp, objResp)
 	}
@@ -380,7 +380,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	thumb, _ := model.GetThumb(obj)
 	var duration float64
 	if !obj.IsDir() && utils.GetFileType(obj.GetName()) == conf.VIDEO {
-		duration = videoDuration(c.Request.Context(), reqPath, common.GetApiUrl(c))
+		duration = videoDuration(c.Request.Context(), reqPath)
 	}
 	if obj.IsDir() {
 		thumb = fillCoverThumb(c, parentPath, obj)

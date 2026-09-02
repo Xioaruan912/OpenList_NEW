@@ -17,12 +17,9 @@ type Addition struct {
 	driver.RootID
 }
 
-// GetProxy 返回 115 驱动客户端（API 与上传）使用的代理：
-// 优先取"全局出站代理"（/@manage/proxy 全局代理策略），未配置时回退到全局 proxy_address
+// GetProxy 返回 115 驱动客户端使用的静态出站代理。
+// 代理在驱动初始化时固定，避免运行中切换共享 HTTP client。
 func (a *Addition) GetProxy() string {
-	if px := op.GetGlobalProxy(); px != "" {
-		return px
-	}
 	return conf.Conf.ProxyAddress
 }
 

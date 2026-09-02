@@ -2,13 +2,13 @@
 
 > 本文件是给**后续开发者 / AI 助手**读的"提示词"与项目知识库。
 > 开始任何功能开发前，请先完整阅读本文件与 `AGENTS.md`。
-> 涉及本项目已有的功能（缩略图、代理、115 登录），务必**先读对应源码**再动手，避免重复造轮子或破坏既有机制。
+> 涉及本项目已有的功能（缩略图、115 登录），务必**先读对应源码**再动手，避免重复造轮子或破坏既有机制。
 
 ---
 
 ## 0. 项目一句话
 
-基于上游 [OpenList](https://github.com/OpenListTeam/OpenList)（Go 后端 + Vite/SolidJS 前端）二次开发的**多网盘文件列表程序**，本仓库重点增强 **115 网盘**的：扫码登录、视频缩略图、多出口防风控代理、全局代理策略。
+基于上游 [OpenList](https://github.com/OpenListTeam/OpenList)（Go 后端 + Vite/SolidJS 前端）二次开发的**多网盘文件列表程序**，本仓库重点增强 **115 网盘**的扫码登录和媒体缩略图链路。
 
 ## 1. 仓库结构速览
 
@@ -16,23 +16,16 @@
 main.go                 入口（go:embed public/dist）
 frontend/               Vite + SolidJS + @hope-ui/solid（所有自定义 UI 源码）
 frontend/src/pages/manage/thumb/Thumb.tsx     缩略图管理页
-frontend/src/pages/manage/proxy/Proxy.tsx     代理管理页（节点 + 全局代理策略）
 frontend/src/pages/manage/storages/*.tsx      存储管理（115 扫码登录、文件夹选择器）
 server/router.go        gin 路由总表
 server/handles/         HTTP handlers
   thumbadmin.go         缩略图管理 API
-  mediathumb.go         缩略图生成/缓存/队列/代理下载核心
-  proxyuse.go           缩略图代理选择（auto/manual/off）
-  globalproxy.go        全局代理策略（115 访问侧出站代理）
-  proxyhealth.go        代理节点真实连通性健康检查
-  proxyadmin.go         代理节点 CRUD
+  mediathumb.go         缩略图生成/缓存/队列/受限 Range 读取核心
   driver115.go          115 扫码登录 API
-internal/op/            runtime 共享变量（globalProxy、thumbUploadProxy）
 internal/conf/          const.go 设置项 key；config.go 静态配置（proxy_address 等）
-internal/model/         ProxyNode 等模型（Address() 拼代理地址）
+internal/model/         存储、任务等核心模型
 internal/bootstrap/data/setting.go  设置默认值
 drivers/115/            115 驱动（login、Link、上传、health.go 风控标记）
-scripts/proxy/          节点一键部署脚本（gost + trafficd）
 install.sh              VPS 一键安装
 public/dist/            前端构建产物（仅占位 index.html 入库；go:embed 用）
 ```
@@ -74,7 +67,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 - **路由**：管理页在 `frontend/src/pages/manage/<name>/<Name>.tsx`，侧边栏入口在 `sidemenu_items.tsx`。
 
 ### 3.2 设计原则（给 AI 的"成熟前端提示词"）
-1. **先读相邻代码**：新页面/组件先看 `Thumb.tsx` / `Proxy.tsx` 的既有写法（组件、样式、请求模式），保持一致，不引入新依赖。
+1. **先读相邻代码**：新页面/组件先看 `Thumb.tsx` / `Logs.tsx` 的既有写法（组件、样式、请求模式），保持一致，不引入新依赖。
 2. **状态最小化**：能用 `createSignal` 就别上 store；派生值用函数（`const x = () => ...`）。
 3. **交互细节**：
    - 破坏性操作（删除/清空）必须 `window.confirm`。
@@ -98,7 +91,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 - **路由**：`server/router.go` 注册；管理接口挂在 `admin` 组（`/api/admin/...`，需 `Authorization` 头 = token 或 JWT，无 Bearer）。
 - **Handler**：`server/handles/xxx.go`，入参 `ShouldBind(&req)`，出参 `common.SuccessResp/ErrorResp/ErrorStrResp`。
 - **设置项**：新增设置 = `internal/conf/const.go` 加 key + `internal/bootstrap/data/setting.go` 加默认值；读写用 `setting.GetStr/GetInt`，保存用 `op.SaveSettingItems([]model.SettingItem{...})`。
-- **运行时共享变量**（跨模块）：放 `internal/op/`，`sync.RWMutex` 保护（参考 `thumbproxy.go` 的 `globalProxy`）。
+- **运行时共享变量**（跨模块）：放 `internal/op/`，并用锁或原子类型保护。
 - **驱动**：`drivers/115/`。新增能力时尽量复用 115driver 库方法；**115 API 细节**（UA/appVer/salt/风控）见下方 4.4。
 
 ### 4.2 新增功能的标准流程
@@ -107,27 +100,25 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 3. 前端：对应页面加 UI → `pnpm build`。
 4. 按第 2 节"构建/部署/验证"部署并实测（含 Playwright）。
 
-### 4.3 三个核心子系统的"心智模型"
+### 4.3 核心子系统的"心智模型"
 - **缩略图**（`mediathumb.go` + `thumbadmin.go`）：
-  - 队列：`prewarmCh`（cap 2048）+ 8 个 `prewarmWorker`，`prewarmDone`（sync.Map）去重。
-  - 生成：`generateVideoThumb` → 本地抽帧 / 长视频 mosaic / 远程抽帧，**代理出白图自动回退直连**。
+  - 队列：`prewarmCh`（cap 2048）+ `thumb_concurrency` 个 worker，`prewarmDone`（sync.Map）去重；队列满时不创建无限延迟协程。
+  - 生成：`generateVideoThumb` → 本地片段抽帧 / 远程 Range 抽帧；同一路径通过 `singleflight` 去重。
+  - 读取：严格校验 `206 Content-Range`，所有响应按请求长度限制；HTTP Client/Transport 按静态代理复用。
+  - ffmpeg/ffprobe：直接使用驱动 `Link.URL` 和 `Link.Header`，不使用外部 Host 拼接 `/d`。
   - 空白检测 `isBlankThumb`（纯色图当失败，不缓存）。
   - 索引：`data/thumb_cache/index.jsonl`；`thumbRecord`/`readThumbIndex`/`writeThumbIndex`。
   - 风控：`isStorageBlocked`（115 health 5 分钟窗口）。
-- **代理**（`proxyuse.go` / `globalproxy.go` / `proxyhealth.go`）：
-  - 节点：`x_proxy_nodes` 表；`Address()` 拼地址（`http://proxy:pass@host:port` 或 `socks5://...`）。
-  - 缩略图代理 `thumbProxyForPath`（thumb 页模式）→ 控制 `newThumbHTTPClient` 下载。
-  - 全局代理 `op.GetGlobalProxy` → 115 驱动 `GetProxy()` → 控制 API/上传。
-  - 健康检查 `proxyhealth.go`：每 60s 实测节点（访问/下载/上传），失败排除 + 显示不可用。
-  - **`/d` 下载/播放是 302 直连 CDN，不走节点**（有意为之，快）。
+- **静态出站代理**：默认直连；需要时只读取 `conf.Conf.ProxyAddress`。不要在运行中修改 115 的共享 Resty Client；多出口负载均衡应由外部基础设施完成。
 - **115 登录**（`driver115.go` + `drivers/115/qrcode.go`）：二维码 → 轮询 → 写 Cookie → 文件夹选择器。
 
 ### 4.4 115 关键事实（改 115 前必读）
 - 上传 API v4.0 `files/init`：**UA 必须是 `Mozilla/5.0 115Browser/<appVer>`**，否则 403"请升级到最新版本"（`getUploadUA`）。
 - 下载/列表 API：普通 Chrome UA 更稳（`getUA`），WAF 对 115Browser 特征严。
-- 风控特征错误：`405`/`blocked`/`服务器开小差`/`登录超时` → `health.go` 标记 5 分钟风控。
+- 风控特征错误：`405`/`blocked`/`服务器开小差` → `health.go` 标记 5 分钟风控。
+- 认证失效：`ErrNotLogin`/`登录超时`/`user not login`/`no auth` 单独标记为 invalid，需要重新登录，不进入风控状态。
 - 长视频 >90s 走 mosaic（9 帧拼图）；moov 在尾部自动远程抽帧。
-- 代理节点中继损坏字节时抽帧会得纯白图 → 已自动回退直连。
+- 配置的静态代理返回损坏字节时可能得到纯白图 → 已自动回退直连。
 
 ---
 

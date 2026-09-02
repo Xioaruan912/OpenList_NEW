@@ -78,8 +78,8 @@ func (d *Pan115) Init(ctx context.Context) error {
 }
 
 func (d *Pan115) WaitLimit(ctx context.Context) error {
-	// 配置了代理时不再限速：115 请求已走代理分散出口 IP，无需再靠限速规避风控
-	if d.limiter == nil || d.GetProxy() != "" {
+	// 代理只改变网络出口，不改变账号级请求预算。
+	if d.limiter == nil {
 		return nil
 	}
 	return d.limiter.Wait(ctx)
@@ -87,19 +87,6 @@ func (d *Pan115) WaitLimit(ctx context.Context) error {
 
 func (d *Pan115) Drop(ctx context.Context) error {
 	return nil
-}
-
-// SetUploadProxy 动态切换 115 客户端（API 与上传）代理；空字符串表示移除代理（走全局/直连）。
-// 供缩略图模块在自动模式下将"上传侧"指派到独立节点，与缩略图下载代理分离。
-func (d *Pan115) SetUploadProxy(px string) {
-	if d.client == nil {
-		return
-	}
-	if px != "" {
-		d.client.Client.SetProxy(px)
-	} else {
-		d.client.Client.RemoveProxy()
-	}
 }
 
 func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {

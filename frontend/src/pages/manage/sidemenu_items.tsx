@@ -183,12 +183,6 @@ export const side_menu_items: SideMenuItem[] = [
     component: lazy(() => import("./thumb/Thumb")),
   },
   {
-    title: "manage.sidemenu.proxy",
-    icon: BsHddNetwork,
-    to: "/@manage/proxy",
-    component: lazy(() => import("./proxy/Proxy")),
-  },
-  {
     title: "manage.sidemenu.activity_log",
     icon: BsNewspaper,
     to: "/@manage/logs",

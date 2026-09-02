@@ -3,6 +3,8 @@ package _115
 import (
 	"errors"
 	"testing"
+
+	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 )
 
 func TestMarkUploadErrorRisk(t *testing.T) {
@@ -42,5 +44,22 @@ func TestMarkUploadErrorRisk(t *testing.T) {
 	MarkUploadError(mount, riskErr)
 	if IsStorageBlocked(mount) {
 		t.Fatal("counter should reset after triggering blocked")
+	}
+}
+
+func TestAuthFailureDoesNotEnterRiskCircuit(t *testing.T) {
+	mount := "/test-auth-invalid"
+	healthMu.Lock()
+	delete(health, mount)
+	delete(blocked, mount)
+	healthMu.Unlock()
+
+	MarkStorageError(mount, driver115.ErrNotLogin)
+	entry, ok := GetStorageHealth(mount)
+	if !ok || !entry.Invalid {
+		t.Fatalf("auth failure health = %+v, %v; want invalid entry", entry, ok)
+	}
+	if IsStorageBlocked(mount) {
+		t.Fatal("authentication failure must not be classified as provider risk")
 	}
 }

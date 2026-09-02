@@ -170,14 +170,6 @@ const (
 	ThumbWidth        = "thumb_width"
 	ThumbFailTTL      = "thumb_fail_ttl"
 
-	// thumb proxy selection (off / auto / manual + node id)
-	ThumbProxyMode = "thumb_proxy_mode"
-	ThumbProxyNode = "thumb_proxy_node"
-
-	// global outbound proxy selection (off / auto(风控时走代理) / manual + node id)
-	GlobalProxyMode = "global_proxy_mode"
-	GlobalProxyNode = "global_proxy_node"
-
 	// traffic
 	TaskOfflineDownloadThreadsNum         = "offline_download_task_threads_num"
 	TaskOfflineDownloadTransferThreadsNum = "offline_download_transfer_task_threads_num"

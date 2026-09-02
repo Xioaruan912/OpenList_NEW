@@ -36,9 +36,6 @@ func Init(e *gin.Engine) {
 	g.GET("/manifest.json", static.ManifestJSON)
 	g.GET("/i/:link_name", handles.Plist)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
-	go handles.StartThumbProxyAssign()
-	go handles.StartProxyHealthCheck()
-	go handles.StartGlobalProxyAssign()
 	go handles.StartThumbAuto()
 	g.Use(middlewares.StoragesLoaded)
 	if conf.Conf.MaxConnections > 0 {
@@ -125,9 +122,6 @@ func Init(e *gin.Engine) {
 	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
 	public.Any("/archive_extensions", handles.ArchiveExtensions)
 
-	// 代理节点一键部署脚本（供节点 VPS curl | bash 使用，无需登录）
-	api.GET("/proxy/install.sh", handles.ProxyInstallScript)
-
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
@@ -188,8 +182,6 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/auto", handles.ThumbSetAuto)
 	thumb.POST("/candidates", handles.ThumbCandidates)
 	thumb.POST("/apply_candidate", handles.ThumbApplyCandidate)
-	thumb.GET("/proxy", handles.ThumbProxyConfig)
-	thumb.POST("/proxy", handles.ThumbProxySet)
 	thumb.POST("/upload", handles.ThumbUpload)
 	thumb.POST("/upload_all", handles.ThumbUploadAll)
 	thumb.POST("/upload_retry", handles.ThumbUploadRetry)
@@ -202,17 +194,6 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/queue/pause", handles.ThumbQueuePause)
 	thumb.POST("/queue/resume", handles.ThumbQueueResume)
 	thumb.POST("/queue/clear", handles.ThumbQueueClear)
-
-	proxy := g.Group("/proxy")
-	proxy.GET("/list", handles.ListProxyNodes)
-	proxy.POST("/create", handles.CreateProxyNode)
-	proxy.POST("/update", handles.UpdateProxyNode)
-	proxy.POST("/delete", handles.DeleteProxyNode)
-	proxy.GET("/traffic", handles.ProxyTraffic)
-	proxy.GET("/install", handles.ProxyInstall)
-	proxy.GET("/policy", handles.GlobalProxyConfig)
-	proxy.POST("/policy", handles.GlobalProxySet)
-	proxy.POST("/enable", handles.ProxyEnable)
 
 	driver := g.Group("/driver")
 	driver.GET("/list", handles.ListDriverInfo)

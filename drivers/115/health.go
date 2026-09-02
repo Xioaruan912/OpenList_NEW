@@ -22,8 +22,8 @@ type HealthEntry struct {
 	At      time.Time `json:"at"`
 }
 
-// MarkStorageError 记录 115 驱动操作错误（ErrNotLogin 判定 cookie 失效；
-// 风控特征错误（拦截页/服务器开小差/登录超时）同时标记风控状态）
+// MarkStorageError 记录 115 驱动操作错误。认证失效与供应商风控分别归类，
+// 避免用切换网络出口掩盖需要重新登录的问题。
 func MarkStorageError(mount string, err error) {
 	if err == nil {
 		return
@@ -31,7 +31,7 @@ func MarkStorageError(mount string, err error) {
 	healthMu.Lock()
 	defer healthMu.Unlock()
 	entry := HealthEntry{
-		Invalid: errors.Is(err, driver115.ErrNotLogin),
+		Invalid: isAuthInvalidError(err),
 		Msg:     err.Error(),
 		At:      time.Now(),
 	}
@@ -51,17 +51,27 @@ func MarkStorageError(mount string, err error) {
 	}
 }
 
-// isRiskControlError 判断是否 115 风控类错误（WAF 拦截页 / 软风控提示 / 登录超时）
-func isRiskControlError(err error) bool {
-	msg := err.Error()
+func isAuthInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, driver115.ErrNotLogin) {
 		return true
 	}
-	lower := strings.ToLower(msg)
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "user not login") ||
+		strings.Contains(lower, "no auth") ||
+		strings.Contains(lower, "登录超时")
+}
+
+// isRiskControlError 判断是否 115 风控类错误（WAF 拦截页 / 软风控提示）。
+func isRiskControlError(err error) bool {
+	if err == nil || isAuthInvalidError(err) {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "blocked") ||
 		strings.Contains(lower, "服务器开小差") ||
-		strings.Contains(lower, "登录超时") ||
-		strings.Contains(lower, "user not login") ||
 		strings.Contains(lower, "405") ||
 		strings.Contains(lower, "forbidden")
 }

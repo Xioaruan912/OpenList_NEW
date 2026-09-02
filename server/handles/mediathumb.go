@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +40,7 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	ffmpeg "github.com/u2takey/ffmpeg-go"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -70,16 +72,36 @@ var (
 
 	thumbCleanupOnce sync.Once
 
-	errThumbTooLarge = errors.New("file too large for thumbnail")
-	errThumbNoCover  = errors.New("no cover art or cover file found")
-	errThumbBlank    = errors.New("blank thumbnail")
+	errThumbTooLarge   = errors.New("file too large for thumbnail")
+	errThumbNoCover    = errors.New("no cover art or cover file found")
+	errThumbBlank      = errors.New("blank thumbnail")
+	errThumbRemoteRisk = errors.New("remote frame extraction blocked")
+
+	thumbGenerateGroup singleflight.Group
 )
+
+func generateThumbOnce(kind, rawPath string, generate func() ([]byte, error)) ([]byte, error) {
+	value, err, _ := thumbGenerateGroup.Do(kind+"\x00"+rawPath, func() (interface{}, error) {
+		return generate()
+	})
+	if err != nil {
+		return nil, err
+	}
+	data, ok := value.([]byte)
+	if !ok {
+		return nil, errors.New("thumbnail generator returned invalid data")
+	}
+	return data, nil
+}
 
 // isPermanentThumbError 判断生成失败是否属于"永久性"（重试无意义）：
 // 115 文件级拦截（403/pmt）、下载被拒等。这类错误写失败标记、不重试，避免长时间空转。
 func isPermanentThumbError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errThumbRemoteRisk) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{"403", "405", "pmt", "forbidden", "access denied", "proxy authentication", "unable to extract any video frame"} {
@@ -101,6 +123,8 @@ func thumbFailReason(err error) string {
 		return "文件过大"
 	case errors.Is(err, errThumbNoCover):
 		return "无封面/无法抽帧"
+	case errors.Is(err, errThumbRemoteRisk):
+		return "115 风控拦截"
 	case strings.Contains(msg, "403") || strings.Contains(msg, "pmt") || strings.Contains(msg, "access denied"):
 		return "115 拦截访问（无法取帧）"
 	case strings.Contains(msg, "405"):
@@ -152,20 +176,173 @@ func isBlankThumb(png []byte) bool {
 	return total > 0 && float64(same)/float64(total) >= 0.99
 }
 
+// scoreVideoThumb 为候选帧计算轻量的内容质量分数。分数只用于推荐，
+// 不会替代用户手动选择；不依赖 AI，避免为远程视频引入额外下载。
+func scoreVideoThumb(png []byte) float64 {
+	img, err := imaging.Decode(bytes.NewReader(png))
+	if err != nil {
+		return -1
+	}
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width < 8 || height < 8 {
+		return -1
+	}
+
+	stepX, stepY := width/64, height/36
+	if stepX < 1 {
+		stepX = 1
+	}
+	if stepY < 1 {
+		stepY = 1
+	}
+
+	lumaAt := func(x, y int) float64 {
+		r, g, b, _ := color.RGBAModel.Convert(img.At(x, y)).RGBA()
+		return (0.2126*float64(r) + 0.7152*float64(g) + 0.0722*float64(b)) / 65535
+	}
+	saturationAt := func(x, y int) float64 {
+		r, g, b, _ := color.RGBAModel.Convert(img.At(x, y)).RGBA()
+		rf, gf, bf := float64(r)/65535, float64(g)/65535, float64(b)/65535
+		maxc, minc := rf, rf
+		if gf > maxc {
+			maxc = gf
+		}
+		if bf > maxc {
+			maxc = bf
+		}
+		if gf < minc {
+			minc = gf
+		}
+		if bf < minc {
+			minc = bf
+		}
+		return maxc - minc
+	}
+
+	var (
+		count, edgeCount int
+		sum, sumSquares  float64
+		edge, saturation float64
+		minLuma          = 1.0
+		maxLuma          float64
+	)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y += stepY {
+		for x := bounds.Min.X; x < bounds.Max.X; x += stepX {
+			luma := lumaAt(x, y)
+			sum += luma
+			sumSquares += luma * luma
+			saturation += saturationAt(x, y)
+			if luma < minLuma {
+				minLuma = luma
+			}
+			if luma > maxLuma {
+				maxLuma = luma
+			}
+			count++
+			if x+stepX < bounds.Max.X {
+				edge += math.Abs(luma - lumaAt(x+stepX, y))
+				edgeCount++
+			}
+			if y+stepY < bounds.Max.Y {
+				edge += math.Abs(luma - lumaAt(x, y+stepY))
+				edgeCount++
+			}
+		}
+	}
+	if count == 0 {
+		return -1
+	}
+
+	mean := sum / float64(count)
+	variance := sumSquares/float64(count) - mean*mean
+	if variance < 0 {
+		variance = 0
+	}
+	contrast := math.Sqrt(variance)
+	edgeMean := 0.0
+	if edgeCount > 0 {
+		edgeMean = edge / float64(edgeCount)
+	}
+	dynamicRange := maxLuma - minLuma
+	score := contrast*0.5 + edgeMean*0.35 + (saturation/float64(count))*0.15
+	if dynamicRange < 0.04 {
+		score *= 0.2
+	}
+	if mean < 0.08 {
+		score *= mean / 0.08
+	} else if mean > 0.95 {
+		score *= (1 - mean) / 0.05
+	}
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+const (
+	videoContactSheetColumns    = 3
+	videoContactSheetRows       = 3
+	videoContactSheetCellWidth  = 96
+	videoContactSheetCellHeight = 54 // 16:9，与默认 288px 缩略图保持一致
+	videoContactSheetWidth      = videoContactSheetColumns * videoContactSheetCellWidth
+	videoContactSheetHeight     = videoContactSheetRows * videoContactSheetCellHeight
+)
+
+// buildVideoContactSheet 将候选帧按原始位置合成 3×3 图。
+// 取帧失败的位置保留深色空格，便于前端仍显示已成功的候选。
+func buildVideoContactSheet(frames [][]byte) ([]byte, error) {
+	sheet := imaging.New(videoContactSheetWidth, videoContactSheetHeight, color.NRGBA{R: 16, G: 16, B: 16, A: 255})
+	for i := 0; i < videoContactSheetColumns*videoContactSheetRows && i < len(frames); i++ {
+		if len(frames[i]) == 0 {
+			continue
+		}
+		img, err := imaging.Decode(bytes.NewReader(frames[i]))
+		if err != nil {
+			continue
+		}
+		tile := imaging.Fill(img, videoContactSheetCellWidth, videoContactSheetCellHeight, imaging.Center, imaging.Lanczos)
+		x := (i % videoContactSheetColumns) * videoContactSheetCellWidth
+		y := (i / videoContactSheetColumns) * videoContactSheetCellHeight
+		sheet = imaging.Paste(sheet, tile, image.Point{X: x, Y: y})
+	}
+	var buf bytes.Buffer
+	if err := imaging.Encode(&buf, sheet, imaging.PNG); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // thumbSemMu 动态并发信号量：容量来自设置 thumb_concurrency
 var (
 	thumbSemMu    sync.Mutex
 	thumbSemCount int
 )
 
-// thumbAcquire 获取生成并发名额。withTimeout 为 true 时（预热任务）超时即让位，
-// 保证浏览器直接请求优先；false 时（直接请求）无限等待。
-func thumbAcquire(withTimeout bool) (got bool) {
+// thumbAcquire 获取生成并发名额。wait > 0 时最多等待指定时长，
+// wait <= 0 时只受 ctx 控制；直接请求取消后不会继续占着 goroutine 等名额。
+func thumbAcquire(ctx context.Context, wait time.Duration) (got bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
 	limit := thumbGenPower().AcquireLimit
 	if limit < 1 {
 		limit = 1
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	if wait > 0 {
+		timer = time.NewTimer(wait)
+		timeout = timer.C
+		defer timer.Stop()
+	}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		thumbSemMu.Lock()
 		if thumbSemCount < limit {
@@ -174,10 +351,13 @@ func thumbAcquire(withTimeout bool) (got bool) {
 			return true
 		}
 		thumbSemMu.Unlock()
-		if withTimeout && time.Now().After(deadline) {
+		select {
+		case <-ctx.Done():
 			return false
+		case <-timeout:
+			return false
+		case <-ticker.C:
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -191,8 +371,6 @@ func thumbRelease() {
 type thumbPrewarmTask struct {
 	kind    string
 	rawPath string
-	apiURL  string
-	retry   int
 }
 
 var (
@@ -230,6 +408,51 @@ func thumbFailPath(kind, rawPath string) string {
 	return filepath.Join(thumbDir(), fmt.Sprintf("%s-%s.fail", kind, thumbHash(rawPath)))
 }
 
+func newThumbTempPath(kind, rawPath, suffix string) (string, error) {
+	f, err := os.CreateTemp(thumbDir(), fmt.Sprintf("%s-%s-*%s", kind, thumbHash(rawPath), suffix))
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	committed := false
+	defer func() {
+		_ = f.Close()
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := f.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 func thumbFailTTLDuration() time.Duration {
 	sec := setting.GetInt(conf.ThumbFailTTL, 7*24*60*60)
 	if sec <= 0 {
@@ -253,7 +476,7 @@ func markThumbFailed(kind, rawPath, msg string) {
 		"at":   time.Now().Format(time.RFC3339),
 		"msg":  msg,
 	})
-	_ = os.WriteFile(thumbFailPath(kind, rawPath), data, 0o666)
+	_ = writeFileAtomic(thumbFailPath(kind, rawPath), data, 0o666)
 }
 
 // thumbFailItem 失败缩略图信息
@@ -311,119 +534,170 @@ func thumbLinkHeader() http.Header {
 	}
 }
 
-// thumbProxyForPath 解析缩略图请求代理：
-//  1. 用户在缩略图页选择的代理节点（off/auto/manual，manual 节点风控时自动切健康节点）
-//  2. 存储级显式代理 / 全局 proxy_address（模式为 off 时走这里）
-//
-// 返回 (代理地址, 代理节点ID)；nodeID=0 表示未走代理节点
-func thumbProxyForPath(rawPath string) (string, uint) {
-	if thumbProxyMode() != thumbProxyModeOff {
-		if addr, nodeID := resolveThumbProxy(); addr != "" {
-			return addr, nodeID
-		}
-	}
+// thumbProxyForPath 返回缩略图读取使用的静态出站代理。
+// 动态节点选择已移除；驱动与缩略图共用存储配置或全局 proxy_address。
+func thumbProxyForPath(rawPath string) string {
 	if rawPath != "" {
 		storage, err := fs.GetStorage(rawPath, &fs.GetStoragesArgs{})
 		if err == nil {
 			if p, ok := storage.GetAddition().(interface{ GetProxy() string }); ok {
 				if px := p.GetProxy(); px != "" {
-					return px, 0
+					return px
 				}
 			}
 		}
 	}
-	return conf.Conf.ProxyAddress, 0
+	return conf.Conf.ProxyAddress
 }
 
-// countingReadCloser 统计通过代理节点读取的字节数
-type countingReadCloser struct {
-	rc io.ReadCloser
-	n  int64
+type thumbHTTPClientEntry struct {
+	client *http.Client
+	err    error
 }
 
-func (c *countingReadCloser) Read(p []byte) (int, error) {
-	n, err := c.rc.Read(p)
-	c.n += int64(n)
-	return n, err
-}
+var thumbHTTPClients sync.Map
 
-func (c *countingReadCloser) Close() error { return c.rc.Close() }
-
-// newThumbHTTPClient 构建缩略图下载用的 HTTP client，proxy 非空时走指定代理
-func newThumbHTTPClient(proxy string, timeout time.Duration) *http.Client {
-	transport := &http.Transport{
-		Proxy:           http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify},
+// thumbHTTPClient 为每个静态代理复用 Transport/Client，保留连接池。
+func thumbHTTPClient(proxy string) (*http.Client, error) {
+	if cached, ok := thumbHTTPClients.Load(proxy); ok {
+		e := cached.(thumbHTTPClientEntry)
+		return e.client, e.err
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	insecureSkipVerify := conf.Conf != nil && conf.Conf.TlsInsecureSkipVerify
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecureSkipVerify}
 	if proxy != "" {
-		if u, err := url.Parse(proxy); err == nil {
-			transport.Proxy = http.ProxyURL(u)
+		u, err := url.Parse(proxy)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			if err == nil {
+				err = fmt.Errorf("proxy URL must include scheme and host")
+			}
+			e := thumbHTTPClientEntry{err: fmt.Errorf("invalid proxy address %q: %w", proxy, err)}
+			actual, _ := thumbHTTPClients.LoadOrStore(proxy, e)
+			stored := actual.(thumbHTTPClientEntry)
+			return stored.client, stored.err
 		}
+		transport.Proxy = http.ProxyURL(u)
 	}
-	return &http.Client{Timeout: timeout, Transport: transport}
+	e := thumbHTTPClientEntry{client: &http.Client{Transport: transport}}
+	actual, _ := thumbHTTPClients.LoadOrStore(proxy, e)
+	stored := actual.(thumbHTTPClientEntry)
+	return stored.client, stored.err
+}
+
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *cancelReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.cancel()
+	return err
+}
+
+func validateThumbRangeResponse(resp *http.Response, offset, limit int64) error {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		value := strings.TrimSpace(resp.Header.Get("Content-Range"))
+		unit, rest, ok := strings.Cut(value, " ")
+		if !ok || !strings.EqualFold(unit, "bytes") {
+			return fmt.Errorf("invalid Content-Range %q", value)
+		}
+		bounds, _, ok := strings.Cut(rest, "/")
+		if !ok {
+			return fmt.Errorf("invalid Content-Range %q", value)
+		}
+		startText, endText, ok := strings.Cut(bounds, "-")
+		if !ok {
+			return fmt.Errorf("invalid Content-Range %q", value)
+		}
+		start, startErr := strconv.ParseInt(startText, 10, 64)
+		end, endErr := strconv.ParseInt(endText, 10, 64)
+		if startErr != nil || endErr != nil || start != offset || end != offset+limit-1 {
+			return fmt.Errorf("unexpected Content-Range %q for bytes=%d-%d", value, offset, offset+limit-1)
+		}
+		return nil
+	case http.StatusOK:
+		// Some origins ignore Range for an initial read. It is safe only at offset 0;
+		// callers still wrap the body in LimitReader.
+		if offset == 0 {
+			return nil
+		}
+		return fmt.Errorf("origin ignored Range request at offset %d", offset)
+	default:
+		return fmt.Errorf("download failed: %d %s", resp.StatusCode, resp.Status)
+	}
+}
+
+func openThumbRange(ctx context.Context, link *model.Link, offset, limit int64, proxy string, timeout time.Duration) (io.ReadCloser, error) {
+	if link == nil {
+		return nil, errors.New("nil download link")
+	}
+	if offset < 0 || limit <= 0 || offset+limit-1 < offset {
+		return nil, fmt.Errorf("invalid byte range offset=%d limit=%d", offset, limit)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	if link.RangeReader != nil {
+		rc, err := link.RangeReader.RangeRead(requestCtx, http_range.Range{Start: offset, Length: limit})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		return &cancelReadCloser{ReadCloser: rc, cancel: cancel}, nil
+	}
+	if link.URL == "" {
+		cancel()
+		return nil, errors.New("download link has no URL or RangeReader")
+	}
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, link.URL, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header = link.Header.Clone()
+	if req.Header == nil {
+		req.Header = http.Header{}
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+limit-1))
+	client, err := thumbHTTPClient(proxy)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if err := validateThumbRangeResponse(resp, offset, limit); err != nil {
+		_ = resp.Body.Close()
+		cancel()
+		return nil, err
+	}
+	return &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}, nil
 }
 
 // downloadRange 从链接读取 [offset, offset+limit) 字节到本地：
 // 优先使用驱动提供的 RangeReader（本地/流式驱动），否则用 Range 请求下载（proxy 非空时走代理）。
-// nodeID 非 0 时统计该代理节点的接收字节（OpenList 侧"走代理的流量"），失败触发风控自动切换。
-func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset, limit int64, proxy string, nodeID uint) (int64, error) {
-	// 连接计数：仅在通过代理节点发起 HTTP 请求时
-	useNode := nodeID != 0 && link.RangeReader == nil
-	if useNode {
-		proxyConnAdd(nodeID)
-		defer proxyConnDel(nodeID)
+func downloadRange(ctx context.Context, link *model.Link, dstPath string, offset, limit int64, proxy string) (int64, error) {
+	rc, err := openThumbRange(ctx, link, offset, limit, proxy, 90*time.Second)
+	if err != nil {
+		return 0, err
 	}
-	var (
-		rc  io.ReadCloser
-		err error
-	)
-	if link.RangeReader != nil {
-		rc, err = link.RangeReader.RangeRead(ctx, http_range.Range{Start: offset, Length: limit})
-		if err != nil {
-			return 0, err
-		}
-		defer rc.Close()
-	} else {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
-		if err != nil {
-			return 0, err
-		}
-		req.Header = link.Header.Clone()
-		if req.Header == nil {
-			req.Header = http.Header{}
-		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+limit-1))
-		client := newThumbHTTPClient(proxy, 90*time.Second)
-		resp, err := client.Do(req)
-		if err != nil {
-			recordProxyFailure(nodeID)
-			return 0, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			recordProxyFailure(nodeID)
-			return 0, fmt.Errorf("download failed: %d %s", resp.StatusCode, resp.Status)
-		}
-		rc = resp.Body
-	}
-	if useNode {
-		rc = &countingReadCloser{rc: rc}
-	}
+	defer rc.Close()
 	f, err := os.Create(dstPath)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	n, cpErr := io.Copy(f, rc)
-	if cpErr != nil {
-		recordProxyFailure(nodeID)
-		return n, cpErr
+	n, err := io.Copy(f, io.LimitReader(rc, limit))
+	if err != nil {
+		return n, err
 	}
-	if useNode {
-		if c := rc.(*countingReadCloser); c.n > 0 {
-			recordProxyUse(nodeID, c.n, 0)
-			recordProxySuccess(nodeID)
-		}
+	if n != limit {
+		return n, fmt.Errorf("short range read: got %d bytes, want %d: %w", n, limit, io.ErrUnexpectedEOF)
 	}
 	return n, nil
 }
@@ -487,29 +761,91 @@ func setStreamContext(stream *ffmpeg.Stream, ctx context.Context) {
 	stream.Context = ctx
 }
 
-// extractVideoFrameAt 通过 ffmpeg HTTP Range 从远程 URL 指定时间点抽一帧（原始 mjpeg 字节）
-func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss string) ([]byte, error) {
-	srcBuf := bytes.NewBuffer(nil)
-	var hb strings.Builder
-	for k, vs := range header {
-		for _, v := range vs {
-			hb.WriteString(k)
-			hb.WriteString(": ")
-			hb.WriteString(v)
-			hb.WriteString("\r\n")
+const thumbFFmpegStderrLimit = 8 * 1024
+
+// thumbLimitedBuffer 防止 ffmpeg 异常输出大量 stderr；其中内容只用于本地风控分类。
+type thumbLimitedBuffer struct {
+	buf bytes.Buffer
+}
+
+func (b *thumbLimitedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len() < thumbFFmpegStderrLimit {
+		n := thumbFFmpegStderrLimit - b.buf.Len()
+		if n > len(p) {
+			n = len(p)
+		}
+		_, _ = b.buf.Write(p[:n])
+	}
+	return len(p), nil
+}
+
+func (b *thumbLimitedBuffer) String() string {
+	return b.buf.String()
+}
+
+func isThumbRemoteRiskText(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"403", "405", "forbidden", "blocked", "pmt"} {
+		if strings.Contains(lower, marker) {
+			return true
 		}
 	}
-	hb.WriteString("\r\n")
-	kwargs := ffmpeg.KwArgs{"noaccurate_seek": "", "timeout": "20000000"}
+	return false
+}
+
+func isThumbRemoteRiskError(err error) bool {
+	return err != nil && (errors.Is(err, errThumbRemoteRisk) || isThumbRemoteRiskText(err.Error()))
+}
+
+func ffmpegHTTPHeaders(header http.Header) string {
+	if len(header) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(header))
+	for key := range header {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		for _, value := range header.Values(key) {
+			value = strings.ReplaceAll(strings.ReplaceAll(value, "\r", ""), "\n", "")
+			b.WriteString(key)
+			b.WriteString(": ")
+			b.WriteString(value)
+			b.WriteString("\r\n")
+		}
+	}
+	return b.String()
+}
+
+// extractVideoFrameAt 通过 ffmpeg HTTP Range 从远程 URL 指定时间点抽一帧（原始 mjpeg 字节）。
+func extractVideoFrameAt(ctx context.Context, sourceURL string, header http.Header, proxy, ss string) ([]byte, error) {
+	if sourceURL == "" {
+		return nil, errors.New("remote media link has no URL")
+	}
+	srcBuf := bytes.NewBuffer(nil)
+	var stderr thumbLimitedBuffer
+	kwargs := ffmpeg.KwArgs{"noaccurate_seek": "", "rw_timeout": "20000000"}
 	if ss != "" {
 		kwargs["ss"] = ss
 	}
-	stream := ffmpeg.Input(url, kwargs).
+	if headers := ffmpegHTTPHeaders(header); headers != "" {
+		kwargs["headers"] = headers
+	}
+	if proxy != "" {
+		kwargs["http_proxy"] = proxy
+	}
+	stream := ffmpeg.Input(sourceURL, kwargs).
 		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "strict": "unofficial"}).
-		GlobalArgs("-headers", hb.String(), "-loglevel", "error").Silent(true).
-		WithOutput(srcBuf, os.Stdout)
+		GlobalArgs("-loglevel", "error").Silent(true).
+		WithOutput(srcBuf, &stderr)
 	setStreamContext(stream, ctx)
 	if err := stream.Run(); err != nil {
+		if isThumbRemoteRiskText(stderr.String()) || isThumbRemoteRiskText(err.Error()) {
+			// 不把远程 URL、签名或请求头带回上层，只返回固定风控错误。
+			return nil, errThumbRemoteRisk
+		}
 		return nil, err
 	}
 	if srcBuf.Len() == 0 {
@@ -521,15 +857,18 @@ func extractVideoFrameAt(ctx context.Context, url string, header http.Header, ss
 // extractVideoFrameRemote 通过 ffmpeg HTTP Range 直接远程抽帧（3s 处单帧缩略图），
 // 适用于 moov 在文件尾部、本地切片无法解析的场景（只传输所需字节）。
 // 深偏移 seek 对部分文件（moov 在尾部/结构稀疏）抽不到帧，回退到首帧（offset 0）。
-func extractVideoFrameRemote(ctx context.Context, url string, header http.Header) ([]byte, error) {
+func extractVideoFrameRemote(ctx context.Context, sourceURL string, header http.Header, proxy string) ([]byte, error) {
 	var (
 		last    []byte
 		lastErr error
 	)
 	// 依次尝试多个远程取帧点，跳过空白帧（见 extractVideoFrame 注释）
 	for _, ss := range []string{"3", "0", "10", "30", "60"} {
-		data, err := extractVideoFrameAt(ctx, url, header, ss)
+		data, err := extractVideoFrameAt(ctx, sourceURL, header, proxy, ss)
 		if err != nil {
+			if isThumbRemoteRiskError(err) {
+				return nil, err
+			}
 			lastErr = err
 			continue
 		}
@@ -554,13 +893,16 @@ func extractVideoFrameRemote(ctx context.Context, url string, header http.Header
 // 115 对大文件深偏移 Range 常返回 403（每次失败 ~0.5s 快速跳过），
 // 部分文件深偏移 seek 抽不到帧（moov 在尾部），此时首帧兜底。
 // 单帧+自适应比多帧网格更快更可靠。
-func generateVideoAdaptiveFrame(ctx context.Context, url string, header http.Header, duration float64) ([]byte, error) {
+func generateVideoAdaptiveFrame(ctx context.Context, sourceURL string, header http.Header, proxy string, duration float64) ([]byte, error) {
 	if duration <= 0 {
 		return nil, errors.New("invalid duration")
 	}
 	for _, ratio := range []float64{0.5, 0.3, 0.15, 0.07, 0.03, 0.0} {
-		data, err := extractVideoFrameAt(ctx, url, header, fmt.Sprintf("%.2f", duration*ratio))
+		data, err := extractVideoFrameAt(ctx, sourceURL, header, proxy, fmt.Sprintf("%.2f", duration*ratio))
 		if err != nil {
+			if isThumbRemoteRiskError(err) {
+				return nil, err
+			}
 			continue
 		}
 		thumb, err := encodeThumb(data)
@@ -650,15 +992,20 @@ func thumbRecord(rawPath string) {
 	line := fmt.Sprintf(`{"path":%s,"at":%q}%s`,
 		strconv.Quote(rawPath), time.Now().Format(time.RFC3339), "\n")
 	thumbIndexMu.Lock()
-	defer thumbIndexMu.Unlock()
 	f, err := os.OpenFile(thumbIndexPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
 	if err != nil {
+		thumbIndexMu.Unlock()
 		return
 	}
 	_, _ = f.WriteString(line)
 	_ = f.Close()
 	// 索引超过 50000 行时截断重写（仅保留缓存文件仍存在的条目）
-	if fi, err := os.Stat(thumbIndexPath()); err == nil && fi.Size() > 4*1024*1024 {
+	needRewrite := false
+	if fi, err := os.Stat(thumbIndexPath()); err == nil {
+		needRewrite = fi.Size() > 4*1024*1024
+	}
+	thumbIndexMu.Unlock()
+	if needRewrite {
 		thumbRewriteIndex()
 	}
 	// 新缩略图生成成功：使顶部聚合统计失效，下次轮询立即重算（磁盘扫描廉价）
@@ -669,22 +1016,21 @@ func thumbRecord(rawPath string) {
 
 // thumbRewriteIndex 重写索引：只保留仍有效（本地缓存存在或已上传到网盘）的条目
 func thumbRewriteIndex() {
+	thumbIndexMu.Lock()
+	defer thumbIndexMu.Unlock()
 	lines := readThumbIndex()
 	cloud := readThumbCloudIndex()
-	f, err := os.Create(thumbIndexPath())
-	if err != nil {
-		return
-	}
-	defer f.Close()
+	var b strings.Builder
 	for _, p := range lines {
 		h := thumbHash(p)
 		if _, err := os.Stat(filepath.Join(thumbDir(), "video-"+h+".png")); err == nil {
-			_, _ = f.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+			b.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
 		} else if cloud[p] {
 			// 本地已删除（上传到网盘后），网盘仍持有缩略图：保留索引
-			_, _ = f.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
+			b.WriteString(fmt.Sprintf(`{"path":%s,"at":""}%s`, strconv.Quote(p), "\n"))
 		}
 	}
+	_ = writeFileAtomic(thumbIndexPath(), []byte(b.String()), 0o666)
 }
 
 // readThumbIndex 读取索引中的路径列表（去重，保留先后顺序）
@@ -877,7 +1223,7 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		return
 	}
 
-	if !thumbAcquire(false) {
+	if !thumbAcquire(c.Request.Context(), 0) {
 		// 并发占用：返回占位图（不写负缓存，下次有机会自动重试）
 		serveThumbPlaceholder(c)
 		return
@@ -892,14 +1238,14 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	// 本地未命中：若网盘 _thumbnails 已有上传副本（如"上传→清空本地"场景），先恢复避免重复生成
 	if kind == thumbKindVideo {
 		if data, ok := tryRestoreRemoteThumb(c.Request.Context(), rawPath); ok {
-			_ = os.WriteFile(cachePath, data, 0o666)
+			_ = writeFileAtomic(cachePath, data, 0o666)
 			thumbRecord(rawPath)
 			serveThumbPNG(c, data)
 			return
 		}
 	}
 
-	png, err := generate()
+	png, err := generateThumbOnce(kind, rawPath, generate)
 	if err != nil {
 		if errors.Is(err, errThumbNoCover) {
 			markThumbFailed(kind, rawPath, "无封面/无法抽帧")
@@ -923,7 +1269,7 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		serveThumbPlaceholder(c)
 		return
 	}
-	_ = os.WriteFile(cachePath, png, 0o666)
+	_ = writeFileAtomic(cachePath, png, 0o666)
 	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
 }
@@ -944,65 +1290,19 @@ var thumbPlaceholderPNG = []byte{
 	0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 }
 
-// downloadRangeBytes 从链接读取 [offset, offset+limit) 字节返回
-// nodeID 非 0 时统计该代理节点的接收字节，失败触发风控自动切换
-func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int64, proxy string, nodeID uint) ([]byte, error) {
-	useNode := nodeID != 0 && link.RangeReader == nil
-	if useNode {
-		proxyConnAdd(nodeID)
-		defer proxyConnDel(nodeID)
+// downloadRangeBytes 从链接读取 [offset, offset+limit) 字节返回。
+func downloadRangeBytes(ctx context.Context, link *model.Link, offset, limit int64, proxy string) ([]byte, error) {
+	rc, err := openThumbRange(ctx, link, offset, limit, proxy, 30*time.Second)
+	if err != nil {
+		return nil, err
 	}
-	var (
-		rc  io.ReadCloser
-		err error
-	)
-	if link.RangeReader != nil {
-		rc, err = link.RangeReader.RangeRead(ctx, http_range.Range{Start: offset, Length: limit})
-		if err != nil {
-			return nil, err
-		}
-		defer rc.Close()
-	} else {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header = link.Header.Clone()
-		if req.Header == nil {
-			req.Header = http.Header{}
-		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+limit-1))
-		client := newThumbHTTPClient(proxy, 30*time.Second)
-		resp, err := client.Do(req)
-		if err != nil {
-			recordProxyFailure(nodeID)
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			recordProxyFailure(nodeID)
-			return nil, fmt.Errorf("download failed: %d %s", resp.StatusCode, resp.Status)
-		}
-		rc = resp.Body
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, limit))
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		if rc != nil {
-			_ = rc.Close()
-		}
-	}()
-	var cr *countingReadCloser
-	if useNode {
-		cr = &countingReadCloser{rc: rc}
-		rc = cr
-	}
-	data, rdErr := io.ReadAll(io.LimitReader(rc, limit))
-	if rdErr != nil {
-		recordProxyFailure(nodeID)
-		return nil, rdErr
-	}
-	if useNode && cr.n > 0 {
-		recordProxyUse(nodeID, cr.n, 0)
-		recordProxySuccess(nodeID)
+	if int64(len(data)) != limit {
+		return nil, fmt.Errorf("short range read: got %d bytes, want %d: %w", len(data), limit, io.ErrUnexpectedEOF)
 	}
 	return data, nil
 }
@@ -1021,21 +1321,24 @@ type moovCacheEntry struct {
 const moovCacheTTL = 24 * time.Hour
 
 // moovAtTail 探测 moov 元数据是否位于文件尾部（下载末尾 64KB 查找 moov 标记）
-func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath string) bool {
+func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath string) (bool, error) {
 	moovCacheMu.Lock()
 	if e, ok := moovCache[rawPath]; ok && time.Since(e.at) < moovCacheTTL {
 		moovCacheMu.Unlock()
-		return e.atTail
+		return e.atTail, nil
 	}
 	moovCacheMu.Unlock()
 	tailLen := int64(64 * 1024)
 	if size < tailLen {
-		return false
+		return false, nil
 	}
-	proxy, proxyNode := thumbProxyForPath(rawPath)
-	data, err := downloadRangeBytes(ctx, link, size-tailLen, tailLen, proxy, proxyNode)
+	proxy := thumbProxyForPath(rawPath)
+	data, err := downloadRangeBytes(ctx, link, size-tailLen, tailLen, proxy)
 	if err != nil {
-		return false
+		if isThumbRemoteRiskError(err) {
+			return false, errThumbRemoteRisk
+		}
+		return false, nil
 	}
 	atTail := bytes.Contains(data, []byte("moov"))
 	moovCacheMu.Lock()
@@ -1048,17 +1351,19 @@ func moovAtTail(ctx context.Context, link *model.Link, size int64, rawPath strin
 		}
 	}
 	moovCacheMu.Unlock()
-	return atTail
+	return atTail, nil
 }
 
 // generateVideoThumb 生成视频缩略图（直接请求与预热共用）。
 // 若经代理下载/抽帧得到空白图（代理中继损坏视频字节的典型表现），
 // 自动回退直连重新生成一次。
-func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]byte, error) {
-	png, err := generateVideoThumbInner(ctx, rawPath, apiURL, true)
+func generateVideoThumb(ctx context.Context, rawPath string) ([]byte, error) {
+	thumbGenerationAdmission.RLock()
+	defer thumbGenerationAdmission.RUnlock()
+	png, err := generateVideoThumbInner(ctx, rawPath, true)
 	if err == nil && isBlankThumb(png) {
-		log.Warnf("thumb blank via proxy, retry direct: %s", rawPath)
-		if png2, err2 := generateVideoThumbInner(ctx, rawPath, apiURL, false); err2 == nil {
+		log.Warnf("thumb blank via configured route, retry direct: %s", rawPath)
+		if png2, err2 := generateVideoThumbInner(ctx, rawPath, false); err2 == nil {
 			return png2, nil
 		}
 	}
@@ -1066,7 +1371,7 @@ func generateVideoThumb(ctx context.Context, rawPath string, apiURL string) ([]b
 }
 
 // generateVideoThumbInner 生成视频缩略图。useProxy=false 时跳过代理直连下载。
-func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string, useProxy bool) ([]byte, error) {
+func generateVideoThumbInner(ctx context.Context, rawPath string, useProxy bool) ([]byte, error) {
 	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
 		rawPath = "/" + rawPath
 	}
@@ -1079,61 +1384,76 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 		return nil, err
 	}
 	defer link.Close()
-	proxy, proxyNode := thumbProxyForPath(rawPath)
+	proxy := thumbProxyForPath(rawPath)
 	if !useProxy {
-		proxy, proxyNode = "", 0
+		proxy = ""
 	}
 	size := obj.GetSize()
 	// 0 = 不限大小（缩略图只下载开头/末尾 3MB 片段或远程抽帧，不下载整文件，大文件也安全）
 	if maxSize > 0 && size > maxSize {
 		return nil, errThumbTooLarge
 	}
-	remoteURL := apiURL + "/d" + utils.EncodePath(rawPath, true) + "?sign=" + sign.SignPath(rawPath)
+	remoteURL := link.URL
 
 	// moov 在文件尾部时本地片段必然无法解析；长视频探测时长后取"中间单帧"（1x1），
 	// 短视频直接远程抽 3s 单帧
-	if moovAtTail(ctx, link, size, rawPath) {
+	atTail, err := moovAtTail(ctx, link, size, rawPath)
+	if err != nil {
+		return nil, err
+	}
+	if atTail {
 		if size > thumbProbeMinSize {
-			if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-				if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, dur); err == nil {
+			if dur := probeVideoDuration(ctx, rawPath); dur > thumbMosaicLongSec {
+				if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, proxy, dur); err == nil {
 					return data, nil
+				} else if isThumbRemoteRiskError(err) {
+					return nil, err
 				}
 			}
 		}
-		return extractVideoFrameRemote(ctx, remoteURL, link.Header)
+		return extractVideoFrameRemote(ctx, remoteURL, link.Header, proxy)
 	}
 
 	// 长视频：探测时长后取"中间单帧"（1x1，中间内容）；失败降级本地头部抽帧
 	if size > thumbProbeMinSize {
-		if dur := probeVideoDuration(ctx, rawPath, apiURL); dur > thumbMosaicLongSec {
-			if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, dur); err == nil {
+		if dur := probeVideoDuration(ctx, rawPath); dur > thumbMosaicLongSec {
+			if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, proxy, dur); err == nil {
 				return data, nil
+			} else if isThumbRemoteRiskError(err) {
+				return nil, err
 			}
 			log.Debugf("middle frame failed for %s, fallback to head chunk", rawPath)
 		}
 	}
 
-	cachePath := thumbCachePath(thumbKindVideo, rawPath)
-	tmpFile := cachePath + ".tmp.mp4"
+	tmpFile, err := newThumbTempPath(thumbKindVideo, rawPath, ".tmp.mp4")
+	if err != nil {
+		return nil, err
+	}
 	defer os.Remove(tmpFile)
 	if size <= thumbChunkSize {
-		if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); err != nil {
+		if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy); err != nil {
 			return nil, err
 		}
 		return extractVideoFrame(ctx, tmpFile)
 	}
 	// 下载开头片段（moov 在头部时常见情况；片段不够（大 moov）自动加大重试）
-	if data, ok := thumbExtractRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); ok {
+	if data, ok, err := thumbExtractRange(ctx, link, tmpFile, 0, size, proxy); err != nil {
+		return nil, err
+	} else if ok {
 		return data, nil
 	}
-	// moov 位于文件尾部（探测失败或非标准容器）：ffmpeg 直接 HTTP Range 远程抽帧。
-	// 走自身 /d 代理接口（服务端已注入驱动 Cookie，不依赖 ffmpeg -headers 传 Cookie，
-	// 后者对 115 直链不可靠）；302 直链场景下 -headers 仍保留 Cookie 作兜底。
-	if data, err := extractVideoFrameRemote(ctx, remoteURL, link.Header); err == nil {
+	// moov 位于文件尾部（探测失败或非标准容器）：ffmpeg 直接读取驱动返回的 URL/Header，
+	// 不再绕公共 /d，也不依赖外部请求 Host。
+	if data, err := extractVideoFrameRemote(ctx, remoteURL, link.Header, proxy); err == nil {
 		return data, nil
+	} else if isThumbRemoteRiskError(err) {
+		return nil, err
 	}
 	// 最后兜底：下载末尾片段（moov 在尾部且本地可解析时有效；同样自动加大片段）
-	if data, ok := thumbExtractRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy, proxyNode); ok {
+	if data, ok, err := thumbExtractRange(ctx, link, tmpFile, size-thumbChunkSize, size, proxy); err != nil {
+		return nil, err
+	} else if ok {
 		return data, nil
 	}
 	return nil, errors.New("unable to extract any video frame")
@@ -1142,7 +1462,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, apiURL string,
 // thumbExtractRange 下载 [start, start+chunk) 片段并抽帧；抽帧失败自动加大片段。
 // 大 moov 的视频（样本表很大）需要更大的头部/尾部片段才能解析；
 // 大文件直接从更大片段开始，避免小片段反复失败。
-func thumbExtractRange(ctx context.Context, link *model.Link, tmpFile string, start, size int64, proxy string, nodeID uint) ([]byte, bool) {
+func thumbExtractRange(ctx context.Context, link *model.Link, tmpFile string, start, size int64, proxy string) ([]byte, bool, error) {
 	var sizes []int64
 	if size > 512*1024*1024 {
 		sizes = []int64{16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024}
@@ -1157,18 +1477,21 @@ func thumbExtractRange(ctx context.Context, link *model.Link, tmpFile string, st
 		if limit <= 0 {
 			break
 		}
-		if _, err := downloadRange(ctx, link, tmpFile, start, limit, proxy, nodeID); err != nil {
+		if _, err := downloadRange(ctx, link, tmpFile, start, limit, proxy); err != nil {
+			if isThumbRemoteRiskError(err) {
+				return nil, false, err
+			}
 			continue
 		}
 		if data, err := extractVideoFrame(ctx, tmpFile); err == nil {
-			return data, true
+			return data, true, nil
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
-// thumbGenPower 返回生成强度参数。当前不做任何节流约束：以最大速度生成
-// （8 个 worker、无批间/批内间隔、并发名额上限放宽），不再做 115 风控限速。
+// thumbGenPower 返回生成强度参数。worker 与准入上限统一使用 thumb_concurrency，
+// 防止后台 worker、浏览器请求和候选任务绕过用户配置。
 type thumbGenPowerCfg struct {
 	Workers       int
 	BatchInterval time.Duration
@@ -1179,7 +1502,14 @@ type thumbGenPowerCfg struct {
 }
 
 func thumbGenPower() thumbGenPowerCfg {
-	return thumbGenPowerCfg{Workers: 8, BatchInterval: 0, AcquireLimit: 64, FrameInterval: 0, TaskInterval: 0, EnqueueMax: 100000}
+	limit := setting.GetInt(conf.ThumbConcurrency, 8)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 64 {
+		limit = 64
+	}
+	return thumbGenPowerCfg{Workers: limit, AcquireLimit: limit, EnqueueMax: 2048}
 }
 
 // prewarmStart 启动预热 worker（多 worker 并发生成，不做节流）
@@ -1258,6 +1588,12 @@ func prewarmWorker() {
 		if !ok {
 			return
 		}
+		// pause 可能发生在 worker 已经阻塞于 channel receive 之后；取到任务后再检查一次，
+		// 保证“暂停”不会额外漏跑一个任务。刚取出一个元素后 channel 必有回填空间。
+		if thumbQueuePaused.Load() {
+			prewarmRequeue(task)
+			continue
+		}
 		processTask(task)
 	}
 }
@@ -1271,6 +1607,14 @@ var (
 	thumbActiveTasks  = map[string]time.Time{}          // rawPath -> startedAt
 	thumbActiveCancel = map[string]context.CancelFunc{} // rawPath -> cancel
 	thumbGenEpoch     int64                             // 生成代际：暂停/清空时递增，用于丢弃旧代任务
+)
+
+// 候选九宫格生成是用户主动触发的远程取帧操作：
+// 同一时间只允许一个候选任务，并与预热 worker 做准入隔离，避免叠加请求触发 115 风控。
+var (
+	thumbCandidateGate       = make(chan struct{}, 1)
+	thumbCandidateActive     atomic.Bool
+	thumbGenerationAdmission sync.RWMutex
 )
 
 func thumbActiveTrack(rawPath string, active bool) {
@@ -1327,11 +1671,9 @@ func thumbTaskCancelled(genCtx context.Context, epoch int64) bool {
 }
 
 func processTask(task thumbPrewarmTask) {
-	// 115 风控中不下载视频生成缩略图（避免加剧风控）：
-	// 放回队列尾部并短暂让位，不阻塞其他存储（如 Onedrive）的任务处理
+	// 风控中不循环重排队，等下一次浏览或手动操作再入队。
 	if blocked, _ := isStorageBlocked(task.rawPath); blocked {
-		prewarmCh <- task
-		time.Sleep(2 * time.Second)
+		prewarmDone.Delete(task.rawPath)
 		return
 	}
 	cachePath := thumbCachePath(task.kind, task.rawPath)
@@ -1343,42 +1685,35 @@ func processTask(task thumbPrewarmTask) {
 		prewarmDone.Store(task.rawPath, struct{}{})
 		return
 	}
-	if !thumbAcquire(true) {
-		// 并发资源被直接请求占用，让位稍后重试
-		time.Sleep(500 * time.Millisecond)
-		prewarmCh <- task
+	if thumbCandidateActive.Load() {
+		// 候选任务正在进行，暂不让预热 worker 发起新的远程请求
+		time.Sleep(250 * time.Millisecond)
+		prewarmRequeue(task)
+		return
+	}
+	if !thumbAcquire(context.Background(), 2*time.Second) {
+		// 并发资源被直接请求或候选生成占用，让位稍后重试
+		prewarmRequeue(task)
 		return
 	}
 	atomic.AddInt32(&thumbActiveWorkers, 1)
 	defer atomic.AddInt32(&thumbActiveWorkers, -1)
 	defer thumbRelease()
 	epoch := atomic.LoadInt64(&thumbGenEpoch)
-	genCtx, cancel := context.WithCancel(context.Background())
+	genCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
 	thumbActiveTrack(task.rawPath, true)
 	thumbActiveCancelAdd(task.rawPath, cancel)
 	defer func() {
 		thumbActiveTrack(task.rawPath, false)
 		thumbActiveCancelDel(task.rawPath)
 	}()
-	// 生成任务硬限时 90s（115 驱动内部请求无超时，网盘风控黑洞时会永久挂起，
-	// 必须用 goroutine+select 强制放弃任务，保证 worker 永不卡死）
-	done := make(chan []byte, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		png, err := generateVideoThumb(genCtx, task.rawPath, task.apiURL)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		done <- png
-	}()
-	var png []byte
-	var err error
-	select {
-	case png = <-done:
-	case err = <-errCh:
-	case <-time.After(90 * time.Second):
-		err = fmt.Errorf("thumb generation timeout (90s)")
+	// 所有 Range 与 ffmpeg 操作共享同一个可取消 context；超时会真正终止子进程和读取。
+	png, err := generateThumbOnce(task.kind, task.rawPath, func() ([]byte, error) {
+		return generateVideoThumb(genCtx, task.rawPath)
+	})
+	if errors.Is(genCtx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("thumb generation timeout (90s): %w", context.DeadlineExceeded)
 	}
 	// 暂停/清空队列导致的取消：丢弃结果、不缓存、不重试（可重新生成）
 	if thumbTaskCancelled(genCtx, epoch) {
@@ -1393,19 +1728,9 @@ func processTask(task thumbPrewarmTask) {
 			prewarmDone.Store(task.rawPath, struct{}{})
 			return
 		}
-		// 生成失败不写 fail 标记（可能为网盘风控等临时问题），
-		// 长间隔退避重试（风控冻结通常 10-30 分钟，短间隔只会加重风控）
-		if task.retry < 3 {
-			prewarmDone.Delete(task.rawPath)
-			time.Sleep(180 * time.Second)
-			task.retry++
-			// 重试任务阻塞入队，保证不丢（新任务入队时丢弃自身而非重试任务）
-			prewarmCh <- task
-			return
-		}
-		log.Warnf("thumb prewarm failed [%s] %s: %v", task.kind, task.rawPath, err)
-		markThumbFailed(task.kind, task.rawPath, thumbFailReason(err))
-		prewarmDone.Store(task.rawPath, struct{}{})
+		// 临时失败不在 worker 内睡眠或循环重试，避免队列风暴；后续浏览可重新入队。
+		log.Warnf("thumb prewarm transient fail [%s] %s: %v", task.kind, task.rawPath, err)
+		prewarmDone.Delete(task.rawPath)
 		return
 	}
 	// 空白/纯色缩略图：视为生成失败（写失败标记、不缓存），避免占着"已有缩略图"名额
@@ -1417,13 +1742,15 @@ func processTask(task thumbPrewarmTask) {
 	}
 	// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
 	if addition := remoteThumbStore(task.rawPath); addition != nil {
-		if err := uploadThumbRemote(context.Background(), task.rawPath, addition, png); err != nil {
+		uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := uploadThumbRemote(uploadCtx, task.rawPath, addition, png); err != nil {
 			log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
 		}
+		uploadCancel()
 		remoteThumbCacheSet(task.rawPath, png)
-		_ = os.WriteFile(cachePath, png, 0o666)
+		_ = writeFileAtomic(cachePath, png, 0o666)
 	} else {
-		_ = os.WriteFile(cachePath, png, 0o666)
+		_ = writeFileAtomic(cachePath, png, 0o666)
 	}
 	thumbRecord(task.rawPath)
 	// 生成成功后清除远程 miss 标记（remote 模式可能之前被标 miss）
@@ -1584,27 +1911,32 @@ func thumbCloudRemove(paths []string) {
 				strconv.Quote(p), time.Now().Format(time.RFC3339)))
 		}
 		sort.Strings(lines)
-		_ = os.WriteFile(thumbCloudIndexPath(), []byte(strings.Join(lines, "\n")+"\n"), 0o666)
+		_ = writeFileAtomic(thumbCloudIndexPath(), []byte(strings.Join(lines, "\n")+"\n"), 0o666)
 	}
 	thumbCloudMu.Unlock()
 }
 
-// prewarmEnqueue 入队预热任务（去重）
-func prewarmEnqueue(kind, rawPath, apiURL string) {
+func prewarmRequeue(task thumbPrewarmTask) bool {
+	select {
+	case prewarmCh <- task:
+		return true
+	default:
+		prewarmDone.Delete(task.rawPath)
+		return false
+	}
+}
+
+// prewarmEnqueue 入队预热任务（去重）。队列满时丢弃本次预热，等待后续浏览重新发现。
+func prewarmEnqueue(kind, rawPath string) {
 	prewarmStart()
 	if _, done := prewarmDone.Load(rawPath); done {
 		return
 	}
 	prewarmDone.Store(rawPath, struct{}{})
 	select {
-	case prewarmCh <- thumbPrewarmTask{kind: kind, rawPath: rawPath, apiURL: apiURL}:
+	case prewarmCh <- thumbPrewarmTask{kind: kind, rawPath: rawPath}:
 	default:
-		// 队列满：清除去重标记，30s 后重试入队
 		prewarmDone.Delete(rawPath)
-		go func() {
-			time.Sleep(30 * time.Second)
-			prewarmEnqueue(kind, rawPath, apiURL)
-		}()
 	}
 }
 
@@ -1619,7 +1951,6 @@ func prewarmDir(c *gin.Context, parent string, objs []model.Obj) {
 		}
 	}
 	prewarmDirDeb.Store(parent, time.Now())
-	apiURL := common.GetApiUrl(c)
 	for _, obj := range objs {
 		if obj.IsDir() {
 			continue
@@ -1627,7 +1958,7 @@ func prewarmDir(c *gin.Context, parent string, objs []model.Obj) {
 		if utils.GetFileType(obj.GetName()) != conf.VIDEO {
 			continue
 		}
-		prewarmEnqueue(thumbKindVideo, parent+"/"+obj.GetName(), apiURL)
+		prewarmEnqueue(thumbKindVideo, parent+"/"+obj.GetName())
 	}
 }
 
@@ -1647,7 +1978,7 @@ func VideoThumb(c *gin.Context) {
 		return
 	}
 	serveThumb(c, thumbKindVideo, rawPath, func() ([]byte, error) {
-		return generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
+		return generateVideoThumb(c.Request.Context(), rawPath)
 	})
 }
 
@@ -1798,8 +2129,8 @@ func tryRestoreRemoteThumb(ctx context.Context, rawPath string) ([]byte, bool) {
 		return nil, false
 	}
 	defer link.Close()
-	proxy, proxyNode := thumbProxyForPath(rawPath)
-	data, err := downloadRangeBytes(ctx, link, 0, obj.GetSize(), proxy, proxyNode)
+	proxy := thumbProxyForPath(rawPath)
+	data, err := downloadRangeBytes(ctx, link, 0, obj.GetSize(), proxy)
 	if err != nil {
 		return nil, false
 	}
@@ -1854,7 +2185,7 @@ func uploadThumbRemote(ctx context.Context, rawPath string, addition interface {
 	ThumbFolderName() string
 }, data []byte) error {
 	// 上传限流：与生成共用并发名额，避免多视频同时上传触发网盘风控
-	if !thumbAcquire(false) {
+	if !thumbAcquire(ctx, 0) {
 		return errors.New("thumbnail upload busy")
 	}
 	defer thumbRelease()
@@ -1921,11 +2252,11 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 		if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 			if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
 				defer link.Close()
-				proxy, proxyNode := thumbProxyForPath(rawPath)
-				if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy, proxyNode); err == nil {
+				proxy := thumbProxyForPath(rawPath)
+				if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy); err == nil {
 					remoteThumbMissClear(rawPath)
 					remoteThumbCacheSet(rawPath, data)
-					_ = os.WriteFile(diskPath, data, 0o666)
+					_ = writeFileAtomic(diskPath, data, 0o666)
 					serveThumbPNG(c, data)
 					return
 				}
@@ -1940,11 +2271,11 @@ func serveRemoteVideoThumb(c *gin.Context, rawPath string, addition interface {
 	if obj, err := fs.Get(c.Request.Context(), remotePath, &fs.GetArgs{NoLog: true}); err == nil {
 		if link, _, err := fs.Link(c.Request.Context(), remotePath, model.LinkArgs{Header: thumbLinkHeader()}); err == nil {
 			defer link.Close()
-			proxy, proxyNode := thumbProxyForPath(rawPath)
-			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy, proxyNode); err == nil {
+			proxy := thumbProxyForPath(rawPath)
+			if data, err := downloadRangeBytes(c.Request.Context(), link, 0, obj.GetSize(), proxy); err == nil {
 				remoteThumbMissClear(rawPath)
 				remoteThumbCacheSet(rawPath, data)
-				_ = os.WriteFile(diskPath, data, 0o666)
+				_ = writeFileAtomic(diskPath, data, 0o666)
 				thumbRecord(rawPath)
 				serveThumbPNG(c, data)
 				return
@@ -1970,7 +2301,13 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 		serveThumbPlaceholder(c)
 		return
 	}
-	png, err := generateVideoThumb(c.Request.Context(), rawPath, common.GetApiUrl(c))
+	png, err := generateThumbOnce(thumbKindVideo, rawPath, func() ([]byte, error) {
+		if !thumbAcquire(c.Request.Context(), 0) {
+			return nil, errors.New("thumbnail generation capacity unavailable")
+		}
+		defer thumbRelease()
+		return generateVideoThumb(c.Request.Context(), rawPath)
+	})
 	if err != nil {
 		if errors.Is(err, errThumbTooLarge) {
 			remoteThumbMissMark(rawPath)
@@ -1996,7 +2333,7 @@ func generateAndServeRemote(c *gin.Context, rawPath string, addition interface {
 	}()
 	remoteThumbMissClear(rawPath)
 	remoteThumbCacheSet(rawPath, png)
-	_ = os.WriteFile(diskPath, png, 0o666)
+	_ = writeFileAtomic(diskPath, png, 0o666)
 	thumbRecord(rawPath)
 	serveThumbPNG(c, png)
 }
@@ -2020,10 +2357,13 @@ func AudioThumb(c *gin.Context) {
 		if size > maxSize {
 			return nil, errThumbTooLarge
 		}
-		tmpFile := thumbCachePath(thumbKindAudio, rawPath) + ".tmp.mp3"
+		tmpFile, err := newThumbTempPath(thumbKindAudio, rawPath, ".tmp.mp3")
+		if err != nil {
+			return nil, err
+		}
 		defer os.Remove(tmpFile)
-		proxy, proxyNode := thumbProxyForPath(rawPath)
-		if _, err := downloadRange(c.Request.Context(), link, tmpFile, 0, size, proxy, proxyNode); err != nil {
+		proxy := thumbProxyForPath(rawPath)
+		if _, err := downloadRange(c.Request.Context(), link, tmpFile, 0, size, proxy); err != nil {
 			return nil, err
 		}
 		return extractAudioCover(c.Request.Context(), tmpFile)
@@ -2042,10 +2382,13 @@ func generateImageThumb(ctx context.Context, rawPath string) ([]byte, error) {
 	if size > maxSize {
 		return nil, errThumbTooLarge
 	}
-	tmpFile := thumbCachePath(thumbKindImage, rawPath) + ".tmp.img"
+	tmpFile, err := newThumbTempPath(thumbKindImage, rawPath, ".tmp.img")
+	if err != nil {
+		return nil, err
+	}
 	defer os.Remove(tmpFile)
-	proxy, proxyNode := thumbProxyForPath(rawPath)
-	if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy, proxyNode); err != nil {
+	proxy := thumbProxyForPath(rawPath)
+	if _, err := downloadRange(ctx, link, tmpFile, 0, size, proxy); err != nil {
 		return nil, err
 	}
 	return resizeImageFile(tmpFile)
@@ -2081,9 +2424,13 @@ func generateCoverThumb(ctx context.Context, rawPath string) ([]byte, error) {
 			link.Close()
 			continue
 		}
-		tmpFile := thumbCachePath(thumbKindCover, rawPath) + ".tmp.cover"
-		proxy, proxyNode := thumbProxyForPath(rawPath)
-		_, dlErr := downloadRange(ctx, link, tmpFile, 0, obj.GetSize(), proxy, proxyNode)
+		tmpFile, err := newThumbTempPath(thumbKindCover, rawPath, ".tmp.cover")
+		if err != nil {
+			link.Close()
+			continue
+		}
+		proxy := thumbProxyForPath(rawPath)
+		_, dlErr := downloadRange(ctx, link, tmpFile, 0, obj.GetSize(), proxy)
 		link.Close()
 		if dlErr != nil {
 			_ = os.Remove(tmpFile)
@@ -2129,6 +2476,18 @@ func startThumbCleanup() {
 	})
 }
 
+func isThumbCacheArtifact(name string) bool {
+	if !strings.HasSuffix(name, ".png") {
+		return false
+	}
+	for _, prefix := range []string{thumbKindVideo + "-", thumbKindAudio + "-", thumbKindImage + "-", thumbKindCover + "-"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func thumbCleanupOnceRun() {
 	dir := thumbDir()
 	entries, err := os.ReadDir(dir)
@@ -2159,6 +2518,16 @@ func thumbCleanupOnceRun() {
 			if now.Sub(fi.ModTime()) > thumbTmpTTL {
 				_ = os.Remove(filepath.Join(dir, name))
 			}
+			continue
+		}
+		if strings.HasSuffix(name, ".fail") {
+			if now.Sub(fi.ModTime()) > thumbFailTTLDuration() {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+			continue
+		}
+		// index.jsonl/cloud.jsonl/excluded.jsonl and any future metadata are not cache artifacts.
+		if !isThumbCacheArtifact(name) {
 			continue
 		}
 		p := filepath.Join(dir, name)
