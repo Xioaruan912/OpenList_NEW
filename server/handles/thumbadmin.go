@@ -2562,6 +2562,9 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 	riskBlocked := false
 	truncated := false
 	for i, ss := range positions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if i > 0 {
 			timer := time.NewTimer(frameGap)
 			select {
@@ -2581,6 +2584,9 @@ func runThumbCandidateJob(job *thumbCandidateJob, parent context.Context) error 
 		job.Done = i + 1
 		job.mu.Unlock()
 		if frameErr != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if storageMount == "" {
 				continue
 			}
