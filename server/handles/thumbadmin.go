@@ -142,9 +142,9 @@ func ThumbGenerate(c *gin.Context) {
 // 目录树聚合统计缓存：buildThumbTree 完整扫描后填充（覆盖全部目录，含非索引目录的网盘清单），
 // ThumbStatus 读取以保持与目录树一致（避免状态接口只统计索引目录导致数字对不上）。
 var (
-	thumbAggMu sync.Mutex
-	thumbAgg   struct{ cached, local, cloud int }
-	thumbAggAt time.Time
+	thumbAggMu         sync.Mutex
+	thumbAgg           struct{ cached, local, cloud int }
+	thumbAggAt         time.Time
 	thumbAggRefreshing atomic.Bool
 )
 
@@ -2247,8 +2247,13 @@ func ThumbCandidates(c *gin.Context) {
 	}
 	defer link.Close()
 	thumbRememberObject(thumbKindVideo, rawPath, obj)
-	remoteURL := link.URL
 	proxy := thumbProxyForPath(rawPath)
+	remoteURL, remoteHeader, remoteProxy, sourceCleanup, err := thumbFFmpegSource(ctx, rawPath, link, obj.GetSize(), proxy)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	defer sourceCleanup()
 
 	var positions []string
 	if size := obj.GetSize(); size > thumbProbeMinSize {
@@ -2293,7 +2298,7 @@ func ThumbCandidates(c *gin.Context) {
 			truncated = true
 			break
 		}
-		data, err := extractVideoFrameAt(ctx, remoteURL, link.Header, proxy, ss)
+		data, err := extractVideoFrameAt(ctx, remoteURL, remoteHeader, remoteProxy, ss)
 		if err != nil {
 			if storageMount == "" {
 				continue

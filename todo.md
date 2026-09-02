@@ -14,7 +14,7 @@
 ## 待处理
 - [x] 将缩略图 JSONL 索引迁移到数据库，并使用内容指纹替代路径 MD5
 - [x] 用 tache 任务管理器替换手写预热/上传队列
-- [ ] 增加内部回环 Range Gateway，统一不提供 URL 的 RangeReader 驱动与 ffmpeg 输入
+- [x] 增加内部回环 Range Gateway，统一不提供 URL 的 RangeReader 驱动与 ffmpeg 输入
 
 ## 本轮 Thumb 管理页 UI 调整
 - [x] 目录树：只有有子目录的文件夹才显示展开箭头

@@ -104,8 +104,8 @@ func probeVideoDuration(ctx context.Context, rawPath string) float64 {
 	videoDurProbeN++
 	videoDurMu.Unlock()
 
-	link, _, err := fs.Link(ctx, rawPath, model.LinkArgs{Header: thumbLinkHeader()})
-	if err != nil || link.URL == "" {
+	link, obj, err := fs.Link(ctx, rawPath, model.LinkArgs{Header: thumbLinkHeader()})
+	if err != nil {
 		if link != nil {
 			_ = link.Close()
 		}
@@ -113,14 +113,21 @@ func probeVideoDuration(ctx context.Context, rawPath string) float64 {
 		return 0
 	}
 	defer link.Close()
+	proxy := thumbProxyForPath(rawPath)
+	sourceURL, sourceHeader, sourceProxy, sourceCleanup, err := thumbFFmpegSource(ctx, rawPath, link, obj.GetSize(), proxy)
+	if err != nil {
+		cacheVideoDurationResult(cacheKey, 0, false)
+		return 0
+	}
+	defer sourceCleanup()
 	args := []string{"-v", "error", "-rw_timeout", "20000000"}
-	if headers := ffmpegHTTPHeaders(link.Header); headers != "" {
+	if headers := ffmpegHTTPHeaders(sourceHeader); headers != "" {
 		args = append(args, "-headers", headers)
 	}
-	if proxy := thumbProxyForPath(rawPath); proxy != "" {
-		args = append(args, "-http_proxy", proxy)
+	if sourceProxy != "" {
+		args = append(args, "-http_proxy", sourceProxy)
 	}
-	args = append(args, "-show_entries", "format=duration", "-of", "csv=p=0", link.URL)
+	args = append(args, "-show_entries", "format=duration", "-of", "csv=p=0", sourceURL)
 	cmdCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, videoDurPath, args...)

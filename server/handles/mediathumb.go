@@ -1747,7 +1747,11 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, useProxy bool)
 	if maxSize > 0 && size > maxSize {
 		return nil, errThumbTooLarge
 	}
-	remoteURL := link.URL
+	remoteURL, remoteHeader, remoteProxy, sourceCleanup, err := thumbFFmpegSource(ctx, rawPath, link, size, proxy)
+	if err != nil {
+		return nil, err
+	}
+	defer sourceCleanup()
 
 	// moov 在文件尾部时本地片段必然无法解析；长视频探测时长后取"中间单帧"（1x1），
 	// 短视频直接远程抽 3s 单帧
@@ -1758,20 +1762,20 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, useProxy bool)
 	if atTail {
 		if size > thumbProbeMinSize {
 			if dur := probeVideoDuration(ctx, rawPath); dur > thumbMosaicLongSec {
-				if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, proxy, dur); err == nil {
+				if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, remoteHeader, remoteProxy, dur); err == nil {
 					return data, nil
 				} else if isThumbRemoteRiskError(err) {
 					return nil, err
 				}
 			}
 		}
-		return extractVideoFrameRemote(ctx, remoteURL, link.Header, proxy)
+		return extractVideoFrameRemote(ctx, remoteURL, remoteHeader, remoteProxy)
 	}
 
 	// 长视频：探测时长后取"中间单帧"（1x1，中间内容）；失败降级本地头部抽帧
 	if size > thumbProbeMinSize {
 		if dur := probeVideoDuration(ctx, rawPath); dur > thumbMosaicLongSec {
-			if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, link.Header, proxy, dur); err == nil {
+			if data, err := generateVideoAdaptiveFrame(ctx, remoteURL, remoteHeader, remoteProxy, dur); err == nil {
 				return data, nil
 			} else if isThumbRemoteRiskError(err) {
 				return nil, err
@@ -1799,7 +1803,7 @@ func generateVideoThumbInner(ctx context.Context, rawPath string, useProxy bool)
 	}
 	// moov 位于文件尾部（探测失败或非标准容器）：ffmpeg 直接读取驱动返回的 URL/Header，
 	// 不再绕公共 /d，也不依赖外部请求 Host。
-	if data, err := extractVideoFrameRemote(ctx, remoteURL, link.Header, proxy); err == nil {
+	if data, err := extractVideoFrameRemote(ctx, remoteURL, remoteHeader, remoteProxy); err == nil {
 		return data, nil
 	} else if isThumbRemoteRiskError(err) {
 		return nil, err
