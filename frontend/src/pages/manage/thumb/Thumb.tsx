@@ -40,6 +40,20 @@ type ThumbStatus = {
   blocked: boolean
   stale_by_dir?: { dir: string; count: number }[]
   mounts?: string[]
+  metrics?: {
+    cache_hits: number
+    cache_misses: number
+    cache_hit_rate: number
+    placeholders: number
+    generated: number
+    generation_failed: number
+    avg_generate_ms: number
+    p95_generate_ms: number
+    range_http: number
+    range_reader: number
+    range_gateway: number
+    failures?: Record<string, number>
+  }
 }
 
 type ThumbCandidate = {
@@ -49,6 +63,12 @@ type ThumbCandidate = {
 }
 
 type ThumbCandidatesData = {
+  job_id?: string
+  state?: "queued" | "running" | "succeeded" | "failed" | "canceled"
+  done?: number
+  total?: number
+  progress?: number
+  error?: string
   candidates?: ThumbCandidate[]
   sheet?: string
   recommended_index?: number
@@ -100,11 +120,15 @@ const Thumb = () => {
   const [candCached, setCandCached] = createSignal(false)
   const [candRiskBlocked, setCandRiskBlocked] = createSignal(false)
   const [candTruncated, setCandTruncated] = createSignal(false)
+  const [candJobId, setCandJobId] = createSignal("")
+  const [candProgress, setCandProgress] = createSignal(0)
   const [applying, setApplying] = createSignal(false)
   const [knownFails, setKnownFails] = createSignal<Set<string>>(new Set())
   const [failedMap, setFailedMap] = createSignal<Record<string, string>>({})
   let candidateRequestId = 0
   let candidateRequestActive = false
+  let treeRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  const [treeScanStatus, setTreeScanStatus] = createSignal("")
   let firstStatusLoaded = false
   const [uploadLive, setUploadLive] = createSignal(false) // 本次会话是否有上传运行（控制轮询）
   const upDefault = {
@@ -202,12 +226,20 @@ const Thumb = () => {
   }
 
   const loadTree = async () => {
-    setTreeLoading(true)
+    if (treeRefreshTimer) {
+      clearTimeout(treeRefreshTimer)
+      treeRefreshTimer = undefined
+    }
+    if (!tree().length) setTreeLoading(true)
     try {
       const resp = await r.get("/admin/thumb/tree")
       handleResp(resp, (d) => {
-        const data = d as { children?: TreeNode[] }
+        const data = d as { children?: TreeNode[]; scan_status?: string }
         setTree(data.children || [])
+        setTreeScanStatus(data.scan_status || "")
+        if (data.scan_status === "refreshing") {
+          treeRefreshTimer = setTimeout(() => void loadTree(), 3000)
+        }
       })
     } finally {
       setTreeLoading(false)
@@ -463,12 +495,19 @@ const Thumb = () => {
 
   const resetCandidateState = () => {
     candidateRequestId += 1
+    candidateRequestActive = false
+    const jobId = candJobId()
+    if (jobId) {
+      setCandJobId("")
+      void r.post("/admin/thumb/candidates/cancel", { job_id: jobId }).catch(() => undefined)
+    }
     setCands([])
     setCandSheet("")
     setRecommendedIndex(0)
     setCandCached(false)
     setCandRiskBlocked(false)
     setCandTruncated(false)
+    setCandProgress(0)
     setCandLoading(false)
     setApplying(false)
   }
@@ -506,13 +545,88 @@ const Thumb = () => {
     resetCandidateState()
   }
 
-  // 生成候选缩略图（严格串行，后端返回 3×3 九宫格和推荐画面）
+  const applyCandidateResponse = (
+    data: ThumbCandidatesData,
+    refresh: boolean,
+    previousCandidates: ThumbCandidate[],
+  ) => {
+    const candidates = data.candidates || []
+    if (refresh && !candidates.length && previousCandidates.length) {
+      notify.warning("重新生成未取得新画面，已保留上次候选")
+      return
+    }
+    setCands(candidates)
+    setCandSheet(data.sheet || "")
+    setRecommendedIndex(data.recommended_index || 0)
+    setCandCached(!!data.cached)
+    setCandRiskBlocked(!!data.risk_blocked)
+    setCandTruncated(!!data.truncated)
+    setCandProgress(100)
+    if (!candidates.length) {
+      if (data.risk_blocked || data.truncated) {
+        notify.warning("为避免触发 115 风控，候选生成已停止，暂无可用画面")
+      } else {
+        notify.error("未能生成候选缩略图")
+      }
+    } else if (data.risk_blocked || data.truncated) {
+      notify.warning(`已取得 ${candidates.length} 个画面，后续取帧已停止以避免触发 115 风控`)
+    }
+  }
+
+  const pollCandidateJob = async (
+    jobId: string,
+    requestId: number,
+    pp: string,
+    refresh: boolean,
+    previousCandidates: ThumbCandidate[],
+  ) => {
+    while (requestId === candidateRequestId && viewPath() === pp && candJobId() === jobId) {
+      await new Promise((resolve) => setTimeout(resolve, 750))
+      if (requestId !== candidateRequestId || viewPath() !== pp || candJobId() !== jobId) return
+      try {
+        const resp = await r.get("/admin/thumb/candidates/status", { params: { job_id: jobId } })
+        let data: ThumbCandidatesData | undefined
+        handleRespWithoutNotify(resp, (d) => {
+          data = d as ThumbCandidatesData
+        })
+        if (!data) continue
+        setCandProgress(data.progress || 0)
+        if (data.state === "succeeded") {
+          applyCandidateResponse(data, refresh, previousCandidates)
+          setCandJobId("")
+          setCandLoading(false)
+          candidateRequestActive = false
+          return
+        }
+        if (data.state === "failed" || data.state === "canceled") {
+          setCandJobId("")
+          setCandLoading(false)
+          candidateRequestActive = false
+          if (data.state === "failed") {
+            notify.error(data.error || "生成候选缩略图失败")
+          }
+          return
+        }
+      } catch {
+        if (requestId === candidateRequestId && viewPath() === pp) {
+          notify.error("读取候选生成进度失败")
+          setCandLoading(false)
+          setCandJobId("")
+        }
+        candidateRequestActive = false
+        return
+      }
+    }
+  }
+
+  // 生成候选缩略图：HTTP 只创建后台 job，前端轮询 1/9...9/9 进度，可随时取消。
   const loadCandidates = async (pp: string, refresh = false) => {
     if (candidateRequestActive) return
     candidateRequestActive = true
     const previousCandidates = cands()
     const requestId = ++candidateRequestId
     setCandLoading(true)
+    setCandProgress(0)
     if (!refresh) {
       setCandSheet("")
       setRecommendedIndex(0)
@@ -527,35 +641,26 @@ const Thumb = () => {
       handleResp(resp, (d) => {
         if (requestId !== candidateRequestId || viewPath() !== pp) return
         const data = d as ThumbCandidatesData
-        const candidates = data.candidates || []
-        if (refresh && !candidates.length && previousCandidates.length) {
-          notify.warning("重新生成未取得新画面，已保留上次候选")
+        if (data.state === "succeeded" || data.candidates) {
+          applyCandidateResponse(data, refresh, previousCandidates)
+          setCandLoading(false)
+          candidateRequestActive = false
           return
         }
-        setCands(candidates)
-        setCandSheet(data.sheet || "")
-        setRecommendedIndex(data.recommended_index || 0)
-        setCandCached(!!data.cached)
-        setCandRiskBlocked(!!data.risk_blocked)
-        setCandTruncated(!!data.truncated)
-        if (!candidates.length) {
-          if (data.risk_blocked || data.truncated) {
-            notify.warning("为避免触发 115 风控，候选生成已停止，暂无可用画面")
-          } else {
-            notify.error("未能生成候选缩略图")
-          }
-        } else if (data.risk_blocked || data.truncated) {
-          notify.warning(`已取得 ${candidates.length} 个画面，后续取帧已停止以避免触发 115 风控`)
+        if (data.job_id) {
+          setCandJobId(data.job_id)
+          setCandProgress(data.progress || 0)
+          void pollCandidateJob(data.job_id, requestId, pp, refresh, previousCandidates)
         }
       })
     } catch {
       if (requestId !== candidateRequestId || viewPath() !== pp) return
       notify.error(refresh && previousCandidates.length ? "重新生成失败，已保留上次候选" : "生成候选缩略图失败")
     } finally {
-      if (requestId === candidateRequestId && viewPath() === pp) {
+      if (requestId === candidateRequestId && viewPath() === pp && !candJobId()) {
         setCandLoading(false)
+        candidateRequestActive = false
       }
-      candidateRequestActive = false
     }
   }
 
@@ -567,6 +672,21 @@ const Thumb = () => {
     setViewLoading(false)
     resetCandidateState()
     void loadCandidates(pp)
+  }
+
+  const cancelCandidates = async () => {
+    const jobId = candJobId()
+    if (!jobId) return
+    candidateRequestId += 1
+    candidateRequestActive = false
+    setCandJobId("")
+    setCandLoading(false)
+    try {
+      const resp = await r.post("/admin/thumb/candidates/cancel", { job_id: jobId })
+      handleRespWithoutNotify(resp, () => notify.success("已取消候选生成"))
+    } catch {
+      // The job may already have completed between the last poll and the cancel click.
+    }
   }
   // 保留所选候选缩略图；同一接口也用于保存九宫格
   const applyCandidate = async (pp: string, png: string, successMessage = "已应用所选缩略图") => {
@@ -916,6 +1036,7 @@ const Thumb = () => {
     candidateRequestId += 1
     clearInterval(timer)
     if (fastTimer) clearInterval(fastTimer)
+    if (treeRefreshTimer) clearTimeout(treeRefreshTimer)
     if (viewUrl()) URL.revokeObjectURL(viewUrl())
   })
 
@@ -941,6 +1062,32 @@ const Thumb = () => {
         >
           占用 {((st()?.cache_size || 0) / 1048576).toFixed(1)} MB
         </Box>
+        <Show when={st()?.metrics}>
+          <Box
+            p="$3"
+            rounded="$lg"
+            border="1px solid $neutral7"
+            background={useColorModeValue("$neutral1", "$neutral2")()}
+          >
+            命中率 {(st()?.metrics?.cache_hit_rate || 0).toFixed(1)}%
+            <Text fontSize="$sm" color="$neutral9">
+              生成均值 {st()?.metrics?.avg_generate_ms || 0}ms · P95 {st()?.metrics?.p95_generate_ms || 0}ms
+            </Text>
+            <Text fontSize="$xs" color="$neutral9">
+              Range URL {st()?.metrics?.range_http || 0} · Reader {st()?.metrics?.range_reader || 0} · Gateway{" "}
+              {st()?.metrics?.range_gateway || 0}
+            </Text>
+            <Show when={Object.keys(st()?.metrics?.failures || {}).length > 0}>
+              <Text fontSize="$xs" color="$neutral9">
+                失败分类{" "}
+                {Object.entries(st()?.metrics?.failures || {})
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([kind, count]) => `${kind} ${count}`)
+                  .join(" · ")}
+              </Text>
+            </Show>
+          </Box>
+        </Show>
          <Show when={st()?.cache_dir}>
            <Box
              p="$3"
@@ -993,7 +1140,7 @@ const Thumb = () => {
             }
           >
             {genBlocked()
-              ? "115 风控中，生成已暂停"
+              ? "部分 115 存储风控，相关生成暂停"
               : st()?.queue_paused
                 ? "队列已暂停"
                 : genActive() > 0
@@ -1071,7 +1218,7 @@ const Thumb = () => {
               upStatus().paused
                 ? "warning"
                 : st()?.blocked
-                  ? "danger"
+                  ? "warning"
                   : upStatus().active
                     ? "success"
                     : upStatus().remaining > 0
@@ -1082,7 +1229,7 @@ const Thumb = () => {
             {upStatus().paused
               ? "上传已暂停"
               : st()?.blocked
-                ? "115 风控中，上传暂停"
+                ? "部分 115 存储风控，相关上传暂停"
                 : upStatus().active
                   ? "正在上传"
                   : upStatus().remaining > 0
@@ -1184,6 +1331,12 @@ const Thumb = () => {
           <Text fontWeight="$medium" p="$2">
             目录
           </Text>
+          <Show when={treeScanStatus() === "refreshing"}>
+            <HStack px="$2" pb="$2" spacing="$2">
+              <Tag colorScheme="info" size="sm">后台校准中</Tag>
+              <Text fontSize="$xs" color="$neutral9">当前先展示数据库快照，不阻塞页面</Text>
+            </HStack>
+          </Show>
           <Show when={treeLoading()}>
             <Text p="$2" fontSize="$sm" color="$neutral9">
               加载中...
@@ -1482,10 +1635,30 @@ const Thumb = () => {
                   已使用缓存
                 </Tag>
               </Show>
+              <Show when={candLoading() && candJobId()}>
+                <Button size="xs" colorScheme="danger" variant="outline" onClick={cancelCandidates}>
+                  取消候选生成
+                </Button>
+              </Show>
               <Text fontSize="$xs" color="$neutral9">
                 115 安全模式：候选帧单路生成，检测到风控会立即停止
               </Text>
             </HStack>
+            <Show when={candLoading() && candJobId()}>
+              <Box mt="$2">
+                <HStack spacing="$2" justifyContent="space-between">
+                  <Text fontSize="$xs" color="$neutral9">
+                    正在后台取帧 {Math.min(9, Math.ceil((candProgress() / 100) * 9))} / 9
+                  </Text>
+                  <Text fontSize="$xs" color="$neutral9">
+                    {Math.round(candProgress())}%
+                  </Text>
+                </HStack>
+                <Progress value={candProgress()} max={100} size="sm">
+                  <ProgressIndicator color="$info6" />
+                </Progress>
+              </Box>
+            </Show>
             <Show when={candSheet()}>
               <Box
                 mt="$3"

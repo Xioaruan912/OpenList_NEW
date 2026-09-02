@@ -2,6 +2,7 @@ package db
 
 import (
 	"errors"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"gorm.io/gorm"
@@ -37,16 +38,87 @@ func UpsertThumbnailIdentity(record *model.ThumbnailRecord) (changed bool, err e
 	}
 	changed = current.Fingerprint != "" && record.Fingerprint != "" && current.Fingerprint != record.Fingerprint
 	err = db.Model(&current).Updates(map[string]interface{}{
-		"kind":        record.Kind,
-		"path":        record.Path,
-		"fingerprint": record.Fingerprint,
-		"cache_key":   record.CacheKey,
-		"remote_name": record.RemoteName,
-		"object_id":   record.ObjectID,
-		"size":        record.Size,
-		"modified":    record.Modified,
+		"kind":         record.Kind,
+		"path":         record.Path,
+		"fingerprint":  record.Fingerprint,
+		"strategy":     record.Strategy,
+		"cache_key":    record.CacheKey,
+		"remote_name":  record.RemoteName,
+		"object_id":    record.ObjectID,
+		"size":         record.Size,
+		"modified":     record.Modified,
+		"last_seen_at": record.LastSeenAt,
 	}).Error
 	return changed, err
+}
+
+func ListThumbnailRecords(kind string) ([]model.ThumbnailRecord, error) {
+	if db == nil {
+		return nil, gorm.ErrInvalidDB
+	}
+	var records []model.ThumbnailRecord
+	err := db.Where("kind = ?", kind).Order("id ASC").Find(&records).Error
+	return records, err
+}
+
+func SetThumbnailFailure(pathKey, class, message string, failedAt, retryAfter time.Time) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	return db.Model(&model.ThumbnailRecord{}).
+		Where("path_key = ?", pathKey).
+		Updates(map[string]interface{}{
+			"failure_class":   class,
+			"failure_message": message,
+			"failure_count":   gorm.Expr("failure_count + ?", 1),
+			"failed_at":       failedAt,
+			"retry_after":     retryAfter,
+		}).Error
+}
+
+func ClearThumbnailFailure(pathKey string) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	return db.Model(&model.ThumbnailRecord{}).
+		Where("path_key = ?", pathKey).
+		Updates(map[string]interface{}{
+			"failure_class":   "",
+			"failure_message": "",
+			"failed_at":       time.Time{},
+			"retry_after":     time.Time{},
+		}).Error
+}
+
+func TouchThumbnailAccess(pathKey string, at time.Time) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	return db.Model(&model.ThumbnailRecord{}).Where("path_key = ?", pathKey).
+		Update("last_accessed_at", at).Error
+}
+
+func MarkThumbnailGenerated(pathKey string, at time.Time, durationMS int64) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	return db.Model(&model.ThumbnailRecord{}).Where("path_key = ?", pathKey).
+		Updates(map[string]interface{}{
+			"last_generated_at": at,
+			"last_generate_ms":  durationMS,
+			"generate_count":    gorm.Expr("generate_count + ?", 1),
+			"failure_class":     "",
+			"failure_message":   "",
+			"failed_at":         time.Time{},
+			"retry_after":       time.Time{},
+		}).Error
+}
+
+func DeleteThumbnailRecord(pathKey string) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	return db.Where("path_key = ?", pathKey).Delete(&model.ThumbnailRecord{}).Error
 }
 
 func SetThumbnailIndexed(record model.ThumbnailRecord, indexed bool) error {

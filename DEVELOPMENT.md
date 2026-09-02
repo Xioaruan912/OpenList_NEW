@@ -102,14 +102,21 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/ping   # 期�
 
 ### 4.3 核心子系统的"心智模型"
 - **缩略图**（`mediathumb.go` + `thumbadmin.go`）：
-  - 队列：生成与上传都由 `github.com/OpenListTeam/tache` 管理。生成 manager 使用 `thumb_concurrency` 个 worker、保留 2048 任务安全上限和 `prewarmDone` 去重；上传 manager 单 worker、每个文件独立 task、最多 3 次尝试并带 5s 重试退避/50 次每 5s 速率窗口。暂停/恢复直接 Pause/Start manager，清空通过取消旧 manager 并原子替换新 manager，避免手写 channel/worker 状态机。
+  - 队列：生成与上传都由 `github.com/OpenListTeam/tache` 管理，并通过原生 `task_items` 持久化；服务重启时 Running 自动恢复为 Pending，暂停/恢复直接 Pause/Start manager，清空会同步清除持久化数据，避免任务重启后复活。生成 manager 使用 `thumb_concurrency` 个 worker、保留 2048 任务安全上限和 `prewarmDone` 去重。
+  - 上传限速：上传 manager 允许跨存储并行，但按 storage 独立限速/风控。115 默认单上传、10 次/5s；OneDrive 默认并发 2、40 次/5s；Local 默认并发 4。一个 115 挂载受限不会冻结其它存储上传。
   - 生成：`generateVideoThumb` → 本地片段抽帧 / 远程 Range 抽帧；同一路径通过 `singleflight` 去重。
+  - `/vt`：浏览器缩略图请求只做内存/本地缓存命中；miss 立即返回短缓存占位图并加入持久化 tache 队列，远程恢复、Range 和 ffmpeg 都在后台执行，不阻塞文件列表。
   - 读取：严格校验 `206 Content-Range`，所有响应按请求长度限制；HTTP Client/Transport 按静态代理复用。
   - ffmpeg/ffprobe：有 `Link.URL` 时直接使用驱动 URL + Header；只有 `RangeReader` 的驱动通过进程内 `127.0.0.1` 随机 token Range Gateway 暴露给 libav。Gateway 单次 Range 最多 32MiB、生命周期绑定任务 context，不提供公网入口，也不使用外部 Host 拼接 `/d`。
   - 空白检测 `isBlankThumb`（纯色图当失败，不缓存）。
-  - 元数据：数据库 `thumbnail_records` 保存已生成/已上传/排除状态、对象指纹、缓存键与远程文件名；旧 `index.jsonl` / `cloud.jsonl` / `excluded.jsonl` 首次启动自动导入并改名为 `.migrated*` 备份。
-  - 缓存键：新对象使用内容指纹（storage + object ID/path + size + mtime + hash）而不是路径 MD5；升级前的旧缓存保留原键直到对象内容发生变化，避免升级时全量重建。同路径替换会自动失效旧 PNG、云端状态、失败标记、候选帧、moov 与时长缓存。
+  - 元数据：数据库 `thumbnail_records` 保存已生成/已上传/排除状态、对象指纹、缓存键、远程文件名、失败分类/重试时间、最后发现/访问/生成时间和生成耗时；旧 `index.jsonl` / `cloud.jsonl` / `excluded.jsonl` 首次启动自动导入并改名为 `.migrated*` 备份，旧 `.fail` 读取时也会迁移到数据库。
+  - 缓存键：新对象使用内容指纹（storage + object ID/path + size + mtime + hash + generation strategy version）而不是路径 MD5；升级前的旧缓存保留原键直到对象内容发生变化，避免升级时全量重建。同路径替换会自动失效旧 PNG、云端状态、失败状态、候选帧、moov 与时长缓存。
+  - 生命周期清理：本地未被 DB 引用的 managed cache 超过 1h 自动回收；远端只识别本项目命名格式的 orphan，并且需连续观察 24h 后才删除，每小时最多校准 20 个目录，避免误删用户文件或突发 115 请求。
+  - 失败重试：失败按 risk/auth/timeout/not_found/blank/range/media/policy/transient 分类并写入 `retry_after`；到期后自动允许重新入队，不再统一依赖 7 天 `.fail` TTL。
   - 状态轮询：`/api/admin/thumb/status` 不同步枚举远程 `_thumbnails` 目录；过期时先返回数据库/本地缓存已知统计，并在后台刷新远程真实计数，避免管理页 10s 轮询被 115 API 卡住。
+  - 目录树：`/api/admin/thumb/tree` 首屏只读 DB/最近快照，立即返回；完整挂载递归扫描在后台 reconcile，扫描成功后更新快照并删除已确认不存在的旧路径记录。
+  - 候选九宫格：`/admin/thumb/candidates` 只创建后台 job；前端轮询 `/candidates/status` 显示 1/9~9/9 进度，可调用 `/candidates/cancel` 取消，不再用一个最长 150s 的 HTTP 请求撑住页面。
+  - 可观测性：Thumb 状态页显示缓存命中率、生成平均/P95、Range URL/RangeReader/Loopback Gateway 次数和按失败类别统计。
   - 风控：`isStorageBlocked`（115 health 5 分钟窗口）。
 - **静态出站代理**：默认直连；需要时只读取 `conf.Conf.ProxyAddress`。不要在运行中修改 115 的共享 Resty Client；多出口负载均衡应由外部基础设施完成。
 - **115 登录**（`driver115.go` + `drivers/115/qrcode.go`）：二维码 → 轮询 → 写 Cookie → 文件夹选择器。

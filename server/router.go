@@ -181,6 +181,8 @@ func admin(g *gin.RouterGroup) {
 	thumb.POST("/migrate", handles.ThumbMigrate)
 	thumb.POST("/auto", handles.ThumbSetAuto)
 	thumb.POST("/candidates", handles.ThumbCandidates)
+	thumb.GET("/candidates/status", handles.ThumbCandidateStatus)
+	thumb.POST("/candidates/cancel", handles.ThumbCandidateCancel)
 	thumb.POST("/apply_candidate", handles.ThumbApplyCandidate)
 	thumb.POST("/upload", handles.ThumbUpload)
 	thumb.POST("/upload_all", handles.ThumbUploadAll)

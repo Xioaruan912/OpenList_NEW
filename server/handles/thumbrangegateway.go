@@ -145,6 +145,7 @@ func serveThumbRangeGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := value.(*thumbRangeGatewaySession)
+	thumbRuntimeMetrics.rangeGateway.Add(1)
 	if err := session.ctx.Err(); err != nil {
 		thumbRangeGatewaySessions.Delete(token)
 		http.Error(w, "range session expired", http.StatusGone)

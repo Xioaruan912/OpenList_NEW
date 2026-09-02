@@ -74,7 +74,9 @@ var (
 	ffmpegPath string
 	ffmpegErr  error
 
-	thumbCleanupOnce sync.Once
+	thumbCleanupOnce           sync.Once
+	thumbRemoteOrphanSeen      sync.Map // remote full path -> first observation time
+	thumbRemoteReconcileCursor atomic.Uint64
 
 	errThumbTooLarge   = errors.New("file too large for thumbnail")
 	errThumbNoCover    = errors.New("no cover art or cover file found")
@@ -84,13 +86,119 @@ var (
 	thumbGenerateGroup singleflight.Group
 )
 
+const (
+	thumbLocalOrphanGrace          = time.Hour
+	thumbRemoteOrphanGrace         = 24 * time.Hour
+	thumbRemoteReconcileDirsPerRun = 20
+)
+
+var managedRemoteThumbPattern = regexp.MustCompile(`_[0-9a-fA-F]{8}([0-9a-fA-F]{4})?\.png$`)
+
+type thumbRuntimeMetricsState struct {
+	startedAt      time.Time
+	cacheHit       atomic.Int64
+	cacheMiss      atomic.Int64
+	placeholder    atomic.Int64
+	generated      atomic.Int64
+	generateFailed atomic.Int64
+	rangeHTTP      atomic.Int64
+	rangeReader    atomic.Int64
+	rangeGateway   atomic.Int64
+	durationMu     sync.Mutex
+	durations      []int64
+	failureMu      sync.Mutex
+	failures       map[string]int64
+}
+
+var thumbRuntimeMetrics = thumbRuntimeMetricsState{
+	startedAt: time.Now(),
+	durations: make([]int64, 0, 512),
+	failures:  map[string]int64{},
+}
+
+func thumbMetricFailure(class string) {
+	thumbRuntimeMetrics.generateFailed.Add(1)
+	thumbRuntimeMetrics.failureMu.Lock()
+	thumbRuntimeMetrics.failures[class]++
+	thumbRuntimeMetrics.failureMu.Unlock()
+}
+
+func thumbMetricGeneration(duration time.Duration) {
+	thumbRuntimeMetrics.generated.Add(1)
+	ms := duration.Milliseconds()
+	thumbRuntimeMetrics.durationMu.Lock()
+	if len(thumbRuntimeMetrics.durations) >= 512 {
+		copy(thumbRuntimeMetrics.durations, thumbRuntimeMetrics.durations[len(thumbRuntimeMetrics.durations)-511:])
+		thumbRuntimeMetrics.durations = thumbRuntimeMetrics.durations[:511]
+	}
+	thumbRuntimeMetrics.durations = append(thumbRuntimeMetrics.durations, ms)
+	thumbRuntimeMetrics.durationMu.Unlock()
+}
+
+func thumbMetricsSnapshot() gin.H {
+	hits := thumbRuntimeMetrics.cacheHit.Load()
+	misses := thumbRuntimeMetrics.cacheMiss.Load()
+	total := hits + misses
+	hitRate := 0.0
+	if total > 0 {
+		hitRate = float64(hits) * 100 / float64(total)
+	}
+	thumbRuntimeMetrics.durationMu.Lock()
+	samples := append([]int64(nil), thumbRuntimeMetrics.durations...)
+	thumbRuntimeMetrics.durationMu.Unlock()
+	avg, p95 := int64(0), int64(0)
+	if len(samples) > 0 {
+		var sum int64
+		for _, v := range samples {
+			sum += v
+		}
+		avg = sum / int64(len(samples))
+		sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+		idx := int(math.Ceil(float64(len(samples))*0.95)) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(samples) {
+			idx = len(samples) - 1
+		}
+		p95 = samples[idx]
+	}
+	thumbRuntimeMetrics.failureMu.Lock()
+	failures := make(map[string]int64, len(thumbRuntimeMetrics.failures))
+	for k, v := range thumbRuntimeMetrics.failures {
+		failures[k] = v
+	}
+	thumbRuntimeMetrics.failureMu.Unlock()
+	return gin.H{
+		"started_at":        thumbRuntimeMetrics.startedAt.Unix(),
+		"cache_hits":        hits,
+		"cache_misses":      misses,
+		"cache_hit_rate":    hitRate,
+		"placeholders":      thumbRuntimeMetrics.placeholder.Load(),
+		"generated":         thumbRuntimeMetrics.generated.Load(),
+		"generation_failed": thumbRuntimeMetrics.generateFailed.Load(),
+		"avg_generate_ms":   avg,
+		"p95_generate_ms":   p95,
+		"range_http":        thumbRuntimeMetrics.rangeHTTP.Load(),
+		"range_reader":      thumbRuntimeMetrics.rangeReader.Load(),
+		"range_gateway":     thumbRuntimeMetrics.rangeGateway.Load(),
+		"failures":          failures,
+	}
+}
+
 func generateThumbOnce(kind, rawPath string, generate func() ([]byte, error)) ([]byte, error) {
 	key := kind + "\x00" + rawPath
 	if fingerprint := thumbKnownFingerprint(kind, rawPath); validThumbFingerprint(fingerprint) {
 		key += "\x00" + fingerprint
 	}
 	value, err, _ := thumbGenerateGroup.Do(key, func() (interface{}, error) {
-		return generate()
+		started := time.Now()
+		data, generateErr := generate()
+		if generateErr != nil {
+			return nil, generateErr
+		}
+		thumbMetricGeneration(time.Since(started))
+		return data, nil
 	})
 	if err != nil {
 		return nil, err
@@ -378,8 +486,8 @@ func thumbRelease() {
 // 预热队列：浏览目录时后台批量生成视频缩略图
 type thumbPrewarmTask struct {
 	tache.Base
-	kind    string
-	rawPath string
+	Kind    string `json:"kind"`
+	RawPath string `json:"raw_path"`
 	manager *tache.Manager[*thumbPrewarmTask]
 }
 
@@ -389,16 +497,20 @@ func (t *thumbPrewarmTask) Run() error {
 }
 
 func (t *thumbPrewarmTask) OnSucceeded() {
-	if t.manager != nil {
-		t.manager.Remove(t.GetID())
+	manager := t.manager
+	if manager == nil {
+		manager = prewarmStart()
 	}
+	manager.Remove(t.GetID())
 }
 
 func (t *thumbPrewarmTask) OnFailed() {
-	prewarmDone.Delete(t.rawPath)
-	if t.manager != nil {
-		t.manager.Remove(t.GetID())
+	prewarmDone.Delete(t.RawPath)
+	manager := t.manager
+	if manager == nil {
+		manager = prewarmStart()
 	}
+	manager.Remove(t.GetID())
 }
 
 var (
@@ -438,7 +550,10 @@ func thumbPathKey(kind, rawPath string) string {
 	return hex.EncodeToString(h[:])
 }
 
-const thumbFingerprintVersion = "thumb-v1"
+// thumbGenerationStrategyVersion is deliberately part of the durable thumbnail identity.
+// Bump it whenever output format/size/seek/blank-detection semantics change and old thumbnails
+// should be regenerated. Keeping the value stable avoids a regeneration storm on normal upgrades.
+const thumbGenerationStrategyVersion = "thumb-v1"
 
 // thumbObjectFingerprint identifies the current object version without using the display path as
 // the primary cache identity. Driver object ID/hash/size/mtime make a same-path replacement produce
@@ -461,7 +576,7 @@ func thumbObjectFingerprint(rawPath string, obj model.Obj) string {
 	}
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%s\x00%d\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s",
-		thumbFingerprintVersion,
+		thumbGenerationStrategyVersion,
 		storageID,
 		mountPath,
 		driverName,
@@ -479,9 +594,11 @@ func thumbRecordIdentity(kind, rawPath, fingerprint string, obj model.Obj) model
 		Kind:        kind,
 		Path:        rawPath,
 		Fingerprint: fingerprint,
+		Strategy:    thumbGenerationStrategyVersion,
 		ObjectID:    obj.GetID(),
 		Size:        obj.GetSize(),
 		Modified:    obj.ModTime().UTC().UnixNano(),
+		LastSeenAt:  time.Now(),
 	}
 }
 
@@ -541,7 +658,7 @@ func thumbRememberObject(kind, rawPath string, obj model.Obj) string {
 		remoteThumbMissClear(rawPath)
 		remoteThumbCacheDelete(rawPath)
 		thumbCandidateCacheDelete(rawPath)
-		_ = os.Remove(thumbFailPath(kind, rawPath))
+		clearThumbFailure(kind, rawPath)
 		log.Infof("thumb fingerprint changed, invalidate stale cache: %s", rawPath)
 	}
 	return fingerprint
@@ -666,7 +783,45 @@ func thumbFailTTLDuration() time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
+func thumbFailurePolicy(msg string) (class string, retryAfter time.Time) {
+	now := time.Now()
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(msg, "风控") || strings.Contains(msg, "115 拦截") || strings.Contains(lower, "403") || strings.Contains(lower, "405") || strings.Contains(lower, "pmt"):
+		return "risk", now.Add(10 * time.Minute)
+	case strings.Contains(lower, "unauthorized") || strings.Contains(lower, "authentication") || strings.Contains(lower, "invalid token"):
+		return "auth", now.Add(24 * time.Hour)
+	case strings.Contains(msg, "超时") || strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline"):
+		return "timeout", now.Add(30 * time.Minute)
+	case strings.Contains(lower, "not found") || strings.Contains(lower, "404"):
+		return "not_found", now.Add(24 * time.Hour)
+	case strings.Contains(msg, "空白") || strings.Contains(lower, "blank"):
+		return "blank", now.Add(2 * time.Hour)
+	case strings.Contains(msg, "数据不完整") || strings.Contains(lower, "partial") || strings.Contains(lower, "unexpected eof") || strings.Contains(lower, "range"):
+		return "range", now.Add(10 * time.Minute)
+	case strings.Contains(msg, "无封面") || strings.Contains(msg, "无法抽帧") || strings.Contains(lower, "codec") || strings.Contains(lower, "invalid data"):
+		return "media", now.Add(7 * 24 * time.Hour)
+	case strings.Contains(msg, "文件过大"):
+		return "policy", now.Add(7 * 24 * time.Hour)
+	default:
+		return "transient", now.Add(30 * time.Minute)
+	}
+}
+
 func thumbFailed(kind, rawPath string) bool {
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		if record, err := db.GetThumbnailRecord(thumbPathKey(kind, rawPath)); err == nil && record.FailureClass != "" {
+			if record.RetryAfter.IsZero() || time.Now().Before(record.RetryAfter) {
+				return true
+			}
+			_ = db.ClearThumbnailFailure(record.PathKey)
+		}
+	}
+	// Legacy fallback for deployments that still have .fail markers. They are no longer written
+	// when the database is available and naturally disappear via the existing cleanup TTL.
 	fi, err := os.Stat(thumbFailPath(kind, rawPath))
 	if err != nil {
 		return false
@@ -675,13 +830,38 @@ func thumbFailed(kind, rawPath string) bool {
 }
 
 func markThumbFailed(kind, rawPath, msg string) {
-	// 记录失败路径与原因，便于按目录统计失败与重试、前端告警
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		pathKey := thumbPathKey(kind, rawPath)
+		// A failure may happen before Link resolved an object identity. Create the minimal row so the
+		// failure/retry policy is still durable and can be shown in the admin page.
+		_ = db.SetThumbnailIndexed(model.ThumbnailRecord{PathKey: pathKey, Kind: kind, Path: rawPath, Strategy: thumbGenerationStrategyVersion}, false)
+		class, retryAfter := thumbFailurePolicy(msg)
+		if err := db.SetThumbnailFailure(pathKey, class, msg, time.Now(), retryAfter); err == nil {
+			_ = os.Remove(thumbFailPath(kind, rawPath))
+			thumbMetricFailure(class)
+			return
+		}
+	}
+	// Database unavailable: retain the old file marker as a safe fallback.
 	data, _ := json.Marshal(map[string]string{
 		"path": rawPath,
 		"at":   time.Now().Format(time.RFC3339),
 		"msg":  msg,
 	})
 	_ = writeFileAtomic(thumbFailPath(kind, rawPath), data, 0o666)
+}
+
+func clearThumbFailure(kind, rawPath string) {
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		_ = db.ClearThumbnailFailure(thumbPathKey(kind, rawPath))
+	}
+	_ = os.Remove(thumbFailPath(kind, rawPath))
 }
 
 // thumbFailItem 失败缩略图信息
@@ -695,12 +875,34 @@ type thumbFailItem struct {
 
 // listThumbFails 扫描 fail 标记文件，解析出失败路径（旧格式无内容视为路径未知）
 func listThumbFails() []thumbFailItem {
+	seen := map[string]bool{}
+	var items []thumbFailItem
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		if records, err := db.ListThumbnailRecords(thumbKindVideo); err == nil {
+			for _, record := range records {
+				if record.FailureClass == "" {
+					continue
+				}
+				if !record.RetryAfter.IsZero() && time.Now().After(record.RetryAfter) {
+					continue
+				}
+				item := thumbFailItem{
+					Kind: record.Kind,
+					Path: record.Path,
+					Dir:  stdpath.Dir(record.Path),
+					At:   record.FailedAt.Format(time.RFC3339),
+					Msg:  record.FailureMessage,
+				}
+				items = append(items, item)
+				seen[record.Kind+"\x00"+record.Path] = true
+			}
+		}
+	}
 	dir := thumbDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return items
 	}
-	var items []thumbFailItem
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".fail") {
 			continue
@@ -715,6 +917,27 @@ func listThumbFails() []thumbFailItem {
 				item.Msg = m["msg"]
 				if item.Path != "" {
 					item.Dir = stdpath.Dir(item.Path)
+				}
+			}
+		}
+		if item.Path != "" && seen[item.Kind+"\x00"+item.Path] {
+			continue
+		}
+		if item.Path != "" && db.GetDb() != nil && thumbEnsureDBMigration() {
+			failedAt := time.Now()
+			if parsed, parseErr := time.Parse(time.RFC3339, item.At); parseErr == nil {
+				failedAt = parsed
+			}
+			class, policyRetry := thumbFailurePolicy(item.Msg)
+			retryAfter := failedAt.Add(time.Until(policyRetry))
+			pathKey := thumbPathKey(item.Kind, item.Path)
+			_ = db.SetThumbnailIndexed(model.ThumbnailRecord{PathKey: pathKey, Kind: item.Kind, Path: item.Path, Strategy: thumbGenerationStrategyVersion}, false)
+			if err := db.SetThumbnailFailure(pathKey, class, item.Msg, failedAt, retryAfter); err == nil {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+				seen[item.Kind+"\x00"+item.Path] = true
+				if time.Now().After(retryAfter) {
+					_ = db.ClearThumbnailFailure(pathKey)
+					continue
 				}
 			}
 		}
@@ -844,6 +1067,7 @@ func openThumbRange(ctx context.Context, link *model.Link, offset, limit int64, 
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	if link.RangeReader != nil {
+		thumbRuntimeMetrics.rangeReader.Add(1)
 		rc, err := link.RangeReader.RangeRead(requestCtx, http_range.Range{Start: offset, Length: limit})
 		if err != nil {
 			cancel()
@@ -855,6 +1079,7 @@ func openThumbRange(ctx context.Context, link *model.Link, offset, limit int64, 
 		cancel()
 		return nil, errors.New("download link has no URL or RangeReader")
 	}
+	thumbRuntimeMetrics.rangeHTTP.Add(1)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, link.URL, nil)
 	if err != nil {
 		cancel()
@@ -1549,9 +1774,14 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	}
 	cachePath := thumbCachePath(kind, rawPath)
 	if data, err := os.ReadFile(cachePath); err == nil {
+		thumbRuntimeMetrics.cacheHit.Add(1)
+		if db.GetDb() != nil && thumbEnsureDBMigration() {
+			_ = db.TouchThumbnailAccess(thumbPathKey(kind, rawPath), time.Now())
+		}
 		serveThumbPNG(c, data)
 		return
 	}
+	thumbRuntimeMetrics.cacheMiss.Add(1)
 	if thumbFailed(kind, rawPath) {
 		serveThumbPlaceholder(c)
 		return
@@ -1575,6 +1805,7 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	defer thumbRelease()
 
 	if data, err := os.ReadFile(cachePath); err == nil {
+		thumbRuntimeMetrics.cacheHit.Add(1)
 		serveThumbPNG(c, data)
 		return
 	}
@@ -1584,11 +1815,13 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 		if data, ok := tryRestoreRemoteThumb(c.Request.Context(), rawPath); ok {
 			_ = writeFileAtomic(cachePath, data, 0o666)
 			thumbRecord(rawPath)
+			_ = db.TouchThumbnailAccess(thumbPathKey(kind, rawPath), time.Now())
 			serveThumbPNG(c, data)
 			return
 		}
 	}
 
+	generateStarted := time.Now()
 	png, err := generateThumbOnce(kind, rawPath, generate)
 	if err != nil {
 		if errors.Is(err, errThumbNoCover) {
@@ -1620,11 +1853,15 @@ func serveThumb(c *gin.Context, kind, rawPath string, generate func() ([]byte, e
 	if kind == thumbKindVideo {
 		thumbRecord(rawPath)
 	}
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		_ = db.MarkThumbnailGenerated(thumbPathKey(kind, rawPath), time.Now(), time.Since(generateStarted).Milliseconds())
+	}
 	serveThumbPNG(c, png)
 }
 
 // serveThumbPlaceholder 返回 1x1 透明 PNG 占位图（避免前端 img 破图）
 func serveThumbPlaceholder(c *gin.Context) {
+	thumbRuntimeMetrics.placeholder.Add(1)
 	c.Header("Cache-Control", "public, max-age=60")
 	c.Data(200, "image/png", thumbPlaceholderPNG)
 }
@@ -1874,6 +2111,8 @@ func newThumbPrewarmManager(running bool) *tache.Manager[*thumbPrewarmTask] {
 	return tache.NewManager[*thumbPrewarmTask](
 		tache.WithWorks(thumbGenPower().Workers),
 		tache.WithMaxRetry(0),
+		tache.WithPersistFunction(db.GetTaskDataFunc("thumb_generate", true), db.UpdateTaskDataFunc("thumb_generate", true)),
+		tache.WithPersistDebounce(500*time.Millisecond),
 		tache.WithRunning(running),
 		tache.WithLogger(thumbTacheLogger),
 	)
@@ -1886,6 +2125,12 @@ func prewarmStart() *tache.Manager[*thumbPrewarmTask] {
 	defer thumbPrewarmManagerMu.Unlock()
 	if thumbPrewarmManager == nil {
 		thumbPrewarmManager = newThumbPrewarmManager(!thumbQueuePaused.Load())
+		for _, task := range thumbPrewarmManager.GetAll() {
+			task.manager = thumbPrewarmManager
+			if task.RawPath != "" {
+				prewarmDone.Store(task.RawPath, struct{}{})
+			}
+		}
 	}
 	thumbPrewarmManager.SetWorkersNumActive(int64(thumbGenPower().Workers))
 	return thumbPrewarmManager
@@ -1912,11 +2157,13 @@ func thumbPrewarmReset(running bool) (dropped int) {
 			case tache.StatePending, tache.StateWaitingRetry, tache.StateBeforeRetry:
 				dropped++
 			}
-			prewarmDone.Delete(task.rawPath)
+			prewarmDone.Delete(task.RawPath)
 		}
 		thumbPrewarmManager.Pause()
 		thumbPrewarmManager.CancelAll()
+		thumbPrewarmManager.RemoveAll()
 	}
+	_ = db.UpdateTaskData(&model.TaskItem{Key: "thumb_generate", PersistData: "[]"})
 	thumbPrewarmManager = newThumbPrewarmManager(running)
 	return dropped
 }
@@ -2054,30 +2301,41 @@ func processTask(task *thumbPrewarmTask, baseCtx context.Context) {
 		// task parked before any remote work; Clear cancels the task context and releases it.
 		select {
 		case <-baseCtx.Done():
-			prewarmDone.Delete(task.rawPath)
+			prewarmDone.Delete(task.RawPath)
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	// 风控中不循环重排队，等下一次浏览或手动操作再入队。
-	if blocked, _ := isStorageBlocked(task.rawPath); blocked {
-		prewarmDone.Delete(task.rawPath)
+	if blocked, _ := isStorageBlocked(task.RawPath); blocked {
+		prewarmDone.Delete(task.RawPath)
 		return
 	}
-	cachePath := thumbCachePath(task.kind, task.rawPath)
+	cachePath := thumbCachePath(task.Kind, task.RawPath)
 	if _, err := os.ReadFile(cachePath); err == nil {
-		prewarmDone.Store(task.rawPath, struct{}{})
+		prewarmDone.Store(task.RawPath, struct{}{})
 		return
 	}
-	if thumbFailed(task.kind, task.rawPath) {
-		prewarmDone.Store(task.rawPath, struct{}{})
+	if thumbFailed(task.Kind, task.RawPath) {
+		prewarmDone.Store(task.RawPath, struct{}{})
 		return
+	}
+	// A browser /vt miss never performs remote work itself. The background task first restores an
+	// existing uploaded thumbnail when possible, then falls through to generation only if needed.
+	if task.Kind == thumbKindVideo {
+		if data, ok := tryRestoreRemoteThumb(baseCtx, task.RawPath); ok {
+			_ = writeFileAtomic(cachePath, data, 0o666)
+			thumbRecord(task.RawPath)
+			remoteThumbCacheSet(task.RawPath, data)
+			prewarmDone.Store(task.RawPath, struct{}{})
+			return
+		}
 	}
 	for thumbCandidateActive.Load() {
 		// 候选任务正在进行时保留 tache 任务，不重新入队、不制造队列风暴。
 		select {
 		case <-baseCtx.Done():
-			prewarmDone.Delete(task.rawPath)
+			prewarmDone.Delete(task.RawPath)
 			return
 		case <-time.After(250 * time.Millisecond):
 		}
@@ -2085,7 +2343,7 @@ func processTask(task *thumbPrewarmTask, baseCtx context.Context) {
 	for !thumbAcquire(baseCtx, 2*time.Second) {
 		// 浏览器直接请求占满并发时，tache 任务保持 Running 等待，而不是重复出队/入队。
 		if baseCtx.Err() != nil {
-			prewarmDone.Delete(task.rawPath)
+			prewarmDone.Delete(task.RawPath)
 			return
 		}
 	}
@@ -2095,61 +2353,67 @@ func processTask(task *thumbPrewarmTask, baseCtx context.Context) {
 	epoch := atomic.LoadInt64(&thumbGenEpoch)
 	genCtx, cancel := context.WithTimeout(baseCtx, 90*time.Second)
 	defer cancel()
-	thumbActiveTrack(task.rawPath, true)
-	thumbActiveCancelAdd(task.rawPath, cancel)
+	thumbActiveTrack(task.RawPath, true)
+	thumbActiveCancelAdd(task.RawPath, cancel)
 	defer func() {
-		thumbActiveTrack(task.rawPath, false)
-		thumbActiveCancelDel(task.rawPath)
+		thumbActiveTrack(task.RawPath, false)
+		thumbActiveCancelDel(task.RawPath)
 	}()
 	// 所有 Range 与 ffmpeg 操作共享同一个可取消 context；超时会真正终止子进程和读取。
-	png, err := generateThumbOnce(task.kind, task.rawPath, func() ([]byte, error) {
-		return generateVideoThumb(genCtx, task.rawPath)
+	generateStarted := time.Now()
+	png, err := generateThumbOnce(task.Kind, task.RawPath, func() ([]byte, error) {
+		return generateVideoThumb(genCtx, task.RawPath)
 	})
 	if errors.Is(genCtx.Err(), context.DeadlineExceeded) {
 		err = fmt.Errorf("thumb generation timeout (90s): %w", context.DeadlineExceeded)
 	}
 	// 暂停/清空队列导致的取消：丢弃结果、不缓存、不重试（可重新生成）
 	if thumbTaskCancelled(genCtx, epoch) {
-		prewarmDone.Delete(task.rawPath)
+		prewarmDone.Delete(task.RawPath)
 		return
 	}
 	if err != nil {
 		// 永久性失败（文件被 115 拦截/结构损坏/文件过大/无封面等）：写失败标记、不重试，让用户可见
 		if isPermanentThumbError(err) || errors.Is(err, errThumbTooLarge) || errors.Is(err, errThumbNoCover) {
-			log.Warnf("thumb prewarm permanent fail [%s] %s: %v", task.kind, task.rawPath, err)
-			markThumbFailed(task.kind, task.rawPath, thumbFailReason(err))
-			prewarmDone.Store(task.rawPath, struct{}{})
+			log.Warnf("thumb prewarm permanent fail [%s] %s: %v", task.Kind, task.RawPath, err)
+			markThumbFailed(task.Kind, task.RawPath, thumbFailReason(err))
+			prewarmDone.Store(task.RawPath, struct{}{})
 			return
 		}
 		// 临时失败不在 worker 内睡眠或循环重试，避免队列风暴；后续浏览可重新入队。
-		log.Warnf("thumb prewarm transient fail [%s] %s: %v", task.kind, task.rawPath, err)
-		prewarmDone.Delete(task.rawPath)
+		log.Warnf("thumb prewarm transient fail [%s] %s: %v", task.Kind, task.RawPath, err)
+		markThumbFailed(task.Kind, task.RawPath, thumbFailReason(err))
+		prewarmDone.Delete(task.RawPath)
 		return
 	}
 	// 空白/纯色缩略图：视为生成失败（写失败标记、不缓存），避免占着"已有缩略图"名额
 	if isBlankThumb(png) {
-		log.Warnf("thumb prewarm blank [%s] %s", task.kind, task.rawPath)
-		markThumbFailed(task.kind, task.rawPath, "生成结果为空白图")
-		prewarmDone.Store(task.rawPath, struct{}{})
+		log.Warnf("thumb prewarm blank [%s] %s", task.Kind, task.RawPath)
+		markThumbFailed(task.Kind, task.RawPath, "生成结果为空白图")
+		prewarmDone.Store(task.RawPath, struct{}{})
 		return
 	}
-	cachePath = thumbCachePath(task.kind, task.rawPath)
+	cachePath = thumbCachePath(task.Kind, task.RawPath)
 	// remote 模式：缩略图上传到视频所在网盘目录，本机不落盘
-	if addition := remoteThumbStore(task.rawPath); addition != nil {
+	if addition := remoteThumbStore(task.RawPath); addition != nil {
 		uploadCtx, uploadCancel := context.WithTimeout(genCtx, 60*time.Second)
-		if err := uploadThumbRemote(uploadCtx, task.rawPath, addition, png); err != nil {
-			log.Warnf("thumb prewarm upload remote failed %s: %v", task.rawPath, err)
+		if err := uploadThumbRemote(uploadCtx, task.RawPath, addition, png); err != nil {
+			log.Warnf("thumb prewarm upload remote failed %s: %v", task.RawPath, err)
 		}
 		uploadCancel()
-		remoteThumbCacheSet(task.rawPath, png)
+		remoteThumbCacheSet(task.RawPath, png)
 		_ = writeFileAtomic(cachePath, png, 0o666)
 	} else {
 		_ = writeFileAtomic(cachePath, png, 0o666)
 	}
-	thumbRecord(task.rawPath)
+	thumbRecord(task.RawPath)
+	clearThumbFailure(task.Kind, task.RawPath)
+	if db.GetDb() != nil && thumbEnsureDBMigration() {
+		_ = db.MarkThumbnailGenerated(thumbPathKey(task.Kind, task.RawPath), time.Now(), time.Since(generateStarted).Milliseconds())
+	}
 	// 生成成功后清除远程 miss 标记（remote 模式可能之前被标 miss）
-	remoteThumbMissClear(task.rawPath)
-	prewarmDone.Store(task.rawPath, struct{}{})
+	remoteThumbMissClear(task.RawPath)
+	prewarmDone.Store(task.RawPath, struct{}{})
 }
 
 // 目录缩略图清单缓存：列表时一次性列出 _thumbnails 文件名（1 次 API），
@@ -2320,7 +2584,20 @@ func thumbCloudRemove(paths []string) {
 // cap is kept so a single recursive scan cannot grow memory without bound.
 func prewarmEnqueue(kind, rawPath string) bool {
 	if _, done := prewarmDone.Load(rawPath); done {
-		return false
+		// "done" also remembers completed tasks. If the cache was later evicted, allow the path to
+		// become queueable again as long as no live persisted task still owns it.
+		manager := prewarmStart()
+		live := false
+		for _, task := range manager.GetAll() {
+			if task.RawPath == rawPath {
+				live = true
+				break
+			}
+		}
+		if live {
+			return false
+		}
+		prewarmDone.Delete(rawPath)
 	}
 	thumbPrewarmEnqueueMu.Lock()
 	defer thumbPrewarmEnqueueMu.Unlock()
@@ -2332,7 +2609,7 @@ func prewarmEnqueue(kind, rawPath string) bool {
 		return false
 	}
 	prewarmDone.Store(rawPath, struct{}{})
-	task := &thumbPrewarmTask{kind: kind, rawPath: rawPath, manager: manager}
+	task := &thumbPrewarmTask{Kind: kind, RawPath: rawPath, manager: manager}
 	manager.Add(task)
 	return true
 }
@@ -2367,18 +2644,40 @@ func serveThumbPNG(c *gin.Context, data []byte) {
 }
 
 // VideoThumb GET /vt/*path
-// 视频文件缩略图：remote 模式生成后上传到视频所在网盘目录的 _thumbnails 文件夹，
-// 之后从网盘读取（本机不落盘）；local 模式保持本地缓存
+// Browser requests are intentionally non-blocking: cache hits return immediately; misses enqueue
+// a persisted tache generation/restore task and return a short-lived placeholder. This keeps file
+// listings responsive even when ffmpeg or a cloud Range request needs tens of seconds.
 func VideoThumb(c *gin.Context) {
 	rawPath := c.Request.Context().Value(conf.PathKey).(string)
 	startThumbCleanup()
-	if remoteStore := remoteThumbStore(rawPath); remoteStore != nil {
-		serveRemoteVideoThumb(c, rawPath, remoteStore)
+	if rawPath != "" && !strings.HasPrefix(rawPath, "/") {
+		rawPath = "/" + rawPath
+	}
+	if data, ok := remoteThumbCacheGet(rawPath); ok {
+		thumbRuntimeMetrics.cacheHit.Add(1)
+		_ = db.TouchThumbnailAccess(thumbPathKey(thumbKindVideo, rawPath), time.Now())
+		serveThumbPNG(c, data)
 		return
 	}
-	serveThumb(c, thumbKindVideo, rawPath, func() ([]byte, error) {
-		return generateVideoThumb(c.Request.Context(), rawPath)
-	})
+	cachePath := thumbCachePath(thumbKindVideo, rawPath)
+	if data, err := os.ReadFile(cachePath); err == nil {
+		thumbRuntimeMetrics.cacheHit.Add(1)
+		_ = db.TouchThumbnailAccess(thumbPathKey(thumbKindVideo, rawPath), time.Now())
+		remoteThumbCacheSet(rawPath, data)
+		serveThumbPNG(c, data)
+		return
+	}
+	thumbRuntimeMetrics.cacheMiss.Add(1)
+	if thumbFailed(thumbKindVideo, rawPath) || readThumbExcluded()[rawPath] {
+		serveThumbPlaceholder(c)
+		return
+	}
+	if blocked, _ := isStorageBlocked(rawPath); blocked {
+		serveThumbPlaceholder(c)
+		return
+	}
+	prewarmEnqueue(thumbKindVideo, rawPath)
+	serveThumbPlaceholder(c)
 }
 
 // remoteThumbAddition 判断视频所在存储是否为远程缩略图模式，返回 Addition
@@ -2606,11 +2905,14 @@ func remoteThumbCacheSet(rawPath string, data []byte) {
 func uploadThumbRemote(ctx context.Context, rawPath string, addition interface {
 	ThumbFolderName() string
 }, data []byte) error {
-	// 上传限流：与生成共用并发名额，避免多视频同时上传触发网盘风控
-	if !thumbAcquire(ctx, 0) {
-		return errors.New("thumbnail upload busy")
+	// Upload has its own storage-aware limiter. Generation already holds thumb_concurrency while
+	// calling this helper, so acquiring the generation semaphore again would self-deadlock when
+	// thumb_concurrency=1. 115 stays single-upload, while faster storages may use more parallelism.
+	releaseUpload, err := thumbUploadStorageAcquire(ctx, rawPath)
+	if err != nil {
+		return err
 	}
-	defer thumbRelease()
+	defer releaseUpload()
 	thumbName := remoteThumbName(rawPath)
 	thumbFullPath := remoteThumbPath(addition, rawPath)
 	if _, err := fs.Get(ctx, thumbFullPath, &fs.GetArgs{NoLog: true}); err == nil {
@@ -2916,12 +3218,117 @@ func isThumbCacheArtifact(name string) bool {
 	return false
 }
 
+func thumbReferencedCacheArtifacts() map[string]struct{} {
+	referenced := map[string]struct{}{}
+	if db.GetDb() == nil || !thumbEnsureDBMigration() {
+		return referenced
+	}
+	for _, kind := range []string{thumbKindVideo, thumbKindAudio, thumbKindImage, thumbKindCover} {
+		records, err := db.ListThumbnailRecords(kind)
+		if err != nil {
+			continue
+		}
+		for _, record := range records {
+			key := record.CacheKey
+			if !validThumbCacheKey(key) {
+				key = record.Fingerprint
+			}
+			if !validThumbCacheKey(key) && record.Path != "" {
+				key = thumbHash(record.Path)
+			}
+			if validThumbCacheKey(key) {
+				referenced[fmt.Sprintf("%s-%s.png", kind, strings.ToLower(key))] = struct{}{}
+			}
+		}
+	}
+	return referenced
+}
+
+func thumbRemoteExpectedByDir() map[string]map[string]bool {
+	expected := map[string]map[string]bool{}
+	if db.GetDb() == nil || !thumbEnsureDBMigration() {
+		return expected
+	}
+	records, err := db.ListThumbnailRecords(thumbKindVideo)
+	if err != nil {
+		return expected
+	}
+	for _, record := range records {
+		if record.Path == "" {
+			continue
+		}
+		dir := stdpath.Dir(record.Path)
+		if expected[dir] == nil {
+			expected[dir] = map[string]bool{}
+		}
+		name := record.RemoteName
+		if name == "" {
+			name = legacyRemoteThumbName(record.Path)
+		}
+		expected[dir][name] = true
+	}
+	return expected
+}
+
+func thumbReconcileRemoteOrphans() {
+	expected := thumbRemoteExpectedByDir()
+	if len(expected) == 0 {
+		return
+	}
+	dirs := make([]string, 0, len(expected))
+	for dir := range expected {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	start := int(thumbRemoteReconcileCursor.Add(thumbRemoteReconcileDirsPerRun)-thumbRemoteReconcileDirsPerRun) % len(dirs)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	for i := 0; i < min(thumbRemoteReconcileDirsPerRun, len(dirs)); i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		dir := dirs[(start+i)%len(dirs)]
+		if blocked, _ := isStorageBlocked(dir); blocked {
+			continue
+		}
+		folder := thumbFolderNameForPath(dir)
+		if folder == "" {
+			continue
+		}
+		remoteDir := stdpath.Join(dir, folder)
+		objs, err := fs.List(ctx, remoteDir, &fs.ListArgs{NoLog: true})
+		if err != nil {
+			continue
+		}
+		for _, obj := range objs {
+			if obj.IsDir() || !managedRemoteThumbPattern.MatchString(obj.GetName()) {
+				continue
+			}
+			full := stdpath.Join(remoteDir, obj.GetName())
+			if expected[dir][obj.GetName()] {
+				thumbRemoteOrphanSeen.Delete(full)
+				continue
+			}
+			first, loaded := thumbRemoteOrphanSeen.LoadOrStore(full, time.Now())
+			if !loaded || time.Since(first.(time.Time)) < thumbRemoteOrphanGrace {
+				continue
+			}
+			if err := fs.Remove(ctx, full); err == nil {
+				thumbRemoteOrphanSeen.Delete(full)
+				thumbListingInvalidate(dir)
+				log.Infof("removed orphan thumbnail from remote storage: %s", full)
+			}
+		}
+	}
+}
+
 func thumbCleanupOnceRun() {
 	dir := thumbDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	referenced := thumbReferencedCacheArtifacts()
 	ttl := time.Duration(setting.GetInt(conf.ThumbCacheTTL, 30)) * 24 * time.Hour
 	maxSize := int64(setting.GetInt(conf.ThumbCacheMaxSize, 2*1024*1024*1024))
 	now := time.Now()
@@ -2959,6 +3366,12 @@ func thumbCleanupOnceRun() {
 			continue
 		}
 		p := filepath.Join(dir, name)
+		if _, ok := referenced[name]; !ok && now.Sub(fi.ModTime()) > thumbLocalOrphanGrace {
+			if os.Remove(p) == nil {
+				log.Infof("removed orphan thumbnail cache: %s", name)
+			}
+			continue
+		}
 		if now.Sub(fi.ModTime()) > ttl {
 			_ = os.Remove(p)
 			continue
@@ -2966,20 +3379,23 @@ func thumbCleanupOnceRun() {
 		files = append(files, entry{p, fi.Size(), fi.ModTime()})
 		total += fi.Size()
 	}
-	if total <= maxSize {
-		return
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
-	for _, f := range files {
-		if total <= maxSize {
-			break
-		}
-		if os.Remove(f.path) == nil {
-			total -= f.size
+	if total > maxSize {
+		sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+		for _, f := range files {
+			if total <= maxSize {
+				break
+			}
+			if os.Remove(f.path) == nil {
+				total -= f.size
+			}
 		}
 	}
 	// 清理删除了缓存文件后重写索引，只保留缓存仍存在的条目，保证统计与实际一致
 	thumbRewriteIndex()
+	// Remote cleanup is deliberately conservative: only managed fingerprint/legacy names are
+	// considered and an orphan must be observed for 24h before deletion. A small directory batch
+	// per hourly cleanup avoids a request burst against 115.
+	thumbReconcileRemoteOrphans()
 }
 
 // thumbURL 构造指向缩略图接口的 URL

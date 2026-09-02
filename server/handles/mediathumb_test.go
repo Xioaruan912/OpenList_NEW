@@ -3,6 +3,7 @@ package handles
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"image"
 	"image/color"
@@ -73,6 +74,75 @@ func TestBuildVideoContactSheetKeepsGridAndMissingSlots(t *testing.T) {
 	r, g, b, _ := color.NRGBAModel.Convert(img.At(videoContactSheetWidth-1, videoContactSheetHeight-1)).RGBA()
 	if r>>8 != 16 || g>>8 != 16 || b>>8 != 16 {
 		t.Fatalf("missing grid slot has color %d,%d,%d, want dark background", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestThumbFailurePolicy(t *testing.T) {
+	tests := []struct {
+		name  string
+		msg   string
+		class string
+	}{
+		{name: "risk", msg: "115 风控拦截", class: "risk"},
+		{name: "timeout", msg: "download timeout", class: "timeout"},
+		{name: "blank", msg: "生成结果为空白图", class: "blank"},
+		{name: "range", msg: "short range read: unexpected EOF", class: "range"},
+		{name: "media", msg: "无封面/无法抽帧", class: "media"},
+		{name: "not-found", msg: "404 not found", class: "not_found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			class, retryAfter := thumbFailurePolicy(tt.msg)
+			if class != tt.class {
+				t.Fatalf("class = %q, want %q", class, tt.class)
+			}
+			if !retryAfter.After(time.Now()) {
+				t.Fatalf("retryAfter %v is not in the future", retryAfter)
+			}
+		})
+	}
+}
+
+func TestManagedRemoteThumbPattern(t *testing.T) {
+	for _, name := range []string{"movie_01234567.png", "movie_0123456789ab.png"} {
+		if !managedRemoteThumbPattern.MatchString(name) {
+			t.Fatalf("managed pattern rejected %q", name)
+		}
+	}
+	for _, name := range []string{"cover.png", "movie_manual.png", "movie_0123456.png", "movie_0123456789abcdef.png"} {
+		if managedRemoteThumbPattern.MatchString(name) {
+			t.Fatalf("managed pattern accepted unrelated file %q", name)
+		}
+	}
+}
+
+func TestThumbPrewarmTaskPersistenceFields(t *testing.T) {
+	original := &thumbPrewarmTask{Kind: thumbKindVideo, RawPath: "/movies/a.mp4"}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal task: %v", err)
+	}
+	var recovered thumbPrewarmTask
+	if err := json.Unmarshal(data, &recovered); err != nil {
+		t.Fatalf("unmarshal task: %v", err)
+	}
+	if recovered.Kind != original.Kind || recovered.RawPath != original.RawPath {
+		t.Fatalf("recovered task = %#v, want kind=%q path=%q", recovered, original.Kind, original.RawPath)
+	}
+}
+
+func TestThumbUploadTaskPersistenceFields(t *testing.T) {
+	original := &thumbUploadTask{Path: "/movies/a.mp4"}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal upload task: %v", err)
+	}
+	var recovered thumbUploadTask
+	if err := json.Unmarshal(data, &recovered); err != nil {
+		t.Fatalf("unmarshal upload task: %v", err)
+	}
+	if recovered.Path != original.Path {
+		t.Fatalf("recovered upload path = %q, want %q", recovered.Path, original.Path)
 	}
 }
 

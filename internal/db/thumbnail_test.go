@@ -2,6 +2,7 @@ package db
 
 import (
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"gorm.io/driver/sqlite"
@@ -152,5 +153,43 @@ func TestReplaceExcludedThumbnailPaths(t *testing.T) {
 	}
 	if len(paths) != 1 || paths[0] != "/b.mp4" {
 		t.Fatalf("excluded paths = %#v, want [/b.mp4]", paths)
+	}
+}
+
+func TestThumbnailFailureAndGenerationLifecycle(t *testing.T) {
+	setupThumbnailTestDB(t)
+	record := model.ThumbnailRecord{PathKey: "failure-key", Kind: "video", Path: "/movie/fail.mp4"}
+	if err := SetThumbnailIndexed(record, false); err != nil {
+		t.Fatalf("create thumbnail row: %v", err)
+	}
+	failedAt := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	retryAfter := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	if err := SetThumbnailFailure(record.PathKey, "timeout", "timed out", failedAt, retryAfter); err != nil {
+		t.Fatalf("set failure: %v", err)
+	}
+	got, err := GetThumbnailRecord(record.PathKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FailureClass != "timeout" || got.FailureCount != 1 || got.FailureMessage != "timed out" {
+		t.Fatalf("unexpected failure state: %#v", got)
+	}
+	if err := SetThumbnailFailure(record.PathKey, "timeout", "timed out again", failedAt, retryAfter); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = GetThumbnailRecord(record.PathKey)
+	if got.FailureCount != 2 {
+		t.Fatalf("failure count = %d, want 2", got.FailureCount)
+	}
+	generatedAt := time.Now().Truncate(time.Millisecond)
+	if err := MarkThumbnailGenerated(record.PathKey, generatedAt, 1234); err != nil {
+		t.Fatalf("mark generated: %v", err)
+	}
+	got, _ = GetThumbnailRecord(record.PathKey)
+	if got.FailureClass != "" || got.FailureMessage != "" || !got.RetryAfter.IsZero() {
+		t.Fatalf("generation did not clear failure state: %#v", got)
+	}
+	if got.GenerateCount != 1 || got.LastGenerateMS != 1234 {
+		t.Fatalf("unexpected generation metrics: count=%d ms=%d", got.GenerateCount, got.LastGenerateMS)
 	}
 }
